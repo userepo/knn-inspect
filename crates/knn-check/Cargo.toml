@@ -1,0 +1,16 @@
+[package]
+name = "knn-check"
+description = "Structural checks and graph statistics for k-NN segment files"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+knn-format.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,58 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/knn-format",
+    "crates/knn-check",
+    "crates/knn-recall",
+    "crates/knn-inspect",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+authors = ["Ivan Petrouchtchak"]
+license = "Apache-2.0"
+repository = "https://github.com/userepo/knn-inspect"
+publish = false
+
+[workspace.dependencies]
+knn-format = { path = "crates/knn-format" }
+knn-check = { path = "crates/knn-check" }
+knn-recall = { path = "crates/knn-recall" }
+
+[workspace.lints.rust]
+ambiguous_negative_literals = "warn"
+missing_debug_implementations = "warn"
+redundant_imports = "warn"
+redundant_lifetimes = "warn"
+trivial_numeric_casts = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+unused_lifetimes = "warn"
+
+[workspace.lints.clippy]
+cargo = { level = "warn", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+correctness = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+
+# Panic hygiene: the parser must never panic on malformed input, so a
+# panic site in production code must carry a written justification.
+# `unwrap` is banned while `expect` (with its reason string) stays
+# allowed; tests keep `unwrap` and indexing via clippy.toml.
+unwrap_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+panic_in_result_fn = "deny"
+string_slice = "deny"
+indexing_slicing = "deny"
+exit = "deny"
+
+# `unsafe` is confined to the mmap view module in knn-format; every block
+# there carries a SAFETY comment.
+undocumented_unsafe_blocks = "deny"
