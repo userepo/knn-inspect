@@ -1,0 +1,4 @@
+# Python side: fixtures and baselines only. The Rust crates never link Faiss.
+faiss-cpu==1.15.1
+numpy>=2.0
+requests>=2.32

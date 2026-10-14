@@ -1,0 +1,67 @@
+{
+  "file": "ip-100x4.faiss",
+  "size": 17079,
+  "faiss_version": "1.15.1",
+  "seed": 20261013,
+  "layout": [
+    "IxMp",
+    "IHNf",
+    "IxFI"
+  ],
+  "dimension": 4,
+  "count": 100,
+  "metric": "inner_product",
+  "faiss_metric_type": 0,
+  "hnsw": {
+    "m": 16,
+    "ef_construction": 100,
+    "ef_search": 16,
+    "max_level": 1,
+    "entry_point": 12,
+    "level_counts": [
+      100,
+      6
+    ],
+    "assign_probas": [
+      0.9375,
+      0.05859375,
+      0.003662109375,
+      0.0002288818359375,
+      1.4305113836599048e-05,
+      8.940696147874405e-07,
+      5.587935092421503e-08,
+      3.4924594327634395e-09
+    ],
+    "cum_nneighbor_per_level": [
+      0,
+      32,
+      48,
+      64,
+      80,
+      96,
+      112,
+      128,
+      144
+    ],
+    "levels_len": 100,
+    "offsets_len": 101,
+    "neighbors_len": 3296,
+    "levels_crc32": 3073793771
+  },
+  "ids": {
+    "len": 100,
+    "first": 1000,
+    "last": 1099,
+    "crc32": 1526159279
+  },
+  "vectors": {
+    "bytes": 1600,
+    "crc32": 2542423212,
+    "first": [
+      0.3670927882194519,
+      -0.8713018298149109,
+      0.103049635887146,
+      0.3089607059955597
+    ]
+  }
+}

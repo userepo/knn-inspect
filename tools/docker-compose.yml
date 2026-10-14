@@ -1,0 +1,16 @@
+# Single-node OpenSearch at the version the fixtures are pinned to. The
+# bundled k-NN plugin writes the native files; tools/extract_opensearch.py
+# indexes vectors against it and copies the segment directory out.
+#
+#   docker compose -f tools/docker-compose.yml up -d
+#   docker compose -f tools/docker-compose.yml down -v
+services:
+  opensearch:
+    image: opensearchproject/opensearch:3.9.0
+    container_name: knn-inspect-opensearch
+    environment:
+      - discovery.type=single-node
+      - DISABLE_SECURITY_PLUGIN=true
+      - OPENSEARCH_JAVA_OPTS=-Xms1g -Xmx1g
+    ports:
+      - "9200:9200"

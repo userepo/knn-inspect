@@ -1,0 +1,3 @@
+# Fixtures are byte-exact test inputs: never apply line-ending conversion,
+# whatever a clone's core.autocrlf says.
+fixtures/** -text
