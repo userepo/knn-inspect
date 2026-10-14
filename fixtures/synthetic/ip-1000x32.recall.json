@@ -1,0 +1,24 @@
+{
+  "file": "ip-1000x32.faiss",
+  "faiss_version": "1.15.1",
+  "queries_file": "ip-1000x32.queries.f32",
+  "results_file": "ip-1000x32.results.jsonl",
+  "queries": 100,
+  "dimension": 32,
+  "k": 10,
+  "ef_search": 16,
+  "recall": 0.912,
+  "matches_histogram": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    1,
+    5,
+    21,
+    27,
+    46
+  ]
+}

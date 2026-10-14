@@ -9,9 +9,10 @@ Rust, read-only, and does not link Faiss or talk to a cluster.
 
 ## Status
 
-Early development. `info`, `verify`, and `stats` work on every fixture
-(see [docs/format-notes.md](docs/format-notes.md) for the format);
-`recall` and `scan` are next.
+Early development. `info`, `verify`, `stats`, and `recall` (scoring
+external results) work on every fixture (see
+[docs/format-notes.md](docs/format-notes.md) for the format); the tool's
+own HNSW search and `scan` are next.
 
 ## Install
 
@@ -31,6 +32,7 @@ cargo install --git https://github.com/userepo/knn-inspect --tag v0.1.0 knn-insp
 knn-inspect info <file.faiss> [--json]
 knn-inspect verify <file.faiss> [--space l2|innerproduct|cosine] [--max-findings N] [--json]
 knn-inspect stats <file.faiss> [--json]
+knn-inspect recall <file.faiss> --queries <q.f32> --results <r.jsonl> [--k N] [--ids <ids.json>] [--json]
 ```
 
 `info` prints the envelope (footer offset and whether its CRC32
@@ -59,6 +61,21 @@ from the entry point, each lower level from every node reached above it,
 so no query can ever visit an unreachable node.
 Exit code 0 when the file parsed, 1 otherwise.
 
+`recall` scores search results produced elsewhere (Faiss, or a live
+OpenSearch query) against exact brute force over the file's own vectors.
+`--queries` is the query vectors as row-major little-endian float32 in the
+file's dimension; `--results` has one line per query, in the same order,
+holding the returned labels in rank order as a JSON array or
+`{"labels": [...]}`. A label matches when its vector is at least as close
+to the query as the k-th nearest, so a tie with the k-th neighbor counts;
+a label repeated within a list counts once, and -1 (Faiss's "no result")
+never matches. Labels are the file's own (Lucene doc ids in a k-NN
+segment) unless `--ids` names a JSON array with node i's id at index i,
+one per vector, for results that carry some other id, such as a stored
+position field returned by a live query. The report gives recall@k, a histogram of
+matches per query, and counts of the anomalies above. Exit code 0 when
+the results were scored, 1 otherwise.
+
 ## Scope (v1)
 
 - Faiss engine files: ID map wrapping HNSW with flat float32 storage
@@ -85,6 +102,11 @@ fixtures and baselines use faiss-cpu 1.15.1.
 - `*.stats.json` beside each synthetic fixture and `stats.json` beside
   each real one - the graph statistics Faiss Python computes from the
   same file, the baseline `stats` must match
+- `*.queries.f32`, `*.results.jsonl`, and `*.recall.json` beside each
+  synthetic fixture (`queries.f32`, `results.jsonl`, `recall.json` beside
+  each real one) - 100 fixed queries, the labels Faiss's HNSW search
+  returns for them, and the recall@10 Faiss computes for those results,
+  the baseline `recall` must match
 - `fixtures/corrupted/` - one file per structural check, each derived
   from a clean fixture by a single mutation; `manifest.json` records the
   mutation and the check and severity it must trip
@@ -122,11 +144,12 @@ The HNSW graph is built multithreaded, so regenerated real fixtures have
 the same vectors, labels, levels, and entry point but different neighbor
 arrays.
 
-The graph statistics baselines depend on the neighbor arrays, so rewrite
-them after regenerating either fixture set:
+The graph statistics and recall baselines depend on the neighbor arrays,
+so rewrite them after regenerating either fixture set:
 
 ```
 .venv\Scripts\python tools\graph_stats.py --fixtures fixtures
+.venv\Scripts\python tools\recall_baseline.py --fixtures fixtures
 ```
 
 ### Inspecting a file without the Rust tool

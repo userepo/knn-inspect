@@ -1,0 +1,24 @@
+{
+  "file": "l2-4000x64.faiss",
+  "faiss_version": "1.15.1",
+  "queries_file": "l2-4000x64.queries.f32",
+  "results_file": "l2-4000x64.results.jsonl",
+  "queries": 100,
+  "dimension": 64,
+  "k": 10,
+  "ef_search": 16,
+  "recall": 0.689,
+  "matches_histogram": [
+    0,
+    1,
+    0,
+    1,
+    5,
+    10,
+    20,
+    28,
+    19,
+    13,
+    3
+  ]
+}

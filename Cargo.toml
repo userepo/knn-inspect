@@ -29,6 +29,9 @@ zerocopy = "0.8.63"
 crc32fast = "1.5.2"
 thiserror = "2.0.21"
 
+# knn-recall: brute force in parallel over queries.
+rayon = "1.12.0"
+
 # knn-inspect: the CLI and its output.
 clap = { version = "4.6.7", features = ["derive"] }
 serde = { version = "1.0.229", features = ["derive"] }

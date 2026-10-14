@@ -11,6 +11,12 @@ publish.workspace = true
 
 [dependencies]
 knn-format.workspace = true
+rayon.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
 
 [lints]
 workspace = true
