@@ -1,16 +1,21 @@
-//! Structural checks over parsed k-NN segment files.
+//! Structural checks and graph statistics over parsed k-NN segment files.
 //!
 //! [`verify`] runs a fixed list of [`Check`]s and returns a [`Report`]:
 //! one [`CheckResult`] per check, each with its worst [`Severity`] and
 //! the first few [`Finding`]s, every finding carrying the file offset
 //! and node it points at. Nothing here panics on malformed input: a file
 //! that does not parse is reported as a failed [`Check::Structure`].
+//!
+//! [`graph_stats`] reports per-level node counts, out-degree histograms,
+//! and the nodes no search can reach.
 
 mod checks;
+mod stats;
 
 use serde::Serialize;
 
 pub use checks::verify;
+pub use stats::{GraphStats, LayerStats, graph_stats};
 
 /// How much a finding matters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]

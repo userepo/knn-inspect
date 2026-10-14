@@ -208,17 +208,14 @@ impl<'a> HnswGraph<'a> {
     /// Nodes present on each level, level 0 first. Empty for an empty
     /// graph.
     ///
-    /// The number of levels comes from `max_level`, capped by the size of
-    /// the per-level table so a corrupt `max_level` cannot drive an
-    /// allocation; a node's own level is clamped the same way.
+    /// The number of levels comes from `max_level`, capped by the levels
+    /// the per-level table describes (one fewer than its entries) so a
+    /// corrupt `max_level` cannot drive an allocation; a node's own level
+    /// is clamped the same way.
     #[must_use]
     pub fn level_counts(&self) -> Vec<usize> {
-        let claimed = self
-            .max_level
-            .checked_add(1)
-            .and_then(|n| usize::try_from(n).ok())
-            .unwrap_or(0);
-        let n_levels = claimed.min(self.cum_nneighbor_per_level.len());
+        let claimed = usize::try_from(self.max_level).map_or(0, |l| l.saturating_add(1));
+        let n_levels = claimed.min(self.cum_nneighbor_per_level.len().saturating_sub(1));
         let mut counts = vec![0_usize; n_levels];
         for level in self.levels {
             let n = usize::try_from(level.get()).unwrap_or(0).min(n_levels);

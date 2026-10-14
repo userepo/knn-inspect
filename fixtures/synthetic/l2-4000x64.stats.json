@@ -1,0 +1,129 @@
+{
+  "file": "l2-4000x64.faiss",
+  "faiss_version": "1.15.1",
+  "nodes": 4000,
+  "entry_point": 3123,
+  "max_level": 3,
+  "layers": [
+    {
+      "level": 0,
+      "nodes": 4000,
+      "slots": 32,
+      "edges": 78672,
+      "degree_min": 1,
+      "degree_max": 32,
+      "degree_histogram": [
+        0,
+        2,
+        12,
+        42,
+        61,
+        65,
+        92,
+        82,
+        91,
+        113,
+        126,
+        109,
+        119,
+        137,
+        137,
+        134,
+        147,
+        136,
+        127,
+        128,
+        136,
+        136,
+        133,
+        142,
+        160,
+        226,
+        197,
+        177,
+        191,
+        157,
+        163,
+        152,
+        170
+      ],
+      "unreachable": 5,
+      "unreachable_nodes": [
+        620,
+        1218,
+        2017,
+        2134,
+        2255
+      ]
+    },
+    {
+      "level": 1,
+      "nodes": 230,
+      "slots": 16,
+      "edges": 2224,
+      "degree_min": 1,
+      "degree_max": 16,
+      "degree_histogram": [
+        0,
+        2,
+        3,
+        8,
+        6,
+        17,
+        25,
+        16,
+        18,
+        14,
+        20,
+        10,
+        27,
+        20,
+        17,
+        13,
+        14
+      ],
+      "unreachable": 3,
+      "unreachable_nodes": [
+        349,
+        675,
+        3996
+      ]
+    },
+    {
+      "level": 2,
+      "nodes": 10,
+      "slots": 16,
+      "edges": 76,
+      "degree_min": 6,
+      "degree_max": 9,
+      "degree_histogram": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        4,
+        0,
+        2,
+        4
+      ],
+      "unreachable": 0,
+      "unreachable_nodes": []
+    },
+    {
+      "level": 3,
+      "nodes": 2,
+      "slots": 16,
+      "edges": 2,
+      "degree_min": 1,
+      "degree_max": 1,
+      "degree_histogram": [
+        0,
+        2
+      ],
+      "unreachable": 0,
+      "unreachable_nodes": []
+    }
+  ]
+}

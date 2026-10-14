@@ -1,6 +1,7 @@
 //! `knn-inspect`: offline inspector for OpenSearch k-NN native segment files.
 
 mod info;
+mod stats;
 mod verify;
 
 use std::path::PathBuf;
@@ -40,6 +41,14 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Per-level graph statistics: node counts, out-degrees, unreachable nodes.
+    Stats {
+        /// A `.faiss` or `.faissc` file.
+        file: PathBuf,
+        /// Print the statistics as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -52,6 +61,7 @@ fn main() -> ExitCode {
             max_findings,
             json,
         } => verify::run(&file, space, max_findings, json),
+        Command::Stats { file, json } => stats::run(&file, json),
     };
     match result {
         Ok(code) => code,

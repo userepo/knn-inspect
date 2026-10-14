@@ -134,3 +134,47 @@ fn verify_json_carries_the_report() {
     );
     assert!(id_map["findings"][0]["offset"].is_number());
 }
+
+#[test]
+fn stats_reports_unreachable_nodes() {
+    let synthetic = fixtures().join("synthetic/l2-4000x64.faiss");
+    let o = run(&["stats", synthetic.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(0));
+    let text = stdout(&o);
+    assert!(
+        text.contains("level 0         4000 nodes, 32 slots, 78672 edges, 5 unreachable: 620, 1218, 2017, 2134, 2255"),
+        "{text}"
+    );
+    assert!(
+        text.contains("degree        min 1, mean 19.67, max 32"),
+        "{text}"
+    );
+
+    let o = run(&["stats", "--json", synthetic.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(0));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["nodes"], 4000);
+    assert_eq!(v["layers"][0]["unreachable"], 5);
+    assert_eq!(
+        v["layers"][1]["unreachable_nodes"],
+        serde_json::json!([349, 675, 3996])
+    );
+    assert_eq!(v["layers"].as_array().unwrap().len(), 4);
+}
+
+#[test]
+fn stats_exit_codes() {
+    let real = fixtures().join("opensearch-3.9.0/cfs/cosinesimil/_2_165_vec.faissc");
+    let o = run(&["stats", real.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(0));
+    assert!(stdout(&o).contains("nodes           500, entry point"));
+
+    let truncated = fixtures().join("corrupted/truncated-in-neighbors.faiss");
+    let o = run(&["stats", truncated.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&o.stderr).starts_with("error: parsing"));
+
+    let o = run(&["stats", "no-such-file.faiss"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&o.stderr).starts_with("error: opening"));
+}

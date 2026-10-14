@@ -9,9 +9,9 @@ Rust, read-only, and does not link Faiss or talk to a cluster.
 
 ## Status
 
-Early development. `info` and `verify` work on every fixture (see
-[docs/format-notes.md](docs/format-notes.md) for the format); `stats`,
-`recall`, and `scan` are next.
+Early development. `info`, `verify`, and `stats` work on every fixture
+(see [docs/format-notes.md](docs/format-notes.md) for the format);
+`recall` and `scan` are next.
 
 ## Install
 
@@ -30,6 +30,7 @@ cargo install --git https://github.com/userepo/knn-inspect --tag v0.1.0 knn-insp
 ```
 knn-inspect info <file.faiss> [--json]
 knn-inspect verify <file.faiss> [--space l2|innerproduct|cosine] [--max-findings N] [--json]
+knn-inspect stats <file.faiss> [--json]
 ```
 
 `info` prints the envelope (footer offset and whether its CRC32
@@ -49,6 +50,14 @@ components, duplicate neighbors, self-loops, and with `--space cosine`,
 zero or non-unit vectors. Exit code 0 when clean, 1 on any failure, 2 on
 warnings only. Where a finding points at bytes or a node, it names the
 file offset and node, so it can be looked up in a hex dump.
+
+`stats` reports, per graph level, the node count, neighbor slots, edges,
+the out-degree histogram, and the nodes no search can reach. A node's
+neighbor list ends at its first empty slot, as Faiss's search reads it.
+Reachability is a breadth-first search per level: the top level starts
+from the entry point, each lower level from every node reached above it,
+so no query can ever visit an unreachable node.
+Exit code 0 when the file parsed, 1 otherwise.
 
 ## Scope (v1)
 
@@ -73,6 +82,9 @@ fixtures and baselines use faiss-cpu 1.15.1.
   `innerproduct`, `cosinesimil`); the native file is `_2_165_vec.faiss`
 - `fixtures/opensearch-3.9.0/cfs/` - the same with compound files on; the
   native file sits beside the `.cfs` as `_2_165_vec.faissc`
+- `*.stats.json` beside each synthetic fixture and `stats.json` beside
+  each real one - the graph statistics Faiss Python computes from the
+  same file, the baseline `stats` must match
 - `fixtures/corrupted/` - one file per structural check, each derived
   from a clean fixture by a single mutation; `manifest.json` records the
   mutation and the check and severity it must trip
@@ -110,17 +122,27 @@ The HNSW graph is built multithreaded, so regenerated real fixtures have
 the same vectors, labels, levels, and entry point but different neighbor
 arrays.
 
+The graph statistics baselines depend on the neighbor arrays, so rewrite
+them after regenerating either fixture set:
+
+```
+.venv\Scripts\python tools\graph_stats.py --fixtures fixtures
+```
+
 ### Inspecting a file without the Rust tool
 
 - `tools/strip_envelope.py <file>` reports and verifies the Lucene footer;
   with `--out` it writes the bare Faiss payload for `faiss.read_index`
 - `tools/walk_faiss.py <file>` prints every Faiss field with its offset
+- `tools/graph_stats.py <file>` prints the graph statistics from the
+  graph Faiss Python loads
 
 ## Fuzzing
 
 `fuzz/` holds a cargo-fuzz target that feeds arbitrary bytes to the
-parser and every check; the rule is a result, never a panic. It needs
-nightly and Linux; see [fuzz/README.md](fuzz/README.md).
+parser, every check, and the graph statistics; the rule is a result,
+never a panic. It needs nightly and Linux; see
+[fuzz/README.md](fuzz/README.md).
 
 ## Platform
 

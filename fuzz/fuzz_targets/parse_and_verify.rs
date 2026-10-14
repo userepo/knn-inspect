@@ -1,8 +1,9 @@
 //! Any byte string must parse to `Ok` or `Err`, never panic, and every
-//! check must run over whatever parsed. Panics, including failed bounds
-//! checks, fail the run; AddressSanitizer covers the unsafe code inside
-//! dependencies (zerocopy's casts, crc32fast's SIMD). The memory map is
-//! not exercised: the harness parses bytes, not files.
+//! check and the graph statistics must run over whatever parsed. Panics,
+//! including failed bounds checks, fail the run; AddressSanitizer covers
+//! the unsafe code inside dependencies (zerocopy's casts, crc32fast's
+//! SIMD). The memory map is not exercised: the harness parses bytes, not
+//! files.
 
 #![no_main]
 
@@ -22,6 +23,11 @@ fuzz_target!(|data: &[u8]| {
                 let _ = graph.neighbors_of(node, level);
             }
         }
+        // Reachability walks every edge, so a corrupt graph exercises it
+        // as much as a clean one.
+        let stats = knn_check::graph_stats(graph);
+        assert_eq!(stats.nodes, graph.node_count());
+        assert_eq!(stats.layers.len(), graph.level_counts().len());
         let _ = parsed.index.index.storage.vector(0);
         let _ = parsed.index.index.storage.row_count();
         if let Some(footer) = parsed.envelope.footer {

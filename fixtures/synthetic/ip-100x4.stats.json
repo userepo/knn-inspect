@@ -1,0 +1,72 @@
+{
+  "file": "ip-100x4.faiss",
+  "faiss_version": "1.15.1",
+  "nodes": 100,
+  "entry_point": 12,
+  "max_level": 1,
+  "layers": [
+    {
+      "level": 0,
+      "nodes": 100,
+      "slots": 32,
+      "edges": 756,
+      "degree_min": 3,
+      "degree_max": 32,
+      "degree_histogram": [
+        0,
+        0,
+        0,
+        5,
+        21,
+        25,
+        15,
+        9,
+        9,
+        7,
+        1,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        6
+      ],
+      "unreachable": 0,
+      "unreachable_nodes": []
+    },
+    {
+      "level": 1,
+      "nodes": 6,
+      "slots": 16,
+      "edges": 26,
+      "degree_min": 4,
+      "degree_max": 5,
+      "degree_histogram": [
+        0,
+        0,
+        0,
+        0,
+        4,
+        2
+      ],
+      "unreachable": 0,
+      "unreachable_nodes": []
+    }
+  ]
+}
