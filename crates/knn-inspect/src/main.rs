@@ -1,6 +1,7 @@
 //! `knn-inspect`: offline inspector for OpenSearch k-NN native segment files.
 
 mod info;
+mod verify;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -24,12 +25,33 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Run every structural check; exit 0 when clean, 1 on a failure, 2 on warnings only.
+    Verify {
+        /// A `.faiss` or `.faissc` file.
+        file: PathBuf,
+        /// The field's space type. Needed for the cosine checks, since the
+        /// file records cosine fields as inner product.
+        #[arg(long, value_enum)]
+        space: Option<verify::SpaceArg>,
+        /// Findings to list per check; the count is always exact. 0 means the default.
+        #[arg(long, default_value_t = 5)]
+        max_findings: usize,
+        /// Print the report as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Info { file, json } => info::run(&file, json),
+        Command::Verify {
+            file,
+            space,
+            max_findings,
+            json,
+        } => verify::run(&file, space, max_findings, json),
     };
     match result {
         Ok(code) => code,

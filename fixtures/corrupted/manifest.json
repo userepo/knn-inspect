@@ -1,0 +1,262 @@
+[
+  {
+    "file": "crc-flipped.faiss",
+    "source": "fixtures/opensearch-3.9.0/nocfs/l2/_2_165_vec.faiss",
+    "mutation": "last byte of the stored CRC32 flipped",
+    "space": null,
+    "expect": {
+      "check": "checksum",
+      "severity": "failure"
+    }
+  },
+  {
+    "file": "payload-flipped.faiss",
+    "source": "fixtures/opensearch-3.9.0/nocfs/l2/_2_165_vec.faiss",
+    "mutation": "one vector byte flipped; CRC no longer matches",
+    "space": null,
+    "expect": {
+      "check": "checksum",
+      "severity": "failure"
+    }
+  },
+  {
+    "file": "footer-cut.faiss",
+    "source": "fixtures/opensearch-3.9.0/nocfs/l2/_2_165_vec.faiss",
+    "mutation": "last 5 bytes removed: no footer magic, 11 stray bytes after the index",
+    "space": null,
+    "expect": {
+      "check": "trailing",
+      "severity": "failure"
+    }
+  },
+  {
+    "file": "truncated-in-neighbors.faiss",
+    "source": "fixtures/opensearch-3.9.0/nocfs/l2/_2_165_vec.faiss",
+    "mutation": "file ends inside the neighbor array",
+    "space": null,
+    "expect": {
+      "check": "structure",
+      "severity": "failure"
+    }
+  },
+  {
+    "file": "truncated-before-id-map.faiss",
+    "source": "fixtures/opensearch-3.9.0/nocfs/l2/_2_165_vec.faiss",
+    "mutation": "file ends where the id map length should start",
+    "space": null,
+    "expect": {
+      "check": "structure",
+      "severity": "failure"
+    }
+  },
+  {
+    "file": "wrong-fourcc.faiss",
+    "source": "fixtures/synthetic/l2-100x4.faiss",
+    "mutation": "outer fourcc IxMp replaced with IxFl",
+    "space": null,
+    "expect": {
+      "check": "structure",
+      "severity": "failure"
+    }
+  },
+  {
+    "file": "empty.faiss",
+    "source": "fixtures/synthetic/l2-100x4.faiss",
+    "mutation": "zero-length file",
+    "space": null,
+    "expect": {
+      "check": "structure",
+      "severity": "failure"
+    }
+  },
+  {
+    "file": "trailing-junk.faiss",
+    "source": "fixtures/synthetic/l2-100x4.faiss",
+    "mutation": "16 zero bytes appended after the index",
+    "space": null,
+    "expect": {
+      "check": "trailing",
+      "severity": "failure"
+    }
+  },
+  {
+    "file": "header-dimension-mismatch.faiss",
+    "source": "fixtures/synthetic/l2-100x4.faiss",
+    "mutation": "storage header dimension set to 5",
+    "space": null,
+    "expect": {
+      "check": "headers",
+      "severity": "failure"
+    }
+  },
+  {
+    "file": "header-count-mismatch.faiss",
+    "source": "fixtures/synthetic/l2-100x4.faiss",
+    "mutation": "hnsw header count set to 99",
+    "space": null,
+    "expect": {
+      "check": "headers",
+      "severity": "failure"
+    }
+  },
+  {
+    "file": "metric-mismatch.faiss",
+    "source": "fixtures/synthetic/l2-100x4.faiss",
+    "mutation": "an L2 file verified with --space innerproduct",
+    "space": "innerproduct",
+    "expect": {
+      "check": "metric",
+      "severity": "failure"
+    }
+  },
+  {
+    "file": "neighbor-out-of-range.faiss",
+    "source": "fixtures/synthetic/l2-100x4.faiss",
+    "mutation": "neighbor slot 5 set to 9999",
+    "space": null,
+    "expect": {
+      "check": "neighbor_ids",
+      "severity": "failure"
+    }
+  },
+  {
+    "file": "offsets-nonmonotonic.faiss",
+    "source": "fixtures/synthetic/l2-100x4.faiss",
+    "mutation": "offsets[10] set below offsets[9]",
+    "space": null,
+    "expect": {
+      "check": "offsets",
+      "severity": "failure"
+    }
+  },
+  {
+    "file": "levels-slot-mismatch.faiss",
+    "source": "fixtures/synthetic/l2-100x4.faiss",
+    "mutation": "node 0 claims 2 levels but has slots for 1",
+    "space": null,
+    "expect": {
+      "check": "levels",
+      "severity": "failure"
+    }
+  },
+  {
+    "file": "level-table-bad.faiss",
+    "source": "fixtures/synthetic/l2-100x4.faiss",
+    "mutation": "cumulative neighbor count for level 1 set to 31",
+    "space": null,
+    "expect": {
+      "check": "levels",
+      "severity": "failure"
+    }
+  },
+  {
+    "file": "max-level-wrong.faiss",
+    "source": "fixtures/synthetic/l2-100x4.faiss",
+    "mutation": "max_level set to 3 with nodes on at most 2 levels",
+    "space": null,
+    "expect": {
+      "check": "levels",
+      "severity": "failure"
+    }
+  },
+  {
+    "file": "entry-point-out-of-range.faiss",
+    "source": "fixtures/synthetic/l2-100x4.faiss",
+    "mutation": "entry point set to 500 in a 100-node graph",
+    "space": null,
+    "expect": {
+      "check": "entry_point",
+      "severity": "failure"
+    }
+  },
+  {
+    "file": "entry-point-not-on-top.faiss",
+    "source": "fixtures/synthetic/l2-100x4.faiss",
+    "mutation": "entry point set to a node that is only on level 0",
+    "space": null,
+    "expect": {
+      "check": "entry_point",
+      "severity": "failure"
+    }
+  },
+  {
+    "file": "duplicate-neighbor.faiss",
+    "source": "fixtures/synthetic/l2-100x4.faiss",
+    "mutation": "node 0 level 0 slot 1 copied from slot 0",
+    "space": null,
+    "expect": {
+      "check": "duplicate_neighbors",
+      "severity": "warning"
+    }
+  },
+  {
+    "file": "self-loop.faiss",
+    "source": "fixtures/synthetic/l2-100x4.faiss",
+    "mutation": "node 3 level 0 slot 0 set to 3",
+    "space": null,
+    "expect": {
+      "check": "self_loops",
+      "severity": "warning"
+    }
+  },
+  {
+    "file": "vector-count-mismatch.faiss",
+    "source": "fixtures/synthetic/l2-100x4.faiss",
+    "mutation": "all three headers say 99 vectors; the arrays hold 100",
+    "space": null,
+    "expect": {
+      "check": "vector_count",
+      "severity": "failure"
+    }
+  },
+  {
+    "file": "id-map-short.faiss",
+    "source": "fixtures/synthetic/l2-100x4.faiss",
+    "mutation": "id map length field set to 99; one label becomes trailing bytes",
+    "space": null,
+    "expect": {
+      "check": "id_map_length",
+      "severity": "failure"
+    }
+  },
+  {
+    "file": "nan-vector.faiss",
+    "source": "fixtures/synthetic/l2-100x4.faiss",
+    "mutation": "vector 0 component 3 set to NaN",
+    "space": null,
+    "expect": {
+      "check": "vector_values",
+      "severity": "warning"
+    }
+  },
+  {
+    "file": "inf-vector.faiss",
+    "source": "fixtures/synthetic/l2-100x4.faiss",
+    "mutation": "vector 1 component 0 set to +inf",
+    "space": null,
+    "expect": {
+      "check": "vector_values",
+      "severity": "warning"
+    }
+  },
+  {
+    "file": "cosine-not-unit.faiss",
+    "source": "fixtures/synthetic/ip-100x4.faiss",
+    "mutation": "vector 7 scaled by 2",
+    "space": "cosinesimil",
+    "expect": {
+      "check": "norms",
+      "severity": "warning"
+    }
+  },
+  {
+    "file": "cosine-zero-vector.faiss",
+    "source": "fixtures/synthetic/ip-100x4.faiss",
+    "mutation": "vector 2 set to zeros",
+    "space": "cosinesimil",
+    "expect": {
+      "check": "norms",
+      "severity": "warning"
+    }
+  }
+]

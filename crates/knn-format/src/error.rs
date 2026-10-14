@@ -96,3 +96,20 @@ pub enum Error {
         offset: usize,
     },
 }
+
+impl Error {
+    /// The file offset the error points at, when it has one.
+    #[must_use]
+    pub fn offset(&self) -> Option<usize> {
+        match self {
+            Self::UnexpectedEof { offset, .. }
+            | Self::UnsupportedLayout { offset, .. }
+            | Self::CountTooLarge { offset, .. }
+            | Self::InvalidValue { offset, .. }
+            | Self::UnknownChecksumAlgorithm { offset, .. }
+            | Self::InvalidChecksum { offset, .. }
+            | Self::InvalidString { offset } => Some(*offset),
+            Self::Io(_) | Self::ChecksumMismatch { .. } => None,
+        }
+    }
+}

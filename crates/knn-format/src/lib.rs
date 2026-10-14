@@ -97,6 +97,22 @@ pub struct Parsed<'a> {
     pub trailing: usize,
 }
 
+/// The file offset at which `view` starts, if `view` is a view into
+/// `bytes` (as every array a [`Parsed`] hands out is).
+#[must_use]
+pub fn view_offset<T>(bytes: &[u8], view: &[T]) -> Option<usize>
+where
+    T: zerocopy::IntoBytes + zerocopy::Immutable,
+{
+    use zerocopy::IntoBytes as _;
+    let base = bytes.as_ptr().addr();
+    let start = view.as_bytes().as_ptr().addr();
+    let end = base.checked_add(bytes.len())?;
+    (base..=end)
+        .contains(&start)
+        .then(|| start.wrapping_sub(base))
+}
+
 /// Parses a native file held in memory.
 ///
 /// The envelope is recognized but the footer checksum is not verified

@@ -9,14 +9,15 @@ Rust, read-only, and does not link Faiss or talk to a cluster.
 
 ## Status
 
-Early development. The parser and the `info` command work on every
-fixture (see [docs/format-notes.md](docs/format-notes.md) for the
-format); `verify`, `stats`, `recall`, and `scan` are next.
+Early development. `info` and `verify` work on every fixture (see
+[docs/format-notes.md](docs/format-notes.md) for the format); `stats`,
+`recall`, and `scan` are next.
 
 ## Usage
 
 ```
 cargo run --release -- info <file.faiss> [--json]
+cargo run --release -- verify <file.faiss> [--space l2|innerproduct|cosine] [--max-findings N] [--json]
 ```
 
 `info` prints the envelope (footer offset and whether its CRC32
@@ -24,6 +25,18 @@ verifies), the Faiss layout, dimension, vector count, metric, HNSW
 parameters, level sizes, and the label range. Exit code 0 when the file
 parsed, 1 otherwise. A cosine field reports `inner_product`, because
 that is what the file records; k-NN normalizes the vectors instead.
+
+`verify` runs every structural check and prints one line per check.
+Failures: footer checksum, truncation or an unsupported layout, trailing
+bytes, disagreeing headers, a `--space` that does not match the stored
+metric, non-monotonic neighbor offsets, node levels that contradict the
+slot counts, an invalid entry point, neighbor ids out of range, a vector
+array or ID map of the wrong size. Warnings: an unexpected Lucene header,
+a Faiss header that says the index is not trained, NaN or infinite
+components, duplicate neighbors, self-loops, and with `--space cosine`,
+zero or non-unit vectors. Exit code 0 when clean, 1 on any failure, 2 on
+warnings only. Where a finding points at bytes or a node, it names the
+file offset and node, so it can be looked up in a hex dump.
 
 ## Scope (v1)
 
@@ -48,6 +61,9 @@ fixtures and baselines use faiss-cpu 1.15.1.
   `innerproduct`, `cosinesimil`); the native file is `_2_165_vec.faiss`
 - `fixtures/opensearch-3.9.0/cfs/` - the same with compound files on; the
   native file sits beside the `.cfs` as `_2_165_vec.faissc`
+- `fixtures/corrupted/` - one file per structural check, each derived
+  from a clean fixture by a single mutation; `manifest.json` records the
+  mutation and the check and severity it must trip
 
 Each real fixture directory also holds `vectors.f32`, the indexed vectors
 in doc-id order (row i is Faiss label i), and `manifest.json` with the
@@ -62,10 +78,11 @@ python -m venv .venv
 .venv\Scripts\pip install -r tools\requirements.txt
 ```
 
-Synthetic fixtures:
+Synthetic and corrupted fixtures:
 
 ```
 .venv\Scripts\python tools\make_synthetic.py
+.venv\Scripts\python tools\make_corrupted.py
 ```
 
 Real fixtures need Docker:

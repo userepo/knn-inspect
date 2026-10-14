@@ -142,6 +142,8 @@ name = "knn-check"
 version = "0.1.0"
 dependencies = [
  "knn-format",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
