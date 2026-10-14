@@ -45,13 +45,14 @@ that is what the file records; k-NN normalizes the vectors instead.
 Failures: footer checksum, truncation or an unsupported layout, trailing
 bytes, disagreeing headers, a `--space` that does not match the stored
 metric, non-monotonic neighbor offsets, node levels that contradict the
-slot counts, an invalid entry point, neighbor ids out of range, a vector
-array or ID map of the wrong size. Warnings: an unexpected Lucene header,
-a Faiss header that says the index is not trained, NaN or infinite
-components, duplicate neighbors, self-loops, and with `--space cosine`,
-zero or non-unit vectors. Exit code 0 when clean, 1 on any failure, 2 on
-warnings only. Where a finding points at bytes or a node, it names the
-file offset and node, so it can be looked up in a hex dump.
+slot counts, an invalid entry point, neighbor ids out of range, a
+neighbor listed on a level it is not on, a vector array or ID map of the
+wrong size. Warnings: an unexpected Lucene header, a Faiss header that
+says the index is not trained, NaN or infinite components, duplicate
+neighbors, self-loops, and with `--space cosine`, zero or non-unit
+vectors. Exit code 0 when clean, 1 on any failure, 2 on warnings only.
+Where a finding points at bytes or a node, it names the file offset and
+node, so it can be looked up in a hex dump.
 
 `stats` reports, per graph level, the node count, neighbor slots, edges,
 the out-degree histogram, and the nodes no search can reach. A node's

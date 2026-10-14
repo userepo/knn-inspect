@@ -535,6 +535,27 @@ fn check_neighbor_lists(col: &mut Collector, bytes: &[u8], graph: &HnswGraph<'_>
                 if id == -1 {
                     continue;
                 }
+                // A neighbor on a level it is not on: a search stepping to
+                // it would read the slots of whatever node follows it. Ids
+                // outside the graph are the neighbor_ids check's.
+                if level > 0
+                    && let Some(neighbor_levels) =
+                        usize::try_from(id).ok().and_then(|i| graph.levels.get(i))
+                    && i64::from(neighbor_levels.get()) <= i64::try_from(level).unwrap_or(i64::MAX)
+                {
+                    let top = neighbor_levels.get().saturating_sub(1);
+                    let on = match top {
+                        0 => "only on level 0".to_owned(),
+                        t if t > 0 => format!("only on levels 0..={t}"),
+                        _ => "on no level".to_owned(),
+                    };
+                    col.fail(
+                        Check::NeighborLevels,
+                        format!("node {node} lists {id} on level {level}, but {id} is {on}"),
+                        at(k),
+                        Some(node),
+                    );
+                }
                 if id == node_id {
                     col.warn(
                         Check::SelfLoops,

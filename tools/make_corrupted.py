@@ -172,6 +172,19 @@ def build() -> Cases:
 
     c.add("entry-point-not-on-top", SYNTHETIC_L2, "entry point set to a node that is only on level 0", "entry_point", "failure", entry_not_on_top)
 
+    def neighbor_off_level(d, f):
+        o = f["hnsw.levels.data"]["offset"]
+        n = f["hnsw.levels.len"]["value"]
+        levels = struct.unpack_from(f"<{n}i", d, o)
+        upper = next(i for i, l in enumerate(levels) if l >= 2)
+        lower = next(i for i, l in enumerate(levels) if l == 1)
+        (start,) = struct.unpack_from("<Q", d, f["hnsw.offsets.data"]["offset"] + upper * 8)
+        (cum1,) = struct.unpack_from("<i", d, f["hnsw.cum_nneighbor_per_level.data"]["offset"] + 4)
+        put(d, f["hnsw.neighbors.data"]["offset"] + (start + cum1) * 4, "<i", lower)
+        return d
+
+    c.add("neighbor-off-level", SYNTHETIC_L2, "a level-1 slot set to a node that is only on level 0", "neighbor_levels", "failure", neighbor_off_level)
+
     def duplicate_neighbor(d, f):
         o = f["hnsw.neighbors.data"]["offset"]
         (first,) = struct.unpack_from("<i", d, o)

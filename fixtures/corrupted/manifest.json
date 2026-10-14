@@ -180,6 +180,16 @@
     }
   },
   {
+    "file": "neighbor-off-level.faiss",
+    "source": "fixtures/synthetic/l2-100x4.faiss",
+    "mutation": "a level-1 slot set to a node that is only on level 0",
+    "space": null,
+    "expect": {
+      "check": "neighbor_levels",
+      "severity": "failure"
+    }
+  },
+  {
     "file": "duplicate-neighbor.faiss",
     "source": "fixtures/synthetic/l2-100x4.faiss",
     "mutation": "node 0 level 0 slot 1 copied from slot 0",

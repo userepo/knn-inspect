@@ -97,6 +97,9 @@ pub enum Check {
     EntryPoint,
     /// Every neighbor slot is -1 or a node id.
     NeighborIds,
+    /// Every neighbor listed on a level is itself on that level. A search
+    /// that steps to one that is not reads the wrong node's slots.
+    NeighborLevels,
     /// The flat storage holds exactly `count x dimension` floats.
     VectorCount,
     /// The ID map holds one label per node.
@@ -113,7 +116,7 @@ pub enum Check {
 
 impl Check {
     /// Every check, in run order.
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 17] = [
         Self::Envelope,
         Self::Checksum,
         Self::Structure,
@@ -124,6 +127,7 @@ impl Check {
         Self::Levels,
         Self::EntryPoint,
         Self::NeighborIds,
+        Self::NeighborLevels,
         Self::VectorCount,
         Self::IdMapLength,
         Self::VectorValues,
@@ -146,6 +150,7 @@ impl Check {
             Self::Levels => "levels",
             Self::EntryPoint => "entry_point",
             Self::NeighborIds => "neighbor_ids",
+            Self::NeighborLevels => "neighbor_levels",
             Self::VectorCount => "vector_count",
             Self::IdMapLength => "id_map_length",
             Self::VectorValues => "vector_values",
