@@ -1,3 +1,10 @@
 /target
 /.venv
 __pycache__/
+
+# cargo-fuzz: the corpus is seeded from the fixtures by fuzz/seed.sh
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+/fuzz/coverage
+/fuzz/fuzz-*.log

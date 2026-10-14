@@ -6,6 +6,8 @@ members = [
     "crates/knn-recall",
     "crates/knn-inspect",
 ]
+# The fuzz crate is its own root: nightly-only, built by cargo-fuzz.
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"

@@ -1,0 +1,24 @@
+# The fuzz crate lives outside the workspace, as cargo-fuzz expects; it
+# builds with nightly and libFuzzer. See fuzz/README.md.
+[package]
+name = "knn-inspect-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4.13"
+knn-format = { path = "../crates/knn-format" }
+knn-check = { path = "../crates/knn-check" }
+
+[[bin]]
+name = "parse_and_verify"
+path = "fuzz_targets/parse_and_verify.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

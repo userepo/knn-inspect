@@ -104,6 +104,12 @@ arrays.
   with `--out` it writes the bare Faiss payload for `faiss.read_index`
 - `tools/walk_faiss.py <file>` prints every Faiss field with its offset
 
+## Fuzzing
+
+`fuzz/` holds a cargo-fuzz target that feeds arbitrary bytes to the
+parser and every check; the rule is a result, never a panic. It needs
+nightly and Linux; see [fuzz/README.md](fuzz/README.md).
+
 ## Platform
 
 Little-endian targets only. Built with the Rust release pinned in
