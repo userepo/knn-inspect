@@ -13,6 +13,10 @@ publish.workspace = true
 knn-format.workspace = true
 knn-check.workspace = true
 knn-recall.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
 
 [lints]
 workspace = true

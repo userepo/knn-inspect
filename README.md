@@ -9,8 +9,21 @@ Rust, read-only, and does not link Faiss or talk to a cluster.
 
 ## Status
 
-Early development. The file format is confirmed and fixtures are in place
-(see [docs/format-notes.md](docs/format-notes.md)); the parser is next.
+Early development. The parser and the `info` command work on every
+fixture (see [docs/format-notes.md](docs/format-notes.md) for the
+format); `verify`, `stats`, `recall`, and `scan` are next.
+
+## Usage
+
+```
+cargo run --release -- info <file.faiss> [--json]
+```
+
+`info` prints the envelope (footer offset and whether its CRC32
+verifies), the Faiss layout, dimension, vector count, metric, HNSW
+parameters, level sizes, and the label range. Exit code 0 when the file
+parsed, 1 otherwise. A cosine field reports `inner_product`, because
+that is what the file records; k-NN normalizes the vectors instead.
 
 ## Scope (v1)
 
@@ -78,6 +91,10 @@ arrays.
 
 Little-endian targets only. Built with the Rust release pinned in
 `rust-toolchain.toml`.
+
+Files are memory-mapped, so point the tool at segment files at rest.
+Lucene never rewrites a segment file in place, but a file that another
+process is still writing or may truncate must not be inspected.
 
 ## License
 

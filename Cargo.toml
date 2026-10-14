@@ -21,6 +21,20 @@ knn-format = { path = "crates/knn-format" }
 knn-check = { path = "crates/knn-check" }
 knn-recall = { path = "crates/knn-recall" }
 
+# knn-format: the mapping, unaligned little-endian views, the footer CRC.
+memmap2 = "0.9.11"
+zerocopy = "0.8.63"
+crc32fast = "1.5.2"
+thiserror = "2.0.21"
+
+# knn-inspect: the CLI and its output.
+clap = { version = "4.6.7", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive"] }
+# float_roundtrip: the tests compare parsed floats with values Faiss
+# Python printed; the default fast parser can be a ULP off.
+serde_json = { version = "1.0.154", features = ["float_roundtrip"] }
+anyhow = "1.0.104"
+
 [workspace.lints.rust]
 ambiguous_negative_literals = "warn"
 missing_debug_implementations = "warn"
@@ -32,6 +46,12 @@ unused_lifetimes = "warn"
 
 [workspace.lints.clippy]
 cargo = { level = "warn", priority = -1 }
+# Two `syn` majors appear in the dependency list: clap and serde derive
+# macros use syn 3, while zerocopy lists zerocopy-derive (syn 2) under a
+# target condition that is never true, to keep the two crates' versions
+# in step. The lint reads the list, not what is built, so this cannot be
+# resolved from here; deny.toml reports duplicates instead.
+multiple_crate_versions = "allow"
 complexity = { level = "warn", priority = -1 }
 correctness = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }

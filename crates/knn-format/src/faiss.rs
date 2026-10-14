@@ -1,0 +1,379 @@
+//! The Faiss payload: `IxMp` wrapping `IHNf` over flat storage, as
+//! `faiss/impl/index_read.cpp` reads it.
+//!
+//! Every array is a view into the file's bytes. Element types are the
+//! unaligned little-endian wrappers from `zerocopy`; call `.get()` on an
+//! element for its native value.
+
+use std::fmt;
+
+use zerocopy::little_endian::{F32, F64, I32, I64, U64};
+
+use crate::reader::Cursor;
+use crate::{Error, Result};
+
+/// A Faiss index type tag.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FourCc(pub [u8; 4]);
+
+impl FourCc {
+    /// `IndexIDMap`.
+    pub const ID_MAP: Self = Self(*b"IxMp");
+    /// `IndexHNSWFlat`.
+    pub const HNSW_FLAT: Self = Self(*b"IHNf");
+    /// `IndexFlatL2`.
+    pub const FLAT_L2: Self = Self(*b"IxF2");
+    /// `IndexFlatIP`.
+    pub const FLAT_IP: Self = Self(*b"IxFI");
+}
+
+impl fmt::Display for FourCc {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for &b in &self.0 {
+            if b.is_ascii_graphic() {
+                write!(f, "{}", char::from(b))?;
+            } else {
+                write!(f, "\\x{b:02x}")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for FourCc {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "FourCc({self})")
+    }
+}
+
+/// The distance an index was built for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Metric {
+    /// `METRIC_INNER_PRODUCT` (0). k-NN also stores cosine fields this
+    /// way, over normalized vectors.
+    InnerProduct,
+    /// `METRIC_L2` (1): squared Euclidean distance.
+    L2,
+    /// Any other `faiss::MetricType`.
+    Other(i32),
+}
+
+impl Metric {
+    #[must_use]
+    pub fn from_type(metric_type: i32) -> Self {
+        match metric_type {
+            0 => Self::InnerProduct,
+            1 => Self::L2,
+            other => Self::Other(other),
+        }
+    }
+
+    /// The name k-NN uses for the space, or the Faiss number.
+    #[must_use]
+    pub fn name(self) -> String {
+        match self {
+            Self::InnerProduct => "inner_product".to_owned(),
+            Self::L2 => "l2".to_owned(),
+            Self::Other(n) => format!("metric_{n}"),
+        }
+    }
+}
+
+/// The fields every Faiss index starts with (`read_index_header`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct IndexHeader {
+    /// File offset of the fourcc.
+    pub offset: usize,
+    /// Dimension.
+    pub d: i32,
+    /// Vector count.
+    pub ntotal: i64,
+    /// Two reserved int64s; Faiss writes `1 << 20` in both.
+    pub reserved: [i64; 2],
+    /// Whether the index is trained.
+    pub is_trained: bool,
+    /// `faiss::MetricType` as stored.
+    pub metric_type: i32,
+    /// Present only when `metric_type > 1`.
+    pub metric_arg: Option<f32>,
+}
+
+impl IndexHeader {
+    #[must_use]
+    pub fn metric(&self) -> Metric {
+        Metric::from_type(self.metric_type)
+    }
+
+    fn read(cur: &mut Cursor<'_>, offset: usize) -> Result<Self> {
+        // The header holds scalars only; no view into the data outlives
+        // the call, so the cursor's lifetime is irrelevant here.
+        let d_offset = cur.offset();
+        let d = cur.i32("dimension")?;
+        if d < 0 {
+            return Err(Error::InvalidValue {
+                offset: d_offset,
+                what: "dimension",
+                value: i64::from(d),
+            });
+        }
+        let ntotal_offset = cur.offset();
+        let ntotal = cur.i64("vector count")?;
+        if ntotal < 0 {
+            return Err(Error::InvalidValue {
+                offset: ntotal_offset,
+                what: "vector count",
+                value: ntotal,
+            });
+        }
+        let reserved = [cur.i64("reserved field")?, cur.i64("reserved field")?];
+        let is_trained = cur.u8("is_trained flag")? != 0;
+        let metric_type = cur.i32("metric type")?;
+        let metric_arg = if metric_type > 1 {
+            Some(cur.f32("metric argument")?)
+        } else {
+            None
+        };
+        Ok(Self {
+            offset,
+            d,
+            ntotal,
+            reserved,
+            is_trained,
+            metric_type,
+            metric_arg,
+        })
+    }
+}
+
+/// The HNSW graph (`read_HNSW`).
+#[derive(Debug, Clone, Copy)]
+pub struct HnswGraph<'a> {
+    /// Probability of a node reaching each level.
+    pub assign_probas: &'a [F64],
+    /// Cumulative neighbor slots per level: slots for level `l` are
+    /// `cum[l]..cum[l + 1]` relative to a node's offset.
+    pub cum_nneighbor_per_level: &'a [I32],
+    /// Number of levels each node is on (1-based), one per node.
+    pub levels: &'a [I32],
+    /// Start of each node's neighbor slots; one more entry than nodes.
+    pub offsets: &'a [U64],
+    /// All neighbor slots; -1 marks an empty one.
+    pub neighbors: &'a [I32],
+    /// Node to start searches from, on the top level.
+    pub entry_point: i32,
+    /// Top level, or -1 for an empty graph.
+    pub max_level: i32,
+    /// Build parameter.
+    pub ef_construction: i32,
+    /// Search parameter as stored.
+    pub ef_search: i32,
+    /// Deprecated; Faiss writes 1.
+    pub upper_beam: i32,
+}
+
+impl<'a> HnswGraph<'a> {
+    fn read(cur: &mut Cursor<'a>) -> Result<Self> {
+        Ok(HnswGraph {
+            assign_probas: cur.vector("assign_probas")?,
+            cum_nneighbor_per_level: cur.vector("cum_nneighbor_per_level")?,
+            levels: cur.vector("levels")?,
+            offsets: cur.vector("offsets")?,
+            neighbors: cur.vector("neighbors")?,
+            entry_point: cur.i32("entry_point")?,
+            max_level: cur.i32("max_level")?,
+            ef_construction: cur.i32("efConstruction")?,
+            ef_search: cur.i32("efSearch")?,
+            upper_beam: cur.i32("upper_beam")?,
+        })
+    }
+
+    /// Nodes in the graph.
+    #[must_use]
+    pub fn node_count(&self) -> usize {
+        self.levels.len()
+    }
+
+    /// `M`, the neighbor slots per node on the upper levels, as recorded
+    /// in `cum_nneighbor_per_level`; `None` if the table is too short.
+    #[must_use]
+    pub fn m(&self) -> Option<i32> {
+        let cum = self.cum_nneighbor_per_level;
+        match (cum.get(1), cum.get(2)) {
+            (Some(l1), Some(l2)) => l2.get().checked_sub(l1.get()),
+            (Some(l1), None) => Some(l1.get() / 2),
+            _ => None,
+        }
+    }
+
+    /// Nodes present on each level, level 0 first. Empty for an empty
+    /// graph.
+    ///
+    /// The number of levels comes from `max_level`, capped by the size of
+    /// the per-level table so a corrupt `max_level` cannot drive an
+    /// allocation; a node's own level is clamped the same way.
+    #[must_use]
+    pub fn level_counts(&self) -> Vec<usize> {
+        let claimed = self
+            .max_level
+            .checked_add(1)
+            .and_then(|n| usize::try_from(n).ok())
+            .unwrap_or(0);
+        let n_levels = claimed.min(self.cum_nneighbor_per_level.len());
+        let mut counts = vec![0_usize; n_levels];
+        for level in self.levels {
+            let n = usize::try_from(level.get()).unwrap_or(0).min(n_levels);
+            for count in counts.iter_mut().take(n) {
+                *count = count.saturating_add(1);
+            }
+        }
+        counts
+    }
+
+    /// The neighbor slots of `node` on `level`, or `None` when the node
+    /// does not exist, is not on that level, or the recorded range falls
+    /// outside the node's own slots.
+    ///
+    /// The level check matters: a node's slots are followed directly by
+    /// the next node's, so the bare `offsets` + `cum_nneighbor_per_level`
+    /// arithmetic for a level the node is not on lands in its neighbor's
+    /// slots and returns plausible-looking data.
+    #[must_use]
+    pub fn neighbors_of(&self, node: usize, level: usize) -> Option<&[I32]> {
+        let node_levels = usize::try_from(self.levels.get(node)?.get()).ok()?;
+        if level >= node_levels {
+            return None;
+        }
+        let start = usize::try_from(self.offsets.get(node)?.get()).ok()?;
+        let next = usize::try_from(self.offsets.get(node.checked_add(1)?)?.get()).ok()?;
+        let lo = usize::try_from(self.cum_nneighbor_per_level.get(level)?.get()).ok()?;
+        let hi = usize::try_from(
+            self.cum_nneighbor_per_level
+                .get(level.checked_add(1)?)?
+                .get(),
+        )
+        .ok()?;
+        let begin = start.checked_add(lo)?;
+        let end = start.checked_add(hi)?;
+        if begin > end || end > next {
+            return None;
+        }
+        self.neighbors.get(begin..end)
+    }
+}
+
+/// Flat float32 storage (`IndexFlatL2` or `IndexFlatIP`).
+#[derive(Debug, Clone, Copy)]
+pub struct FlatStorage<'a> {
+    /// `IxF2` or `IxFI`.
+    pub fourcc: FourCc,
+    /// The storage index's own header.
+    pub header: IndexHeader,
+    /// All vectors, row-major: `ntotal` rows of `d`.
+    pub codes: &'a [F32],
+}
+
+impl FlatStorage<'_> {
+    /// Vector `i`, or `None` when it is not entirely inside `codes`.
+    #[must_use]
+    pub fn vector(&self, i: usize) -> Option<&[F32]> {
+        let d = usize::try_from(self.header.d).ok()?;
+        let start = i.checked_mul(d)?;
+        self.codes.get(start..start.checked_add(d)?)
+    }
+
+    /// Rows that `codes` holds in full.
+    #[must_use]
+    pub fn row_count(&self) -> usize {
+        match usize::try_from(self.header.d) {
+            Ok(d) if d > 0 => self.codes.len() / d,
+            _ => 0,
+        }
+    }
+}
+
+/// `IndexHNSWFlat`: the graph plus its storage.
+#[derive(Debug, Clone, Copy)]
+pub struct HnswIndex<'a> {
+    /// The HNSW index's own header.
+    pub header: IndexHeader,
+    /// The graph.
+    pub graph: HnswGraph<'a>,
+    /// The vectors.
+    pub storage: FlatStorage<'a>,
+}
+
+/// `IndexIDMap`: the outermost index, mapping node ids to labels.
+#[derive(Debug, Clone, Copy)]
+pub struct IdMapIndex<'a> {
+    /// The ID map's own header.
+    pub header: IndexHeader,
+    /// The wrapped index.
+    pub index: HnswIndex<'a>,
+    /// One label per node. k-NN writes Lucene doc ids.
+    pub id_map: &'a [I64],
+    /// File offset just past the last byte of the index.
+    pub end: usize,
+}
+
+/// Parses the payload, `base` being its offset in the file.
+///
+/// # Errors
+///
+/// Returns an error for any fourcc outside the supported layout, a
+/// negative dimension or count, or a structure running past the data.
+pub fn parse(payload: &[u8], base: usize) -> Result<IdMapIndex<'_>> {
+    let mut cur = Cursor::new(payload, base);
+
+    let offset = cur.offset();
+    expect_fourcc(&mut cur, &[FourCc::ID_MAP], "IxMp")?;
+    let header = IndexHeader::read(&mut cur, offset)?;
+
+    let hnsw_offset = cur.offset();
+    expect_fourcc(&mut cur, &[FourCc::HNSW_FLAT], "IHNf")?;
+    let hnsw_header = IndexHeader::read(&mut cur, hnsw_offset)?;
+    let graph = HnswGraph::read(&mut cur)?;
+
+    let storage_offset = cur.offset();
+    let fourcc = expect_fourcc(
+        &mut cur,
+        &[FourCc::FLAT_L2, FourCc::FLAT_IP],
+        "IxF2 or IxFI",
+    )?;
+    let storage_header = IndexHeader::read(&mut cur, storage_offset)?;
+    let codes = cur.xb_vector("vectors")?;
+
+    let id_map = cur.vector("id_map")?;
+
+    Ok(IdMapIndex {
+        header,
+        index: HnswIndex {
+            header: hnsw_header,
+            graph,
+            storage: FlatStorage {
+                fourcc,
+                header: storage_header,
+                codes,
+            },
+        },
+        id_map,
+        end: cur.offset(),
+    })
+}
+
+fn expect_fourcc(
+    cur: &mut Cursor<'_>,
+    accepted: &[FourCc],
+    expected: &'static str,
+) -> Result<FourCc> {
+    let offset = cur.offset();
+    let fourcc = FourCc(cur.fourcc("index type")?);
+    if accepted.contains(&fourcc) {
+        Ok(fourcc)
+    } else {
+        Err(Error::UnsupportedLayout {
+            offset,
+            fourcc,
+            expected,
+        })
+    }
+}
