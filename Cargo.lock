@@ -198,6 +198,7 @@ dependencies = [
  "knn-check",
  "knn-format",
  "knn-recall",
+ "memchr",
  "serde",
  "serde_json",
 ]

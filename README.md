@@ -9,9 +9,9 @@ Rust, read-only, and does not link Faiss or talk to a cluster.
 
 ## Status
 
-Early development. `info`, `verify`, `stats`, and `recall` work on every
-fixture (see [docs/format-notes.md](docs/format-notes.md) for the
-format); `scan` is next.
+Early development: every planned command works on every fixture. See
+[docs/format-notes.md](docs/format-notes.md) for the file format and
+[docs/json.md](docs/json.md) for the JSON output of each command.
 
 ## Install
 
@@ -33,6 +33,7 @@ knn-inspect verify <file.faiss> [--space l2|innerproduct|cosine] [--max-findings
 knn-inspect stats <file.faiss> [--json]
 knn-inspect recall <file.faiss> (--queries <q.f32> | --sample N [--seed S]) [--k N] [--ef-search N] [--json]
 knn-inspect recall <file.faiss> --queries <q.f32> --results <r.jsonl> [--k N] [--ids <ids.json>] [--json]
+knn-inspect scan <dir> [--space l2|innerproduct|cosine] [--max-findings N] [--json]
 ```
 
 `info` prints the envelope (footer offset and whether its CRC32
@@ -91,6 +92,23 @@ within a list counts once, and -1 (Faiss's "no result") never matches.
 The report gives recall@k, a histogram of matches per query, and counts
 of the anomalies above. Exit code 0 when the results were scored, 1
 otherwise.
+
+`scan` finds every `.faiss` and `.faissc` file under a directory,
+subdirectories included, and runs `verify` on each, printing one summary
+line per file (layout, dimension, count, metric, verdict) and the checks
+that failed or warned. Links to directories are not followed, so a link
+back up the tree cannot loop; a link to a native file is scanned like the
+file. A subdirectory that cannot be read is listed as not scanned, and
+the rest of the tree still is.
+
+`scan` also cross-checks the vectors against Lucene's own copy: the
+segment's `.vec` file holds the same vectors in the same order, and the
+native file's storage must appear in it byte for byte. A compound
+segment keeps its `.vec` inside the `.cfs`, so the check is skipped
+there. `--space` applies to every file found; leave it out when the
+directory mixes space types. Exit code 0 when every file is clean, 1 if
+any failed (or would not open, a subdirectory could not be read, or none
+was found), 2 if the worst verdict was a warning.
 
 ## Scope (v1)
 

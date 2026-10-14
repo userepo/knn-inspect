@@ -2,6 +2,7 @@
 
 mod info;
 mod recall;
+mod scan;
 mod stats;
 mod verify;
 
@@ -52,6 +53,8 @@ enum Command {
     },
     /// Score search results, the tool's own or supplied, against exact brute force.
     Recall(recall::RecallArgs),
+    /// Verify and summarize every native file under a directory.
+    Scan(scan::ScanArgs),
 }
 
 fn main() -> ExitCode {
@@ -66,6 +69,7 @@ fn main() -> ExitCode {
         } => verify::run(&file, space, max_findings, json),
         Command::Stats { file, json } => stats::run(&file, json),
         Command::Recall(args) => recall::run(&args),
+        Command::Scan(args) => scan::run(&args),
     };
     match result {
         Ok(code) => code,

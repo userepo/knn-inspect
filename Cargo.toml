@@ -39,6 +39,8 @@ serde = { version = "1.0.229", features = ["derive"] }
 # Python printed; the default fast parser can be a ULP off.
 serde_json = { version = "1.0.154", features = ["float_roundtrip"] }
 anyhow = "1.0.104"
+# knn-inspect scan: linear-time search for the native vectors in a .vec.
+memchr = "2.8.3"
 
 [workspace.lints.rust]
 ambiguous_negative_literals = "warn"

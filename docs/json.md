@@ -1,0 +1,127 @@
+# JSON output
+
+Every command takes `--json` and prints one object. The shape is stable:
+fields keep their names and meanings, and new ones are only added. A
+field marked *optional* is left out when it does not apply; a field
+marked *nullable* is present with `null`. Offsets are byte offsets from
+the start of the file. Node ids are Faiss node numbers (0-based storage
+rows); labels are the ID map's values, which k-NN sets to Lucene doc ids.
+
+## `info`
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `file` | string | The path as given |
+| `size` | integer | File size in bytes |
+| `envelope.header` | object, nullable | Lucene codec header, if present: `length`, `codec`, `version`, `segment_id` (hex), `suffix`. k-NN writes none |
+| `envelope.footer` | object, nullable | Lucene footer: `offset`, `algorithm`, `checksum` (hex string), `verified` (whether the CRC32 matches) |
+| `payload.offset`, `payload.length` | integer | Where the Faiss payload lies |
+| `payload.trailing_bytes` | integer | Bytes between the end of the index and the footer; 0 in a well-formed file |
+| `layout` | array of strings | The Faiss fourccs, outermost first: `IxMp`, `IHNf`, then `IxF2` or `IxFI` |
+| `dimension` | integer | Vector dimension |
+| `count` | integer | Vector count from the ID map's header |
+| `metric` | string | `l2` or `inner_product` as the file records it; a cosine field reads `inner_product` |
+| `hnsw.m` | integer, nullable | Neighbor slots per node on the upper levels; `null` if the level table is too short to say |
+| `hnsw.ef_construction`, `hnsw.ef_search` | integer | As stored |
+| `hnsw.max_level`, `hnsw.entry_point` | integer | As stored; `-1` for an empty graph |
+| `hnsw.level_counts` | array of integers | Nodes on each level, level 0 first |
+| `hnsw.neighbor_slots` | integer | Length of the neighbor array |
+| `ids.len` | integer | Labels in the ID map |
+| `ids.first`, `ids.last` | integer, nullable | First and last label; `null` when there are none |
+
+## `verify`
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `file`, `size` | | As for `info` |
+| `space` | string, nullable | The `--space` given: `l2`, `innerproduct`, or `cosinesimil`; `null` when none |
+| `status` | string | `clean`, `warnings`, or `failed`; the exit code is 0, 2, or 1 |
+| `failures`, `warnings` | integer | Checks that reported a failure, and checks that reported a warning and nothing worse |
+| `checks` | array | One entry per check, in run order (see below) |
+
+Each entry of `checks`:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `name` | string | The check: `envelope`, `checksum`, `structure`, `trailing`, `headers`, `metric`, `offsets`, `levels`, `entry_point`, `neighbor_ids`, `neighbor_levels`, `vector_count`, `id_map_length`, `vector_values`, `duplicate_neighbors`, `self_loops`, `norms` |
+| `severity` | string, nullable | The worst finding: `info`, `warning`, or `failure`; `null` when the check passed silently or was skipped |
+| `skipped` | string, optional | Why the check did not run |
+| `count` | integer | Findings in total, however many are listed |
+| `findings` | array | The first findings, up to `--max-findings`: `message`, plus `offset` and `node` when the finding points at bytes or a node (both optional) |
+
+## `stats`
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `file` | string | The path as given |
+| `nodes` | integer | Nodes in the graph |
+| `entry_point`, `max_level` | integer | As stored |
+| `layers` | array | One entry per level, level 0 first (see below) |
+
+Each entry of `layers`:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `level` | integer | The level |
+| `nodes` | integer | Nodes on this level |
+| `slots` | integer | Neighbor slots per node on this level |
+| `edges` | integer | Neighbors listed, summed over the level's nodes; a list ends at its first empty slot |
+| `degree_min`, `degree_max` | integer, nullable | Out-degree range; `null` on an empty level |
+| `degree_histogram` | array of integers | Entry `k` is the number of nodes with `k` neighbors |
+| `unreachable` | integer | Nodes on this level no search can reach |
+| `unreachable_nodes` | array of integers | Those nodes, in id order |
+
+## `recall`
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `file` | string | The path as given |
+| `queries_file` | string, optional | The `--queries` file |
+| `sample` | object, optional | For `--sample`: `count` and `seed` |
+| `results_file` | string, optional | The `--results` file |
+| `ids_file` | string, optional | The `--ids` file |
+| `search` | object, optional | For the tool's own search: `ef_search` used and `search_ms` |
+| `dimension`, `vectors` | integer | Of the file |
+| `metric` | string | As for `info` |
+| `ground_truth_ms` | integer | Time of the brute-force pass |
+| `k` | integer | The `--k` given |
+| `k_effective` | integer | Matches a perfect result list has: `k`, or fewer when the file holds fewer vectors at a finite distance; the largest over all queries |
+| `queries` | integer | Queries scored |
+| `recall` | number | Matches over all queries, divided by the matches perfect lists would have |
+| `matches_histogram` | array of integers | Entry `m` is the number of queries with exactly `m` matches |
+| `missing` | integer | Entries that were -1 (no result) |
+| `unknown` | integer | Labels no node carries, or whose node has no stored vector |
+| `duplicates` | integer | Labels repeated within one list; each counts once |
+| `truncated` | integer | Lists longer than `k`; the extra ranks were ignored |
+
+## `scan`
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `directory` | string | The path as given |
+| `space` | string, nullable | The `--space` given, as for `verify` |
+| `status` | string | The worst verdict over the files: `failed` also when a file would not open, a subdirectory could not be read, or no file was found |
+| `files` | array | One entry per `.faiss` or `.faissc` file, in path order (see below) |
+| `unreadable` | array, optional | Subdirectories, or entries in one, that could not be read and so were not scanned: `path` and `error`. Any entry makes `status` `failed` |
+| `summary` | object | `files`, `clean`, `warnings`, `failed`: counts of entries by status |
+
+Each entry of `files`:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `file` | string | The file's path |
+| `size` | integer, nullable | Bytes; `null` when the file would not open |
+| `error` | string, optional | Why the file would not open; `failures`, `warnings`, and `checks` are then absent, and `lucene_vectors` is `skipped` |
+| `layout`, `dimension`, `count`, `metric` | optional | As for `info`; absent when the file did not parse |
+| `status` | string | `clean`, `warnings`, or `failed`, counting the Lucene cross-check |
+| `failures`, `warnings`, `checks` | optional | As for `verify` |
+| `lucene_vectors.status` | string | `match`, `mismatch`, or `skipped` |
+| `lucene_vectors.file` | string, optional | The segment's `.vec` file the vectors were found in, or the first one looked in |
+| `lucene_vectors.offset` | integer, optional | Where in that file the stored vectors begin |
+| `lucene_vectors.detail` | string | What was found, or why the check was skipped |
+
+The Lucene cross-check looks for the native file's stored vectors, byte
+for byte, inside the `.vec` (Lucene flat vectors) files of the same
+segment, which hold the same vectors in the same order; a `mismatch`
+fails the file. It is skipped when no loose `.vec` lies beside the native
+file, as in a compound segment, where the `.vec` is inside the `.cfs`.

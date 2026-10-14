@@ -629,3 +629,275 @@ fn recall_search_bounds_huge_parameters() {
     let recall = v["recall"].as_f64().unwrap();
     assert!(recall > 0.0 && recall < 1.0, "{v}");
 }
+
+#[test]
+fn scan_walks_a_directory_and_cross_checks_lucene_vectors() {
+    let root = fixtures().join("opensearch-3.9.0");
+    let o = run(&["scan", root.to_str().unwrap(), "--json"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["status"], "clean");
+    assert_eq!(
+        v["summary"],
+        serde_json::json!({"files": 6, "clean": 6, "warnings": 0, "failed": 0})
+    );
+    let files = v["files"].as_array().unwrap();
+    assert_eq!(files.len(), 6);
+    for f in files {
+        assert_eq!(f["status"], "clean", "{f}");
+        assert_eq!(f["count"], 500);
+        assert_eq!(f["dimension"], 16);
+        assert_eq!(f["checks"].as_array().unwrap().len(), 17);
+        let name = f["file"].as_str().unwrap();
+        let lv = &f["lucene_vectors"];
+        if name.ends_with(".faissc") {
+            // Compound segments keep the .vec inside the .cfs.
+            assert_eq!(lv["status"], "skipped", "{f}");
+            assert!(lv.get("offset").is_none());
+        } else {
+            assert_eq!(lv["status"], "match", "{f}");
+            assert_eq!(lv["offset"], 128, "{f}");
+            assert!(
+                lv["file"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with("_2_NativeEngines990KnnVectorsFormat_0.vec"),
+                "{f}"
+            );
+        }
+    }
+
+    let o = run(&["scan", root.to_str().unwrap()]);
+    let text = stdout(&o);
+    assert!(text.contains("6 native file(s)"), "{text}");
+    assert!(
+        text.contains(
+            "pass      lucene_vectors       500 vectors found byte for byte at offset 128"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("skip      lucene_vectors       no .vec file of segment _2 beside"),
+        "{text}"
+    );
+    assert!(
+        text.trim_end()
+            .ends_with("6 file(s): 6 clean, 0 with warnings, 0 failed; exit code 0"),
+        "{text}"
+    );
+}
+
+#[test]
+fn scan_reports_every_corrupted_file() {
+    let dir = fixtures().join("corrupted");
+    let o = run(&["scan", dir.to_str().unwrap(), "--json"]);
+    assert_eq!(o.status.code(), Some(1));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["status"], "failed");
+    let files = v["files"].as_array().unwrap();
+    // Every corrupted fixture is listed, including the zero-length one.
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(files.len(), manifest.as_array().unwrap().len());
+    assert!(
+        v["summary"]["failed"].as_u64().unwrap() >= 19,
+        "{}",
+        v["summary"]
+    );
+    // The warning-only cases keep their verdict; cosine ones need --space.
+    assert!(
+        v["summary"]["warnings"].as_u64().unwrap() >= 4,
+        "{}",
+        v["summary"]
+    );
+    let empty = files
+        .iter()
+        .find(|f| f["file"].as_str().unwrap().ends_with("empty.faiss"))
+        .unwrap();
+    assert_eq!(empty["status"], "failed");
+    assert!(empty.get("dimension").is_none(), "{empty}");
+    assert_eq!(empty["lucene_vectors"]["status"], "skipped");
+
+    let o = run(&["scan", dir.to_str().unwrap()]);
+    let text = stdout(&o);
+    assert!(text.contains("FAIL      neighbor_levels"), "{text}");
+    assert!(text.contains("WARN      self_loops"), "{text}");
+    assert!(text.contains("(did not parse)"), "{text}");
+}
+
+#[test]
+fn scan_flags_vectors_that_differ_from_the_lucene_copy() {
+    // A segment whose .vec holds other vectors than the native file.
+    let scratch = std::env::temp_dir().join(format!("knn-inspect-scan-{}", std::process::id()));
+    std::fs::create_dir_all(&scratch).unwrap();
+    let l2 = fixtures().join("opensearch-3.9.0/nocfs/l2");
+    let ip = fixtures().join("opensearch-3.9.0/nocfs/innerproduct");
+    std::fs::copy(
+        l2.join("_2_165_vec.faiss"),
+        scratch.join("_2_165_vec.faiss"),
+    )
+    .unwrap();
+    std::fs::copy(
+        ip.join("_2_NativeEngines990KnnVectorsFormat_0.vec"),
+        scratch.join("_2_NativeEngines990KnnVectorsFormat_0.vec"),
+    )
+    .unwrap();
+    // A .vec of another segment must not be consulted.
+    std::fs::copy(
+        l2.join("_2_NativeEngines990KnnVectorsFormat_0.vec"),
+        scratch.join("_3_NativeEngines990KnnVectorsFormat_0.vec"),
+    )
+    .unwrap();
+    let o = run(&["scan", scratch.to_str().unwrap(), "--json"]);
+    assert_eq!(o.status.code(), Some(1), "{}", stdout(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    let f = &v["files"][0];
+    assert_eq!(f["failures"], 0, "verify itself is clean: {f}");
+    assert_eq!(f["status"], "failed", "{f}");
+    assert_eq!(f["lucene_vectors"]["status"], "mismatch", "{f}");
+    assert!(
+        f["lucene_vectors"]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("_2_NativeEngines990KnnVectorsFormat_0.vec"),
+        "{f}"
+    );
+    assert!(
+        !f["lucene_vectors"]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("_3_"),
+        "{f}"
+    );
+
+    // No native files is a failure, not a clean report.
+    let empty = scratch.join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    let o = run(&["scan", empty.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(stdout(&o).contains("0 native file(s)"));
+    std::fs::remove_dir_all(&scratch).unwrap();
+
+    let o = run(&["scan", "no-such-dir"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&o.stderr).starts_with("error: reading directory"));
+}
+
+/// A scratch directory under the system temp dir, removed on drop.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new(name: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("knn-inspect-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Self(dir)
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+fn scan_searches_zero_filled_vectors_in_linear_time() {
+    // Zero-filled pages are what a crash leaves. With the native storage
+    // and the .vec both zeros except one late byte, a naive substring
+    // search compares nearly the whole storage at every offset: about 30 s
+    // for this 1 MB in a release build. The linear search takes
+    // milliseconds even unoptimized.
+    let scratch = Scratch::new("scan-zeros");
+    let mut bytes = std::fs::read(fixtures().join("synthetic/l2-4000x64.faiss")).unwrap();
+    let (start, len) = {
+        let parsed = knn_format::parse(&bytes).unwrap();
+        let codes = parsed.index.index.storage.codes;
+        (
+            knn_format::view_offset(&bytes, codes).unwrap(),
+            codes.len() * 4,
+        )
+    };
+    bytes[start..start + len].fill(0);
+    bytes[start + len - 1] = 1;
+    std::fs::write(scratch.0.join("_2_165_vec.faiss"), &bytes).unwrap();
+    std::fs::write(
+        scratch.0.join("_2_NativeEngines990KnnVectorsFormat_0.vec"),
+        vec![0_u8; len * 2],
+    )
+    .unwrap();
+
+    let started = std::time::Instant::now();
+    let o = run(&["scan", scratch.0.to_str().unwrap(), "--json"]);
+    let elapsed = started.elapsed();
+    assert_eq!(o.status.code(), Some(1), "{}", stdout(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["files"][0]["lucene_vectors"]["status"], "mismatch");
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "the .vec search took {elapsed:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn scan_does_not_follow_directory_links() {
+    // A link back up the tree would make a following walk endless.
+    let scratch = Scratch::new("scan-links");
+    let shard = scratch.0.join("shard");
+    std::fs::create_dir_all(&shard).unwrap();
+    std::fs::copy(
+        fixtures().join("synthetic/l2-100x4.faiss"),
+        shard.join("_0_165_vec.faiss"),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(&scratch.0, shard.join("loop")).unwrap();
+    // A link to a native file is scanned like the file.
+    std::os::unix::fs::symlink(
+        fixtures()
+            .join("synthetic/ip-100x4.faiss")
+            .canonicalize()
+            .unwrap(),
+        scratch.0.join("_1_165_vec.faiss"),
+    )
+    .unwrap();
+
+    let o = run(&["scan", scratch.0.to_str().unwrap(), "--json"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["summary"]["files"], 2, "{v}");
+}
+
+#[cfg(unix)]
+#[test]
+fn scan_reports_unreadable_subdirectories_and_continues() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let scratch = Scratch::new("scan-unreadable");
+    std::fs::copy(
+        fixtures().join("synthetic/l2-100x4.faiss"),
+        scratch.0.join("_0_165_vec.faiss"),
+    )
+    .unwrap();
+    let locked = scratch.0.join("locked");
+    std::fs::create_dir_all(&locked).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // Root reads any directory; the case cannot be staged there.
+    if std::fs::read_dir(&locked).is_ok() {
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+
+    let o = run(&["scan", scratch.0.to_str().unwrap(), "--json"]);
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(o.status.code(), Some(1), "{}", stdout(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    // The readable file is still scanned and clean.
+    assert_eq!(v["summary"]["files"], 1, "{v}");
+    assert_eq!(v["files"][0]["status"], "clean", "{v}");
+    assert_eq!(v["status"], "failed");
+    let unreadable = v["unreadable"].as_array().unwrap();
+    assert_eq!(unreadable.len(), 1, "{v}");
+    assert!(unreadable[0]["path"].as_str().unwrap().ends_with("locked"));
+    assert_ne!(unreadable[0]["error"].as_str().unwrap(), "");
+}
