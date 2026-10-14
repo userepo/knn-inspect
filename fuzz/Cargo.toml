@@ -13,6 +13,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4.13"
 knn-format = { path = "../crates/knn-format" }
 knn-check = { path = "../crates/knn-check" }
+knn-recall = { path = "../crates/knn-recall" }
 
 [[bin]]
 name = "parse_and_verify"

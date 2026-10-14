@@ -1,8 +1,9 @@
 # Fuzzing
 
 One libFuzzer target, `parse_and_verify`, feeds arbitrary bytes to
-`knn_format::parse`, `knn_check::verify`, and `knn_check::graph_stats`.
-The rule under test: any input yields a result, never a panic or an
+`knn_format::parse`, `knn_check::verify`, `knn_check::graph_stats`, and
+an HNSW search (`knn_recall::Searcher`) over whatever graph parsed. The
+rule under test: any input yields a result, never a panic or an
 out-of-bounds read.
 
 cargo-fuzz needs a nightly toolchain and does not support Windows MSVC;

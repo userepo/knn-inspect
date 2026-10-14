@@ -9,10 +9,9 @@ Rust, read-only, and does not link Faiss or talk to a cluster.
 
 ## Status
 
-Early development. `info`, `verify`, `stats`, and `recall` (scoring
-external results) work on every fixture (see
-[docs/format-notes.md](docs/format-notes.md) for the format); the tool's
-own HNSW search and `scan` are next.
+Early development. `info`, `verify`, `stats`, and `recall` work on every
+fixture (see [docs/format-notes.md](docs/format-notes.md) for the
+format); `scan` is next.
 
 ## Install
 
@@ -32,6 +31,7 @@ cargo install --git https://github.com/userepo/knn-inspect --tag v0.1.0 knn-insp
 knn-inspect info <file.faiss> [--json]
 knn-inspect verify <file.faiss> [--space l2|innerproduct|cosine] [--max-findings N] [--json]
 knn-inspect stats <file.faiss> [--json]
+knn-inspect recall <file.faiss> (--queries <q.f32> | --sample N [--seed S]) [--k N] [--ef-search N] [--json]
 knn-inspect recall <file.faiss> --queries <q.f32> --results <r.jsonl> [--k N] [--ids <ids.json>] [--json]
 ```
 
@@ -61,20 +61,35 @@ from the entry point, each lower level from every node reached above it,
 so no query can ever visit an unreachable node.
 Exit code 0 when the file parsed, 1 otherwise.
 
-`recall` scores search results produced elsewhere (Faiss, or a live
-OpenSearch query) against exact brute force over the file's own vectors.
-`--queries` is the query vectors as row-major little-endian float32 in the
-file's dimension; `--results` has one line per query, in the same order,
-holding the returned labels in rank order as a JSON array or
-`{"labels": [...]}`. A label matches when its vector is at least as close
-to the query as the k-th nearest, so a tie with the k-th neighbor counts;
-a label repeated within a list counts once, and -1 (Faiss's "no result")
-never matches. Labels are the file's own (Lucene doc ids in a k-NN
-segment) unless `--ids` names a JSON array with node i's id at index i,
-one per vector, for results that carry some other id, such as a stored
-position field returned by a live query. The report gives recall@k, a histogram of
-matches per query, and counts of the anomalies above. Exit code 0 when
-the results were scored, 1 otherwise.
+`recall` measures recall@k against exact brute force over the file's own
+vectors. By default it searches the file's HNSW graph itself, following
+Faiss's search step for step (greedy descent through the upper levels,
+then a best-first search on level 0 with a candidate queue of
+`max(efSearch, k)`); on the fixtures it returns the same result lists as
+Faiss for the same queries and parameters. This is also the search the
+k-NN plugin runs for a query without a filter or nested field: its JNI
+layer passes only efSearch and keeps Faiss's other search defaults.
+`--ef-search` overrides the efSearch stored in the file. As in Faiss, a
+search with efSearch below k can return fewer than k results; the report
+counts the empty slots as missing, and an `--ef-search` of at least k
+avoids them. `--queries` is the query vectors as row-major little-endian
+float32 in the file's dimension; `--sample N` takes N of the file's own
+vectors instead, chosen by `--seed`.
+
+With `--results`, the tool scores lists produced elsewhere (Faiss, or a
+live OpenSearch query): one line per query, in the same order, holding
+the returned labels in rank order as a JSON array or `{"labels": [...]}`.
+Labels are the file's own (Lucene doc ids in a k-NN segment) unless
+`--ids` names a JSON array with node i's id at index i, one per vector,
+for results that carry some other id, such as a stored position field
+returned by a live query.
+
+A label matches when its vector is at least as close to the query as the
+k-th nearest, so a tie with the k-th neighbor counts; a label repeated
+within a list counts once, and -1 (Faiss's "no result") never matches.
+The report gives recall@k, a histogram of matches per query, and counts
+of the anomalies above. Exit code 0 when the results were scored, 1
+otherwise.
 
 ## Scope (v1)
 
@@ -163,8 +178,8 @@ so rewrite them after regenerating either fixture set:
 ## Fuzzing
 
 `fuzz/` holds a cargo-fuzz target that feeds arbitrary bytes to the
-parser, every check, and the graph statistics; the rule is a result,
-never a panic. It needs nightly and Linux; see
+parser, every check, the graph statistics, and the HNSW search; the rule
+is a result, never a panic. It needs nightly and Linux; see
 [fuzz/README.md](fuzz/README.md).
 
 ## Platform

@@ -50,28 +50,8 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Score search results against exact brute force over the file's vectors.
-    Recall {
-        /// A `.faiss` or `.faissc` file.
-        file: PathBuf,
-        /// Query vectors: row-major little-endian float32, the file's dimension.
-        #[arg(long)]
-        queries: PathBuf,
-        /// One result list per query, in query order: a JSON array of labels
-        /// per line, or `{"labels": [...]}`.
-        #[arg(long)]
-        results: PathBuf,
-        /// Neighbors per query to score; longer lists are cut to this.
-        #[arg(long, default_value_t = 10)]
-        k: usize,
-        /// A JSON array naming node i as `ids[i]`, when the results use ids
-        /// other than the file's labels (a stored position field, say).
-        #[arg(long)]
-        ids: Option<PathBuf>,
-        /// Print the report as JSON.
-        #[arg(long)]
-        json: bool,
-    },
+    /// Score search results, the tool's own or supplied, against exact brute force.
+    Recall(recall::RecallArgs),
 }
 
 fn main() -> ExitCode {
@@ -85,14 +65,7 @@ fn main() -> ExitCode {
             json,
         } => verify::run(&file, space, max_findings, json),
         Command::Stats { file, json } => stats::run(&file, json),
-        Command::Recall {
-            file,
-            queries,
-            results,
-            k,
-            ids,
-            json,
-        } => recall::run(&file, &queries, &results, k, ids.as_deref(), json),
+        Command::Recall(args) => recall::run(&args),
     };
     match result {
         Ok(code) => code,

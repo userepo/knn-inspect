@@ -436,3 +436,196 @@ fn recall_checks_the_ids_map_and_bounds_k() {
     let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
     assert_eq!(v["k_effective"], 100);
 }
+
+#[test]
+fn recall_searches_the_file_itself() {
+    let dir = fixtures().join("synthetic");
+    let file = dir.join("l2-4000x64.faiss");
+    let queries = dir.join("l2-4000x64.queries.f32");
+    let base = [
+        "recall",
+        file.to_str().unwrap(),
+        "--queries",
+        queries.to_str().unwrap(),
+    ];
+
+    // At the stored efSearch the search reproduces Faiss's own recall.
+    let o = run(&[&base[..], &["--json"]].concat());
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["search"]["ef_search"], 16);
+    assert!(v["search"]["search_ms"].is_number());
+    assert!(v.get("results_file").is_none());
+    assert!((v["recall"].as_f64().unwrap() - 0.689).abs() <= 0.01, "{v}");
+
+    // A wider queue finds nearly everything; only the unreachable nodes
+    // are out of reach.
+    let o = run(&[&base[..], &["--ef-search", "4000", "--json"]].concat());
+    assert_eq!(o.status.code(), Some(0));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["search"]["ef_search"], 4000);
+    assert!(v["recall"].as_f64().unwrap() >= 0.99, "{v}");
+
+    let o = run(&base);
+    let text = stdout(&o);
+    assert!(
+        text.contains("results         own HNSW search, efSearch 16, "),
+        "{text}"
+    );
+}
+
+#[test]
+fn recall_samples_queries_from_the_file() {
+    let file = fixtures().join("synthetic/ip-1000x32.faiss");
+    let args = [
+        "recall",
+        file.to_str().unwrap(),
+        "--sample",
+        "25",
+        "--seed",
+        "9",
+        "--json",
+    ];
+    let first = run(&args);
+    assert_eq!(
+        first.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let a: serde_json::Value = serde_json::from_str(&stdout(&first)).unwrap();
+    assert_eq!(a["sample"], serde_json::json!({"count": 25, "seed": 9}));
+    assert_eq!(a["queries"], 25);
+    assert!(a.get("queries_file").is_none());
+    // Sampled queries score like any others (0.992 here).
+    assert!(a["recall"].as_f64().unwrap() >= 0.9, "{a}");
+
+    // The same seed gives the same sample and the same score.
+    let second = run(&args);
+    let b: serde_json::Value = serde_json::from_str(&stdout(&second)).unwrap();
+    assert_eq!(a["recall"], b["recall"]);
+    assert_eq!(a["matches_histogram"], b["matches_histogram"]);
+
+    let o = run(&["recall", file.to_str().unwrap(), "--sample", "25"]);
+    let text = stdout(&o);
+    assert!(
+        text.contains("queries         25 sampled from the file (seed 1)"),
+        "{text}"
+    );
+
+    let o = run(&["recall", file.to_str().unwrap(), "--sample", "5000"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("cannot sample 5000 queries from 1000 vectors")
+    );
+}
+
+#[test]
+fn recall_rejects_contradictory_options() {
+    let dir = fixtures().join("synthetic");
+    let file = dir.join("l2-100x4.faiss");
+    let queries = dir.join("l2-100x4.queries.f32");
+    let results = dir.join("l2-100x4.results.jsonl");
+    let (file_s, queries_s, results_s) = (
+        file.to_str().unwrap(),
+        queries.to_str().unwrap(),
+        results.to_str().unwrap(),
+    );
+    // clap reports usage errors with exit code 2.
+    let o = run(&["recall", file_s]);
+    assert_eq!(o.status.code(), Some(2));
+    let o = run(&["recall", file_s, "--queries", queries_s, "--sample", "3"]);
+    assert_eq!(o.status.code(), Some(2));
+    let o = run(&[
+        "recall",
+        file_s,
+        "--queries",
+        queries_s,
+        "--results",
+        results_s,
+        "--ef-search",
+        "32",
+    ]);
+    assert_eq!(o.status.code(), Some(2));
+    let o = run(&["recall", file_s, "--queries", queries_s, "--ids", results_s]);
+    assert_eq!(o.status.code(), Some(2));
+    let o = run(&["recall", file_s, "--sample", "3", "--results", results_s]);
+    assert_eq!(o.status.code(), Some(2));
+    let o = run(&["recall", file_s, "--queries", queries_s, "--seed", "5"]);
+    assert_eq!(o.status.code(), Some(2));
+    // A stray --seed names --sample as the missing argument.
+    for extra in [
+        &["--seed", "5"][..],
+        &["--seed", "5", "--results", results_s][..],
+    ] {
+        let o = run(&[&["recall", file_s][..], extra].concat());
+        assert_eq!(o.status.code(), Some(2));
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(err.contains("--sample"), "{err}");
+    }
+    // efSearch 0 would stop the search after one step; it is never meant.
+    let o = run(&["recall", file_s, "--queries", queries_s, "--ef-search", "0"]);
+    assert_eq!(o.status.code(), Some(2));
+    // --ids without --results, in the two forms clap would otherwise let
+    // through because --results conflicts with another given option.
+    let o = run(&["recall", file_s, "--sample", "3", "--ids", results_s]);
+    assert_eq!(o.status.code(), Some(2));
+    let o = run(&[
+        "recall",
+        file_s,
+        "--queries",
+        queries_s,
+        "--ef-search",
+        "5",
+        "--ids",
+        results_s,
+    ]);
+    assert_eq!(o.status.code(), Some(2));
+}
+
+#[test]
+fn recall_search_bounds_huge_parameters() {
+    // k and efSearch far beyond the vector count are searched, not an
+    // allocation abort.
+    let dir = fixtures().join("synthetic");
+    let file = dir.join("l2-100x4.faiss");
+    let queries = dir.join("l2-100x4.queries.f32");
+    let search = |extra: [&str; 2]| {
+        let o = run(&[
+            "recall",
+            file.to_str().unwrap(),
+            "--queries",
+            queries.to_str().unwrap(),
+            extra[0],
+            extra[1],
+            "--json",
+        ]);
+        assert_eq!(
+            o.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        serde_json::from_str::<serde_json::Value>(&stdout(&o)).unwrap()
+    };
+
+    // A queue that wide explores the whole graph: every true neighbor is
+    // found.
+    let v = search(["--ef-search", "1000000000000"]);
+    assert_eq!(v["recall"], 1.0, "{v}");
+    assert_eq!(v["missing"], 0, "{v}");
+
+    // k is cut to the 100 vectors. The stored efSearch of 16 stays, and as
+    // in Faiss a search with efSearch below k stops before it has k
+    // results, so the lists come back short and the report says so.
+    let v = search(["--k", "1000000000000"]);
+    assert_eq!(v["k_effective"], 100, "{v}");
+    assert!(v["missing"].as_u64().unwrap() > 0, "{v}");
+    let recall = v["recall"].as_f64().unwrap();
+    assert!(recall > 0.0 && recall < 1.0, "{v}");
+}

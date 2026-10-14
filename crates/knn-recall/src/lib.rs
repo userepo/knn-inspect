@@ -9,14 +9,20 @@
 //!
 //! Result lists carry the file's own labels (the ID map's) unless the
 //! caller supplies [`Labels`] built from ids of its own, such as the
-//! position field a live query returns.
+//! position field a live query returns. The tool's own result lists come
+//! from [`search_all`], an HNSW search over the file's graph that follows
+//! Faiss's; [`sample_queries`] draws queries from the file's vectors.
 //!
 //! Distances are float32 sums in element order, as Faiss computes them but
 //! without its SIMD regrouping, so two neighbors a last bit apart can
 //! order differently here than in Faiss.
 
+mod hnsw;
+
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
+
+pub use hnsw::{Hit, Searcher, result_labels, search_all};
 
 use knn_format::faiss::{FlatStorage, Metric};
 use knn_format::{F32, I64};
@@ -87,6 +93,14 @@ pub enum Error {
         truth: usize,
         /// Queries given.
         queries: usize,
+    },
+    /// More sample queries asked for than the file has vectors.
+    #[error("cannot sample {count} queries from {rows} vectors")]
+    SampleTooLarge {
+        /// Queries asked for.
+        count: usize,
+        /// Vectors in the file.
+        rows: usize,
     },
 }
 
@@ -228,9 +242,70 @@ impl Labels {
     }
 }
 
+/// `count` distinct rows of `storage` as queries, chosen by a fixed
+/// generator from `seed`, with the rows they came from. The same seed
+/// and file give the same queries on every platform.
+///
+/// # Errors
+///
+/// Returns an error when `count` is 0 or exceeds the vector count, or
+/// the dimension is unusable.
+pub fn sample_queries(
+    storage: &FlatStorage<'_>,
+    count: usize,
+    seed: u64,
+) -> Result<(Queries, Vec<usize>)> {
+    let rows = storage.row_count();
+    if count > rows {
+        return Err(Error::SampleTooLarge { count, rows });
+    }
+    let d = usize::try_from(storage.header.d)
+        .ok()
+        .filter(|&d| d > 0)
+        .ok_or(Error::Dimension {
+            d: storage.header.d,
+        })?;
+    // A partial Fisher-Yates shuffle over the identity permutation, kept
+    // sparse: only positions a swap has touched are stored, so memory
+    // follows the sample size, not the file. The first `count` positions
+    // end up holding distinct rows.
+    let mut moved: HashMap<usize, usize> = HashMap::with_capacity(count.saturating_mul(2));
+    let at = |moved: &HashMap<usize, usize>, p: usize| moved.get(&p).copied().unwrap_or(p);
+    let mut state = seed;
+    for i in 0..count {
+        let remaining = u64::try_from(rows - i).unwrap_or(u64::MAX);
+        let offset = usize::try_from(splitmix64(&mut state) % remaining).unwrap_or(0);
+        let j = i.saturating_add(offset);
+        let (vi, vj) = (at(&moved, i), at(&moved, j));
+        moved.insert(i, vj);
+        moved.insert(j, vi);
+    }
+    let order: Vec<usize> = (0..count).map(|i| at(&moved, i)).collect();
+    let mut data = Vec::with_capacity(count.saturating_mul(d));
+    for &row in &order {
+        data.extend(
+            storage
+                .vector(row)
+                .unwrap_or_default()
+                .iter()
+                .map(|v| v.get()),
+        );
+    }
+    Ok((Queries::from_rows(d, data)?, order))
+}
+
+/// `SplitMix64`: a small, well-distributed generator with no dependency.
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
 /// Smaller is closer: squared L2, or the negated inner product.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Distance {
+pub(crate) enum Distance {
     L2,
     NegatedInnerProduct,
 }

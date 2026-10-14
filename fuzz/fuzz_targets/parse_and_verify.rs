@@ -1,9 +1,9 @@
 //! Any byte string must parse to `Ok` or `Err`, never panic, and every
-//! check and the graph statistics must run over whatever parsed. Panics,
-//! including failed bounds checks, fail the run; AddressSanitizer covers
-//! the unsafe code inside dependencies (zerocopy's casts, crc32fast's
-//! SIMD). The memory map is not exercised: the harness parses bytes, not
-//! files.
+//! check, the graph statistics, and an HNSW search must run over whatever
+//! parsed. Panics, including failed bounds checks, fail the run;
+//! AddressSanitizer covers the unsafe code inside dependencies (zerocopy's
+//! casts, crc32fast's SIMD). The memory map is not exercised: the harness
+//! parses bytes, not files.
 
 #![no_main]
 
@@ -28,6 +28,19 @@ fuzz_target!(|data: &[u8]| {
         let stats = knn_check::graph_stats(graph);
         assert_eq!(stats.nodes, graph.node_count());
         assert_eq!(stats.layers.len(), graph.level_counts().len());
+        // The HNSW search over an arbitrary graph, with the first stored
+        // vector as the query so the query's size is bounded by the file.
+        if let Some(v) = parsed.index.index.storage.vector(0) {
+            let query: Vec<f32> = v.iter().map(|x| x.get()).collect();
+            let mut searcher = knn_recall::Searcher::new(graph.node_count());
+            if let Ok(hits) = searcher.search(&parsed.index.index, &query, 3, 5) {
+                assert!(hits.len() <= 3);
+                // Padded to k, or to the node count when the graph is
+                // smaller: no list can hold more.
+                let labels = knn_recall::result_labels(&parsed.index, &hits, 3);
+                assert_eq!(labels.len(), 3.min(graph.node_count()));
+            }
+        }
         let _ = parsed.index.index.storage.vector(0);
         let _ = parsed.index.index.storage.row_count();
         if let Some(footer) = parsed.envelope.footer {
