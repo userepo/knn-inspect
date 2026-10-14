@@ -13,11 +13,23 @@ Early development. `info` and `verify` work on every fixture (see
 [docs/format-notes.md](docs/format-notes.md) for the format); `stats`,
 `recall`, and `scan` are next.
 
+## Install
+
+Each release carries a prebuilt binary for Linux (x86_64 and aarch64,
+static, musl), macOS (arm64), and Windows (x86_64), with a `SHA256SUMS`
+file; see the [releases page](https://github.com/userepo/knn-inspect/releases).
+The macOS binary is not notarized; after unpacking, run
+`xattr -d com.apple.quarantine knn-inspect`. Or build from source:
+
+```
+cargo install --git https://github.com/userepo/knn-inspect --tag v0.1.0 knn-inspect
+```
+
 ## Usage
 
 ```
-cargo run --release -- info <file.faiss> [--json]
-cargo run --release -- verify <file.faiss> [--space l2|innerproduct|cosine] [--max-findings N] [--json]
+knn-inspect info <file.faiss> [--json]
+knn-inspect verify <file.faiss> [--space l2|innerproduct|cosine] [--max-findings N] [--json]
 ```
 
 `info` prints the envelope (footer offset and whether its CRC32

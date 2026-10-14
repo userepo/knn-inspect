@@ -1,0 +1,103 @@
+# Pushing a tag `v<version>` checks the tag against the Cargo version and
+# the README's install line, builds the CLI for each target, and opens a
+# draft release holding the archives and their SHA-256 sums. Publishing
+# the draft is a manual step. The toolchain comes from rust-toolchain.toml.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Static Linux binaries: no libc version to match, so they run
+          # in any container the segment files are already in. The runner
+          # release does not reach the binaries; the newest GA image is
+          # the one that stays available longest.
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-26.04
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-26.04-arm
+          - target: aarch64-apple-darwin
+            os: macos-26
+          - target: x86_64-pc-windows-msvc
+            os: windows-2025
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check that the tag matches the Cargo version and the README
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          cargo_version="$(cargo pkgid -p knn-inspect | sed 's/.*[#@]//')"
+          if [ "$version" != "$cargo_version" ]; then
+            echo "tag $GITHUB_REF_NAME but Cargo.toml says $cargo_version" >&2
+            exit 1
+          fi
+          if ! grep -q -- "--tag $GITHUB_REF_NAME " README.md; then
+            echo "README.md's cargo install line does not say --tag $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+      - name: Add target
+        run: rustup target add ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --locked -p knn-inspect --target ${{ matrix.target }}
+      - name: Smoke test
+        shell: bash
+        run: |
+          bin="target/${{ matrix.target }}/release/knn-inspect"
+          if [ "${{ runner.os }}" = Windows ]; then
+            bin="$bin.exe"
+          fi
+          "$bin" --version
+          "$bin" verify fixtures/opensearch-3.9.0/nocfs/l2/_2_165_vec.faiss
+      - name: Archive
+        shell: bash
+        run: |
+          name="knn-inspect-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir "$name"
+          cp LICENSE "$name/"
+          if [ "${{ runner.os }}" = Windows ]; then
+            cp "target/${{ matrix.target }}/release/knn-inspect.exe" "$name/"
+            7z a "$name.zip" "$name" > /dev/null
+          else
+            cp "target/${{ matrix.target }}/release/knn-inspect" "$name/"
+            tar czf "$name.tar.gz" "$name"
+          fi
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            knn-inspect-*.tar.gz
+            knn-inspect-*.zip
+          if-no-files-found: error
+
+  release:
+    name: Draft release
+    needs: build
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --draft --verify-tag --title "$GITHUB_REF_NAME" --generate-notes dist/*
