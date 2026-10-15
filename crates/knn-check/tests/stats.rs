@@ -22,17 +22,24 @@ fn fixtures() -> PathBuf {
 }
 
 /// Every baseline: `<name>.stats.json` beside each synthetic fixture,
-/// `stats.json` beside each real one.
+/// `stats.json` beside each real one, float and fp16.
 fn baselines() -> Vec<PathBuf> {
     let mut out = Vec::new();
-    for entry in fs::read_dir(fixtures().join("synthetic")).unwrap() {
-        let p = entry.unwrap().path();
-        if p.to_string_lossy().ends_with(".stats.json") {
-            out.push(p);
+    for synthetic in ["synthetic", "synthetic-fp16"] {
+        for entry in fs::read_dir(fixtures().join(synthetic)).unwrap() {
+            let p = entry.unwrap().path();
+            if p.to_string_lossy().ends_with(".stats.json") {
+                out.push(p);
+            }
         }
     }
-    for mode in ["nocfs", "cfs"] {
-        for entry in fs::read_dir(fixtures().join("opensearch-3.9.0").join(mode)).unwrap() {
+    for set in [
+        "opensearch-3.9.0/nocfs",
+        "opensearch-3.9.0/cfs",
+        "opensearch-3.9.0-fp16/sq-fp16",
+        "opensearch-3.9.0-fp16/half-float",
+    ] {
+        for entry in fs::read_dir(fixtures().join(set)).unwrap() {
             out.push(entry.unwrap().path().join("stats.json"));
         }
     }
@@ -74,7 +81,7 @@ fn stats_match_faiss_python() {
         unreachable_seen += stats.layers.iter().map(|l| l.unreachable).sum::<usize>();
         seen += 1;
     }
-    assert_eq!(seen, 11, "5 synthetic and 6 real baselines");
+    assert_eq!(seen, 20, "8 synthetic and 12 real baselines");
     // l2-4000x64 has unreachable nodes on levels 0 and 1, so the search
     // itself is compared, not only the empty case.
     assert_eq!(unreachable_seen, 8);

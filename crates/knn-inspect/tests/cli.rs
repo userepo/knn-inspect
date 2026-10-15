@@ -818,7 +818,7 @@ fn scan_searches_zero_filled_vectors_in_linear_time() {
     let mut bytes = std::fs::read(fixtures().join("synthetic/l2-4000x64.faiss")).unwrap();
     let (start, len) = {
         let parsed = knn_format::parse(&bytes).unwrap();
-        let codes = parsed.index.index.storage.codes;
+        let codes = parsed.index.index.storage.flat().unwrap().codes;
         (
             knn_format::view_offset(&bytes, codes).unwrap(),
             codes.len() * 4,
@@ -1112,4 +1112,75 @@ fn scan_skips_a_sound_si_in_a_newer_format() {
     assert_eq!(o.status.code(), Some(1), "{}", stdout(&o));
     let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
     assert_eq!(v["files"][0]["lucene_docs"]["status"], "damaged");
+}
+
+#[test]
+fn fp16_files_are_read() {
+    let real = fixtures().join("opensearch-3.9.0-fp16/half-float/cosinesimil/_2_165_vec.faiss");
+    let path = real.to_str().unwrap();
+    let o = run(&["info", path]);
+    assert_eq!(o.status.code(), Some(0));
+    let text = stdout(&o);
+    assert!(text.contains("IxMp > IHNs > IxSQ"), "{text}");
+    assert!(
+        text.contains(
+            "quantizer       QT_fp16 (type 4), dimension 16, code size 32, trained values 0"
+        ),
+        "{text}"
+    );
+
+    let o = run(&["info", "--json", path]);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["layout"], serde_json::json!(["IxMp", "IHNs", "IxSQ"]));
+    assert_eq!(v["metric"], "inner_product");
+    assert_eq!(
+        v["quantizer"],
+        serde_json::json!({"qtype": 4, "name": "QT_fp16", "dimension": 16, "code_size": 32, "trained": 0})
+    );
+    let float = fixtures().join("opensearch-3.9.0/nocfs/l2/_2_165_vec.faiss");
+    let o = run(&["info", "--json", float.to_str().unwrap()]);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert!(v.get("quantizer").is_none(), "{v}");
+
+    let o = run(&["verify", path, "--space", "cosinesimil"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+    let o = run(&["stats", path]);
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+}
+
+#[test]
+fn recall_says_fp16_is_not_read_yet() {
+    let real = fixtures().join("opensearch-3.9.0-fp16/sq-fp16/l2/_2_165_vec.faiss");
+    let o = run(&["recall", real.to_str().unwrap(), "--sample", "5"]);
+    assert_eq!(o.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(err.contains("IxSQ storage is not supported yet"), "{err}");
+}
+
+#[test]
+fn scan_reads_fp16_segments() {
+    let root = fixtures().join("opensearch-3.9.0-fp16");
+    let o = run(&["scan", root.to_str().unwrap(), "--json"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(
+        v["summary"],
+        serde_json::json!({"files": 6, "clean": 6, "warnings": 0, "failed": 0})
+    );
+    for f in v["files"].as_array().unwrap() {
+        assert_eq!(
+            f["layout"],
+            serde_json::json!(["IxMp", "IHNs", "IxSQ"]),
+            "{f}"
+        );
+        assert_eq!(f["lucene_vectors"]["status"], "skipped", "{f}");
+        assert!(
+            f["lucene_vectors"]["detail"]
+                .as_str()
+                .unwrap()
+                .contains("fp16"),
+            "{f}"
+        );
+        assert_eq!(f["lucene_docs"]["status"], "match", "{f}");
+    }
 }

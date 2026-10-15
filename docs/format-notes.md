@@ -1,11 +1,10 @@
 # Native file format notes
 
-What a k-NN native file for a float HNSW field (and, ahead of parser
-support, an fp16 one) looks like on disk, confirmed byte by byte against
-the pinned sources and fixture files. The Rust parser in `knn-format` is
-checked against this document and the Python walker in
-`tools/walk_faiss.py`, which is a direct transcription of the Faiss read
-path.
+What a k-NN native file for a float or fp16 HNSW field looks like on
+disk, confirmed byte by byte against the pinned sources and fixture
+files. The Rust parser in `knn-format` is checked against this document
+and the Python walker in `tools/walk_faiss.py`, which is a direct
+transcription of the Faiss read path.
 
 ## Pinned versions
 
@@ -166,9 +165,10 @@ walker's dimension, count, metric, level counts, entry point, and
 
 ## Scalar-quantized storage (fp16)
 
-Not yet read by `knn-inspect`, which reports these files as an
-unsupported layout at the `IHNs` tag (offset 37, right after the ID
-map's header). This section records the layout ahead of that support.
+`knn-inspect` reads these files for `info`, `verify`, `stats`, and
+`scan`; `recall` and the `.vec` cross-check of `scan` read float32
+storage only so far. Any quantizer type other than `QT_fp16` is reported
+as unsupported.
 
 k-NN stores fp16 vectors through Faiss's scalar quantizer with `QT_fp16`
 in two ways: the `sq` encoder with `type: fp16` (and `bits: 16`, which
@@ -206,30 +206,43 @@ count is a byte count (`read_vector` of uint8), where the flat layout's
 count is in float32 elements (`READXBVECTOR`); a reader that assumes the
 float convention would read four times too far. And `d` and `code_size`
 are 8-byte `size_t` fields, unlike the 4-byte `d` in the index header.
+Faiss does not trust the stored `code_size`: `read_ScalarQuantizer` ends
+with `set_derived_sizes()`, which recomputes it from `qtype` and `d`.
+`verify` reports a stored value that differs, since Faiss never writes
+one.
 
 Each vector is `code_size` bytes: one IEEE 754 half-precision float per
 component, little-endian, in component order. Decoding to float32 is
-exact, and matches what Faiss reconstructs. Encoding is not quite IEEE:
-Faiss's float-to-half conversion rounds a value exactly halfway between
-two half floats away from zero, where IEEE round-to-nearest (and
-NumPy's `astype(float16)`) rounds it to the even one. Everything else
-rounds the same. Anything that re-encodes float32 vectors to compare
-them with stored codes, such as a check against Lucene's float32 copy,
-must round ties the way Faiss does or report false mismatches.
+exact, and matches what Faiss reconstructs. Encoding rounds to the
+nearest half float, but how it breaks an exact tie depends on the Faiss
+build (`faiss/utils/fp16.h` at `5616caa`). The portable encoder
+(`fp16-inl.h`) rounds a value exactly halfway between two half floats
+away from zero. The F16C encoder (`fp16-fp16c.h`), which Faiss's AVX2
+and AVX-512 builds are compiled with, and the NEON encoder on aarch64
+round it to the even one, as IEEE round-to-nearest and NumPy's
+`astype(float16)` do. The faiss-cpu 1.15.1 wheel that wrote the
+synthetic fixtures on Windows rounds ties away from zero; k-NN on Linux
+x86 loads Faiss's AVX2 or AVX-512 build when the CPU supports it, and
+then rounds them to even. Anything that re-encodes float32 vectors to
+compare them with stored codes, such as a check against Lucene's float32
+copy, must accept either neighbor on an exact tie or report false
+mismatches.
 
 ### Synthetic fp16 fixtures
 
-`tools/make_synthetic.py` writes three to `fixtures/synthetic-fp16/`, each
-with an `.expected.json`: `l2-100x4-fp16`, `l2-1000x32-fp16`, and
-`ip-1000x32-fp16`. They draw the same vectors as the float fixtures of the
-same shape, and their graphs have the same levels and entry points,
+`tools/make_synthetic.py` writes three to `fixtures/synthetic-fp16/`,
+each with an `.expected.json`: `l2-100x4-fp16`, `l2-1000x32-fp16`, and
+`ip-1000x32-fp16`. They draw the same vectors as the float fixtures of
+the same shape, and their graphs have the same levels and entry points,
 since Faiss draws levels from its own seed whatever the storage. The
 neighbor lists differ only where rounding to fp16 reorders close
 candidates: not at all in the 100x4 file, in about 1% and 0.5% of slots
 in the 1000x32 ones (331 and 174 of 32,960). The generator asserts that
 the codes decode to Faiss's own reconstruction and differ from NumPy's
 half-float rounding only on ties rounded away from zero; the three files
-hold 0, 2, and 3 such ties.
+hold 0, 2, and 3 such ties. A Faiss build with the F16C or NEON encoder
+would round those five components to even, so regenerating the files
+there would change their codes.
 
 `tools/walk_faiss.py` reads all three to the end with no trailing bytes.
 In `l2-100x4-fp16.faiss` (16,315 bytes): `IHNs` at 37, `IxSQ` at 14,626,
@@ -255,16 +268,16 @@ encoding:
 
 | Encoding | Lucene vector file | What it holds |
 | --- | --- | --- |
-| `sq` fp16 | `_2_NativeEngines990KnnVectorsFormat_0.vec`, codec `Lucene99FlatVectorsFormatData` | float32: the indexed vectors for `l2` and `innerproduct`, k-NN's normalized ones for `cosinesimil`; the codes are exactly these rounded to fp16 the Faiss way |
+| `sq` fp16 | `_2_NativeEngines990KnnVectorsFormat_0.vec`, codec `Lucene99FlatVectorsFormatData` | float32: the indexed vectors for `l2` and `innerproduct`, k-NN's normalized ones for `cosinesimil`; the codes are exactly these rounded to the nearest half float |
 | `half_float` | `_2_NativeEngines990HalfFloatKnnVectorsFormat_0.vec`, codec `KNN1040HalfFloatFlatVectorsFormatData` | fp16: the same bytes as the codes, at offset 128 |
 
 So a check against Lucene's copy can compare a `half_float` field byte
 for byte, as for float fields, but must round an `sq` fp16 field's
-float32 copy the Faiss way first. The only exact tie in these vectors,
-one component of the normalized cosine vectors, falls where rounding
-away from zero and rounding to even agree, so they cannot show which
-rounding `half_float` uses on a tie; that the codes match Lucene's bytes
-is what is confirmed.
+float32 copy to the nearest half float first, accepting either neighbor
+on an exact tie. The only exact tie in these vectors, one component of
+the normalized cosine vectors, falls where rounding away from zero and
+rounding to even agree, so these files cannot show which tie rule either
+encoding used; that the codes match Lucene's copy is what is confirmed.
 
 For `cosinesimil`, k-NN's normalized float32 vectors differ by up to
 about 1e-7 from a NumPy normalization of the same input, so a check must

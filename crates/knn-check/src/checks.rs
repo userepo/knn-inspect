@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use knn_format::envelope::Envelope;
-use knn_format::faiss::{HnswGraph, IdMapIndex, IndexHeader, Metric};
+use knn_format::faiss::{Fp16Storage, HnswGraph, IdMapIndex, IndexHeader, Metric, Storage};
 use knn_format::{Parsed, view_offset};
 
 use crate::{Check, CheckResult, Finding, Options, Report, Severity, Space, Status};
@@ -11,6 +11,11 @@ use crate::{Check, CheckResult, Finding, Options, Report, Severity, Space, Statu
 /// How far a cosine vector's length may stray from 1 before it is
 /// reported. k-NN normalizes in float32, which lands within ~1e-7.
 const UNIT_NORM_TOLERANCE: f64 = 1e-4;
+
+/// The same for fp16 storage. Rounding each component to half precision
+/// moves it by at most 2^-11 of its value (plus 2^-25 for a subnormal),
+/// so a unit vector's stored length is within about 4.9e-4 of 1.
+const FP16_UNIT_NORM_TOLERANCE: f64 = 1e-3;
 
 /// Runs every check over `bytes`.
 #[must_use]
@@ -40,7 +45,7 @@ pub fn verify(bytes: &[u8], options: &Options) -> Report {
 
     check_trailing(&mut col, &parsed);
     let idx = &parsed.index;
-    check_headers(&mut col, idx);
+    check_headers(&mut col, bytes, idx);
     check_metric(&mut col, idx, options.space);
     let graph = &idx.index.graph;
     check_offsets(&mut col, bytes, graph);
@@ -114,11 +119,11 @@ fn check_trailing(col: &mut Collector, parsed: &Parsed<'_>) {
     }
 }
 
-fn check_headers(col: &mut Collector, idx: &IdMapIndex<'_>) {
+fn check_headers(col: &mut Collector, bytes: &[u8], idx: &IdMapIndex<'_>) {
     let headers: [(&str, &IndexHeader); 3] = [
         ("id map", &idx.header),
         ("hnsw", &idx.index.header),
-        ("storage", &idx.index.storage.header),
+        ("storage", idx.index.storage.header()),
     ];
     let first = &idx.header;
     for (name, h) in &headers {
@@ -181,6 +186,51 @@ fn check_headers(col: &mut Collector, idx: &IdMapIndex<'_>) {
             None,
         );
     }
+    if let Storage::Fp16(storage) = &idx.index.storage {
+        check_quantizer(col, bytes, storage, first.d);
+    }
+}
+
+/// The fp16 quantizer's own fields: its dimension and code size must
+/// match the index, and it has nothing to train.
+fn check_quantizer(col: &mut Collector, bytes: &[u8], storage: &Fp16Storage<'_>, d: i32) {
+    let q = &storage.quantizer;
+    // qtype, rangestat, and rangestat_arg take 4 bytes each.
+    let d_at = q.offset.checked_add(12);
+    let code_size_at = q.offset.checked_add(20);
+    if i64::try_from(q.d).ok() != Some(i64::from(d)) {
+        col.fail(
+            Check::Headers,
+            format!("quantizer dimension {} differs from the id map's {d}", q.d),
+            d_at,
+            None,
+        );
+    }
+    let expected = u64::try_from(d).ok().and_then(|d| d.checked_mul(2));
+    if expected != Some(q.code_size) {
+        col.fail(
+            Check::Headers,
+            format!(
+                "quantizer code size {} is not 2 bytes per component; dimension {d} needs {}",
+                q.code_size,
+                expected.map_or_else(|| "none".to_owned(), |e| e.to_string())
+            ),
+            code_size_at,
+            None,
+        );
+    }
+    if !q.trained.is_empty() {
+        col.warn(
+            Check::Headers,
+            format!(
+                "quantizer holds {} trained value{}; fp16 uses none",
+                q.trained.len(),
+                if q.trained.len() == 1 { "" } else { "s" }
+            ),
+            view_offset(bytes, q.trained),
+            None,
+        );
+    }
 }
 
 fn check_metric(col: &mut Collector, idx: &IdMapIndex<'_>, space: Option<Space>) {
@@ -188,7 +238,7 @@ fn check_metric(col: &mut Collector, idx: &IdMapIndex<'_>, space: Option<Space>)
         col.skip(Check::Metric, "no --space given");
         return;
     };
-    let metric = idx.index.storage.header.metric();
+    let metric = idx.index.storage.header().metric();
     let wanted = match space {
         Space::L2 => Metric::L2,
         Space::InnerProduct | Space::Cosine => Metric::InnerProduct,
@@ -202,7 +252,7 @@ fn check_metric(col: &mut Collector, idx: &IdMapIndex<'_>, space: Option<Space>)
                 space.name(),
                 wanted.name()
             ),
-            Some(idx.index.storage.header.offset),
+            Some(idx.index.storage.header().offset),
             None,
         );
     }
@@ -465,22 +515,26 @@ fn node_of_slot(graph: &HnswGraph<'_>, slot: usize) -> Option<usize> {
 
 fn check_vector_count(col: &mut Collector, idx: &IdMapIndex<'_>) {
     let storage = &idx.index.storage;
+    // Counted as the file counts them: float32 elements, or fp16 bytes.
+    let (held, per_component, unit) = match storage {
+        Storage::Flat(s) => (s.codes.len(), 1, "floats"),
+        Storage::Fp16(s) => (s.codes.len(), 2, "bytes of fp16 codes"),
+    };
     let expected = usize::try_from(idx.header.ntotal)
         .ok()
         .zip(usize::try_from(idx.header.d).ok())
-        .and_then(|(n, d)| n.checked_mul(d));
+        .and_then(|(n, d)| n.checked_mul(d)?.checked_mul(per_component));
     match expected {
-        Some(e) if e == storage.codes.len() => {}
+        Some(e) if e == held => {}
         _ => col.fail(
             Check::VectorCount,
             format!(
-                "storage holds {} floats; {} vectors of dimension {} need {}",
-                storage.codes.len(),
+                "storage holds {held} {unit}; {} vectors of dimension {} need {}",
                 idx.header.ntotal,
                 idx.header.d,
                 expected.map_or_else(|| "more than fit".to_owned(), |e| e.to_string())
             ),
-            Some(storage.header.offset),
+            Some(storage.header().offset),
             None,
         ),
     }
@@ -504,15 +558,17 @@ fn check_id_map_length(col: &mut Collector, bytes: &[u8], idx: &IdMapIndex<'_>) 
 
 fn check_vector_values(col: &mut Collector, bytes: &[u8], idx: &IdMapIndex<'_>) {
     let storage = &idx.index.storage;
-    let d = usize::try_from(idx.header.d).unwrap_or(0).max(1);
-    let base = view_offset(bytes, storage.codes);
-    for (i, v) in storage.codes.iter().enumerate() {
-        let x = v.get();
+    // Vectors numbered as the storage counts them, as in the norms check.
+    let d = usize::try_from(storage.header().d).unwrap_or(0).max(1);
+    let size = storage.component_size();
+    let base = view_offset(bytes, storage.code_bytes());
+    for i in 0..storage.component_count() {
+        let Some(x) = storage.component(i) else { break };
         if !x.is_finite() {
             col.warn(
                 Check::VectorValues,
                 format!("vector {} component {} is {x}", i / d, i % d),
-                base.and_then(|b| b.checked_add(i.checked_mul(4)?)),
+                base.and_then(|b| b.checked_add(i.checked_mul(size)?)),
                 Some(i / d),
             );
         }
@@ -583,17 +639,23 @@ fn check_norms(col: &mut Collector, bytes: &[u8], idx: &IdMapIndex<'_>, space: O
         return;
     }
     let storage = &idx.index.storage;
-    let base = view_offset(bytes, storage.codes);
-    let d = usize::try_from(idx.header.d).unwrap_or(0);
+    let base = view_offset(bytes, storage.code_bytes());
+    let size = storage.component_size();
+    let tolerance = match storage {
+        Storage::Flat(_) => UNIT_NORM_TOLERANCE,
+        Storage::Fp16(_) => FP16_UNIT_NORM_TOLERANCE,
+    };
+    // Rows as the storage counts them, by its own header's dimension.
+    let d = usize::try_from(storage.header().d).unwrap_or(0);
     for i in 0..storage.row_count() {
-        let Some(row) = storage.vector(i) else { break };
-        let norm = row
-            .iter()
-            .map(|v| f64::from(v.get()))
+        let Some(start) = i.checked_mul(d) else { break };
+        let norm = (start..start.saturating_add(d))
+            .filter_map(|c| storage.component(c))
+            .map(f64::from)
             .map(|x| x * x)
             .sum::<f64>()
             .sqrt();
-        let at = base.and_then(|b| b.checked_add(i.checked_mul(d)?.checked_mul(4)?));
+        let at = base.and_then(|b| b.checked_add(start.checked_mul(size)?));
         if norm == 0.0 {
             col.warn(
                 Check::Norms,
@@ -601,7 +663,7 @@ fn check_norms(col: &mut Collector, bytes: &[u8], idx: &IdMapIndex<'_>, space: O
                 at,
                 Some(i),
             );
-        } else if (norm - 1.0).abs() > UNIT_NORM_TOLERANCE {
+        } else if (norm - 1.0).abs() > tolerance {
             col.warn(
                 Check::Norms,
                 format!("vector {i} has length {norm:.6}, not 1"),

@@ -9,9 +9,11 @@ Rust, read-only, and does not link Faiss or talk to a cluster.
 
 ## Status
 
-Early development: every planned command works on every fixture. See
-[docs/format-notes.md](docs/format-notes.md) for the file format and
-[docs/json.md](docs/json.md) for the JSON output of each command.
+Early development: every planned command works on every float fixture;
+on the fp16 fixtures every command but `recall` does, and `scan` skips
+its `.vec` cross-check. See [docs/format-notes.md](docs/format-notes.md)
+for the file format and [docs/json.md](docs/json.md) for the JSON output
+of each command.
 
 ## Install
 
@@ -37,23 +39,26 @@ knn-inspect scan <dir> [--space l2|innerproduct|cosine] [--max-findings N] [--js
 ```
 
 `info` prints the envelope (footer offset and whether its CRC32
-verifies), the Faiss layout, dimension, vector count, metric, HNSW
-parameters, level sizes, and the label range. Exit code 0 when the file
-parsed, 1 otherwise. A cosine field reports `inner_product`, because
-that is what the file records; k-NN normalizes the vectors instead.
+verifies), the Faiss layout, dimension, vector count, metric, the scalar
+quantizer of fp16 storage, HNSW parameters, level sizes, and the label
+range. Exit code 0 when the file parsed, 1 otherwise. A cosine field
+reports `inner_product`, because that is what the file records; k-NN
+normalizes the vectors instead.
 
 `verify` runs every structural check and prints one line per check.
-Failures: footer checksum, truncation or an unsupported layout, trailing
-bytes, disagreeing headers, a `--space` that does not match the stored
-metric, non-monotonic neighbor offsets, node levels that contradict the
-slot counts, an invalid entry point, neighbor ids out of range, a
-neighbor listed on a level it is not on, a vector array or ID map of the
-wrong size. Warnings: an unexpected Lucene header, a Faiss header that
-says the index is not trained, NaN or infinite components, duplicate
-neighbors, self-loops, and with `--space cosine`, zero or non-unit
-vectors. Exit code 0 when clean, 1 on any failure, 2 on warnings only.
-Where a finding points at bytes or a node, it names the file offset and
-node, so it can be looked up in a hex dump.
+Failures: footer checksum, truncation, an unsupported layout or scalar
+quantizer type, trailing bytes, disagreeing headers (for fp16 storage,
+the quantizer's dimension and code size too), a `--space` that does not
+match the stored metric, non-monotonic neighbor offsets, node levels
+that contradict the slot counts, an invalid entry point, neighbor ids
+out of range, a neighbor listed on a level it is not on, a vector array
+or ID map of the wrong size. Warnings: an unexpected Lucene header, a
+Faiss header that says the index is not trained, trained values in an
+fp16 quantizer, NaN or infinite components, duplicate neighbors,
+self-loops, and with `--space cosine`, zero or non-unit vectors. Exit
+code 0 when clean, 1 on any failure, 2 on warnings only. Where a finding
+points at bytes or a node, it names the file offset and node, so it can
+be looked up in a hex dump.
 
 `stats` reports, per graph level, the node count, neighbor slots, edges,
 the out-degree histogram, and the nodes no search can reach. A node's
@@ -76,7 +81,8 @@ search with efSearch below k can return fewer than k results; the report
 counts the empty slots as missing, and an `--ef-search` of at least k
 avoids them. `--queries` is the query vectors as row-major little-endian
 float32 in the file's dimension; `--sample N` takes N of the file's own
-vectors instead, chosen by `--seed`.
+vectors instead, chosen by `--seed`. `recall` reads float32 storage only
+so far, and stops with an error on a file with fp16 storage.
 
 With `--results`, the tool scores lists produced elsewhere (Faiss, or a
 live OpenSearch query): one line per query, in the same order, holding
@@ -105,7 +111,9 @@ the rest of the tree still is.
 its segment. The `.vec` file holds the same vectors in the same order,
 and the native file's storage must appear in it byte for byte; a
 compound segment keeps its `.vec` inside the `.cfs`, so this check is
-skipped there. The `.si` file gives the segment's document count, and
+skipped there. It is also skipped for fp16 storage for now, without
+opening the `.vec`, so a damaged `.vec` beside an fp16 file is not
+reported yet. The `.si` file gives the segment's document count, and
 every label in the ID map, which k-NN sets to a doc id, must be one of
 the segment's doc ids. A `.vec` or `.si` that is there but cannot be
 read, or fails its own checksum, fails the native file too: the segment
@@ -177,15 +185,20 @@ checksums of this run are in
 ## Supported files
 
 Faiss-engine native files (`.faiss`, and `.faissc` beside a compound
-segment) for float vector fields: an ID map wrapping HNSW with flat
-float32 storage, L2 or inner product (k-NN's `cosinesimil` is inner
-product over normalized vectors), with or without the Lucene footer.
-Fixtures and format notes target OpenSearch 3.9.0.
+segment) for HNSW fields: an ID map wrapping HNSW with flat float32
+storage, or with fp16 scalar-quantized storage (the `sq` encoder with
+`type: fp16`, and the `half_float` data type), L2 or inner product
+(k-NN's `cosinesimil` is inner product over normalized vectors), with or
+without the Lucene footer. `info`, `verify`, `stats`, and `scan` read
+both; `recall` and the `.vec` cross-check of `scan` read float32 storage
+only so far. Fixtures and format notes target OpenSearch 3.9.0.
 
-Not yet: scalar-quantized fields (`half_float`, fp16), byte and binary
-vectors, product quantization, and IVF. Their files are reported as an
-unsupported layout rather than misread. NMSLIB and Lucene-engine fields
-write no `.faiss` file, so `scan` does not see them.
+Not yet: other scalar-quantized storage (such as bf16), byte and binary
+vectors, product quantization, and IVF. Their files are refused rather
+than misread: as an unsupported layout, or, for bf16 and byte vectors,
+which k-NN also writes as `IHNs` > `IxSQ`, as an unsupported scalar
+quantizer type. NMSLIB and Lucene-engine fields write no `.faiss` file,
+so `scan` does not see them.
 
 ## Pinned versions
 
@@ -197,9 +210,8 @@ fixtures and baselines use faiss-cpu 1.15.1.
 
 - `fixtures/synthetic/` - small indexes written by Faiss Python, each with
   an `.expected.json` of the values the parser must report
-- `fixtures/synthetic-fp16/` - the same shapes with fp16 scalar-quantized
-  storage, ahead of fp16 support; until then the tool reports them as an
-  unsupported layout (see [docs/format-notes.md](docs/format-notes.md))
+- `fixtures/synthetic-fp16/` - three of the same shapes with fp16
+  scalar-quantized storage, each with an `.expected.json`
 - `fixtures/opensearch-3.9.0/nocfs/` - real segments from OpenSearch
   3.9.0 with compound files off, one per space type (`l2`,
   `innerproduct`, `cosinesimil`); the native file is `_2_165_vec.faiss`
@@ -208,11 +220,10 @@ fixtures and baselines use faiss-cpu 1.15.1.
 - `fixtures/opensearch-3.9.0-fp16/` - real segments of the same vectors
   with an fp16 field, compound files off, one per space type, in
   `sq-fp16/` (the `sq` encoder with `type: fp16`) and `half-float/` (the
-  `half_float` data type); until fp16 support the tool reports them as
-  an unsupported layout
-- `*.stats.json` beside each synthetic float fixture and `stats.json`
-  beside each real float one - the graph statistics Faiss Python
-  computes from the same file, the baseline `stats` must match
+  `half_float` data type)
+- `*.stats.json` beside each synthetic fixture and `stats.json` beside
+  each real one - the graph statistics Faiss Python computes from the
+  same file, the baseline `stats` must match
 - `*.queries.f32`, `*.results.jsonl`, and `*.recall.json` beside each
   synthetic float fixture (`queries.f32`, `results.jsonl`, `recall.json`
   beside each real float one) - 100 fixed queries, the labels Faiss's

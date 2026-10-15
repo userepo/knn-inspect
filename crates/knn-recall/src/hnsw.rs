@@ -30,7 +30,7 @@ use std::collections::BinaryHeap;
 use knn_format::faiss::{HnswGraph, HnswIndex, IdMapIndex};
 use rayon::prelude::*;
 
-use crate::{Distance, Error, Queries, Result, checked_dimension};
+use crate::{Distance, Error, Queries, Result, checked_dimension, flat};
 
 /// One result of a search.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -66,8 +66,9 @@ impl Searcher {
     ///
     /// # Errors
     ///
-    /// Returns an error when `k` is 0, the file's dimension or metric is
-    /// unusable, or `query` has another dimension.
+    /// Returns an error when `k` is 0, the storage is not float32, the
+    /// file's dimension or metric is unusable, or `query` has another
+    /// dimension.
     pub fn search(
         &mut self,
         index: &HnswIndex<'_>,
@@ -78,7 +79,7 @@ impl Searcher {
         if k == 0 {
             return Err(Error::ZeroK);
         }
-        let storage = &index.storage;
+        let storage = flat(&index.storage)?;
         let d = usize::try_from(storage.header.d)
             .ok()
             .filter(|&d| d > 0)
@@ -252,8 +253,9 @@ fn neighbor_list<'g>(
 ///
 /// # Errors
 ///
-/// Returns an error when `k` is 0, the file's dimension or metric is
-/// unusable, or the queries' dimension differs from the file's.
+/// Returns an error when `k` is 0, the storage is not float32, the file's
+/// dimension or metric is unusable, or the queries' dimension differs
+/// from the file's.
 pub fn search_all(
     index: &HnswIndex<'_>,
     queries: &Queries,
@@ -263,8 +265,9 @@ pub fn search_all(
     if k == 0 {
         return Err(Error::ZeroK);
     }
-    checked_dimension(&index.storage, queries)?;
-    Distance::of_storage(&index.storage)?;
+    let storage = flat(&index.storage)?;
+    checked_dimension(storage, queries)?;
+    Distance::of_storage(storage)?;
     let nodes = index.graph.node_count();
     queries
         .rows()

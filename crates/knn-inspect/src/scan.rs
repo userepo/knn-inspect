@@ -1,6 +1,7 @@
 //! The `scan` command: every native file under a directory, each verified
 //! and summarized, plus a cross-check of its vectors against the Lucene
-//! flat-vector file (`.vec`) of the same segment when one lies beside it.
+//! flat-vector file (`.vec`) of the same segment when one lies beside it
+//! and the native file stores float32 vectors.
 
 use std::fmt::Write as _;
 use std::fs;
@@ -144,8 +145,9 @@ enum CrossCheck {
     Damaged,
     /// Not compared: the Lucene file is not beside the native file (a
     /// compound segment keeps its `.vec` inside the `.cfs`), is a sound
-    /// file in a format this tool does not read, or there was nothing to
-    /// compare. `detail` says which.
+    /// file in a format this tool does not read, the native file stores
+    /// fp16 vectors (the `.vec` is then not opened), or there was nothing
+    /// to compare. `detail` says which.
     Skipped,
 }
 
@@ -322,16 +324,10 @@ fn scan_file(path: &Path, options: &Options) -> FileReport {
         file: path.display().to_string(),
         size: Some(bytes.len()),
         error: None,
-        layout: idx.map(|i| {
-            vec![
-                "IxMp".to_owned(),
-                "IHNf".to_owned(),
-                i.index.storage.fourcc.to_string(),
-            ]
-        }),
+        layout: idx.map(|i| i.layout().iter().map(ToString::to_string).collect()),
         dimension: idx.map(|i| i.header.d),
         count: idx.map(|i| i.header.ntotal),
-        metric: idx.map(|i| i.index.storage.header.metric().name()),
+        metric: idx.map(|i| i.index.storage.header().metric().name()),
         status,
         failures: Some(report.failures),
         warnings: Some(report.warnings),
@@ -473,7 +469,15 @@ fn lucene_vectors(path: &Path, bytes: &[u8], parsed: &knn_format::Parsed<'_>) ->
             "no .vec file of segment {segment} beside the native file (a compound segment keeps its .vec inside the .cfs)"
         ));
     }
-    let codes = parsed.index.index.storage.codes;
+    // The .vec of an fp16 field holds float32 for the sq encoder and
+    // the codes themselves for half_float; neither is compared yet.
+    let Some(flat) = parsed.index.index.storage.flat() else {
+        return skipped(
+            "the native file stores fp16 vectors, which are not compared with the .vec yet"
+                .to_owned(),
+        );
+    };
+    let codes = flat.codes;
     let Some(storage) = view_offset(bytes, codes)
         .and_then(|start| bytes.get(start..start.checked_add(codes.len().checked_mul(4)?)?))
     else {

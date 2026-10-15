@@ -5,6 +5,7 @@ use std::process::ExitCode;
 
 use anyhow::Context;
 use knn_format::NativeFile;
+use knn_format::faiss::{Storage, quantizer_type_name};
 use serde::Serialize;
 
 #[derive(Serialize)]
@@ -17,8 +18,19 @@ struct Report {
     dimension: i32,
     count: i64,
     metric: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quantizer: Option<QuantizerReport>,
     hnsw: HnswReport,
     ids: IdsReport,
+}
+
+#[derive(Serialize)]
+struct QuantizerReport {
+    qtype: i32,
+    name: String,
+    dimension: u64,
+    code_size: u64,
+    trained: usize,
 }
 
 #[derive(Serialize)]
@@ -107,14 +119,22 @@ pub fn run(path: &Path, json: bool) -> anyhow::Result<ExitCode> {
             length: parsed.payload_len,
             trailing_bytes: parsed.trailing,
         },
-        layout: vec![
-            "IxMp".to_owned(),
-            "IHNf".to_owned(),
-            storage.fourcc.to_string(),
-        ],
+        layout: idx.layout().iter().map(ToString::to_string).collect(),
         dimension: idx.header.d,
         count: idx.header.ntotal,
-        metric: storage.header.metric().name(),
+        metric: storage.header().metric().name(),
+        quantizer: match storage {
+            Storage::Flat(_) => None,
+            Storage::Fp16(s) => Some(QuantizerReport {
+                qtype: s.quantizer.qtype,
+                name: quantizer_type_name(s.quantizer.qtype)
+                    .unwrap_or("unknown")
+                    .to_owned(),
+                dimension: s.quantizer.d,
+                code_size: s.quantizer.code_size,
+                trained: s.quantizer.trained.len(),
+            }),
+        },
         hnsw: HnswReport {
             m: graph.m(),
             ef_construction: graph.ef_construction,
@@ -175,6 +195,12 @@ fn print_text(r: &Report) {
     println!("  dimension       {}", r.dimension);
     println!("  vectors         {}", r.count);
     println!("  metric          {}", r.metric);
+    if let Some(q) = &r.quantizer {
+        println!(
+            "  quantizer       {} (type {}), dimension {}, code size {}, trained values {}",
+            q.name, q.qtype, q.dimension, q.code_size, q.trained
+        );
+    }
     let h = &r.hnsw;
     println!(
         "  hnsw            M {}, efConstruction {}, efSearch {}",

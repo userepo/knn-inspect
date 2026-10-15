@@ -136,7 +136,8 @@ fn synthetic_fixtures_match_faiss_python() {
 
         let idx = &parsed.index;
         let hnsw = &idx.index;
-        let storage = &hnsw.storage;
+        assert_eq!(hnsw.fourcc, FourCc::HNSW_FLAT, "{name}");
+        let storage = hnsw.storage.flat().expect("float32 storage");
         let expected_storage = FourCc(e.layout[2].as_bytes().try_into().unwrap());
         assert_eq!(storage.fourcc, expected_storage, "{name}: storage type");
         for (what, header) in [
@@ -245,7 +246,8 @@ fn real_fixtures_parse_and_verify() {
         assert_eq!(parsed.trailing, 0, "{name}");
 
         let idx = &parsed.index;
-        let storage = &idx.index.storage;
+        assert_eq!(idx.index.fourcc, FourCc::HNSW_FLAT, "{name}");
+        let storage = idx.index.storage.flat().expect("float32 storage");
         let (expected_metric, expected_fourcc) = match m.space_type.as_str() {
             "l2" => (Metric::L2, FourCc::FLAT_L2),
             "innerproduct" | "cosinesimil" => (Metric::InnerProduct, FourCc::FLAT_IP),

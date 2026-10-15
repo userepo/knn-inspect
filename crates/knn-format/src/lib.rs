@@ -6,10 +6,13 @@
 //! and exposes the Faiss structures as bounds-checked views over the
 //! mapping. It never writes.
 //!
-//! The layout it understands is the one the k-NN plugin writes for a float
+//! The layouts it understands are the ones the k-NN plugin writes for an
 //! HNSW field: an `IxMp` ID map wrapping an `IHNf` HNSW index over `IxF2`
-//! or `IxFI` flat storage. See `docs/format-notes.md` in the repository
-//! for the byte-level description.
+//! or `IxFI` flat float32 storage, or an `IHNs` HNSW index over `IxSQ`
+//! scalar-quantized storage with `QT_fp16` (the `sq` encoder with
+//! `type: fp16`, and the `half_float` data type). See
+//! `docs/format-notes.md` in the repository for the byte-level
+//! description.
 //!
 //! [`segment_info`] reads one more Lucene file of the segment, as far as
 //! the document count: the segment info (`.si`).
@@ -33,7 +36,7 @@ pub mod segment_info;
 use std::path::{Path, PathBuf};
 
 pub use error::Error;
-pub use zerocopy::little_endian::{F32, F64, I32, I64, U64};
+pub use zerocopy::little_endian::{F32, F64, I32, I64, U16, U64};
 
 /// The crate's result type.
 pub type Result<T> = std::result::Result<T, Error>;
@@ -124,8 +127,9 @@ where
 ///
 /// # Errors
 ///
-/// Returns an error when the envelope is malformed, the payload is not
-/// the supported layout, or any structure runs past the end of the data.
+/// Returns an error when the envelope is malformed, the payload is not a
+/// supported layout (see [`faiss::parse`]), or any structure runs past
+/// the end of the data.
 pub fn parse(bytes: &[u8]) -> Result<Parsed<'_>> {
     let envelope = envelope::Envelope::parse(bytes)?;
     let (payload_offset, payload) = envelope.payload(bytes);

@@ -33,8 +33,12 @@ fuzz_target!(|data: &[u8]| {
         assert_eq!(stats.layers.len(), graph.level_counts().len());
         // The HNSW search over an arbitrary graph, with the first stored
         // vector as the query so the query's size is bounded by the file.
-        if let Some(v) = parsed.index.index.storage.vector(0) {
-            let query: Vec<f32> = v.iter().map(|x| x.get()).collect();
+        // fp16 storage is refused with an error, which must not panic
+        // either.
+        let storage = &parsed.index.index.storage;
+        let d = usize::try_from(storage.header().d).unwrap_or(0);
+        let query: Vec<f32> = (0..d).map_while(|i| storage.component(i)).collect();
+        if d > 0 && query.len() == d {
             let mut searcher = knn_recall::Searcher::new(graph.node_count());
             if let Ok(hits) = searcher.search(&parsed.index.index, &query, 3, 5) {
                 assert!(hits.len() <= 3);
@@ -44,8 +48,23 @@ fuzz_target!(|data: &[u8]| {
                 assert_eq!(labels.len(), 3.min(graph.node_count()));
             }
         }
-        let _ = parsed.index.index.storage.vector(0);
-        let _ = parsed.index.index.storage.row_count();
+        let _ = storage.row_count();
+        let _ = storage.component_count();
+        let _ = storage.code_bytes();
+        let _ = parsed.index.layout();
+        match storage {
+            knn_format::faiss::Storage::Flat(s) => {
+                let _ = s.vector(0);
+            }
+            knn_format::faiss::Storage::Fp16(s) => {
+                if let Some(row) = s.vector(0) {
+                    let _: Vec<f32> = row
+                        .iter()
+                        .map(|h| knn_format::faiss::f16_to_f32(h.get()))
+                        .collect();
+                }
+            }
+        }
         if let Some(footer) = parsed.envelope.footer {
             let _ = footer.verify(data);
         }

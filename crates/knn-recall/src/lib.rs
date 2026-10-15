@@ -24,7 +24,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 
 pub use hnsw::{Hit, Searcher, result_labels, search_all};
 
-use knn_format::faiss::{FlatStorage, Metric};
+use knn_format::faiss::{FlatStorage, FourCc, Metric, Storage};
 use knn_format::{F32, I64};
 use rayon::prelude::*;
 use serde::Serialize;
@@ -101,6 +101,14 @@ pub enum Error {
         count: usize,
         /// Vectors in the file.
         rows: usize,
+    },
+    /// The file's vectors are not float32.
+    #[error(
+        "{fourcc} storage is not supported yet; recall reads float32 storage (IxF2 or IxFI) only"
+    )]
+    UnsupportedStorage {
+        /// The storage index's fourcc.
+        fourcc: FourCc,
     },
 }
 
@@ -350,6 +358,13 @@ impl Ord for Ordered {
     fn cmp(&self, other: &Self) -> Ordering {
         self.0.total_cmp(&other.0)
     }
+}
+
+/// The float32 storage an index holds; other storage is an error.
+fn flat<'s, 'a>(storage: &'s Storage<'a>) -> Result<&'s FlatStorage<'a>> {
+    storage.flat().ok_or(Error::UnsupportedStorage {
+        fourcc: storage.fourcc(),
+    })
 }
 
 /// The file's dimension as a usable row width, checked against the queries.

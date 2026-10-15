@@ -62,9 +62,11 @@ fn options(space: Option<Space>) -> Options {
 
 #[test]
 fn synthetic_fixtures_are_clean() {
-    let dir = fixtures().join("synthetic");
     let mut seen = 0;
-    for entry in fs::read_dir(&dir).unwrap() {
+    let entries = ["synthetic", "synthetic-fp16"]
+        .into_iter()
+        .flat_map(|d| fs::read_dir(fixtures().join(d)).unwrap());
+    for entry in entries {
         let path = entry.unwrap().path();
         if path.extension().is_none_or(|e| e != "faiss") {
             continue;
@@ -91,15 +93,19 @@ fn synthetic_fixtures_are_clean() {
         );
         seen += 1;
     }
-    assert_eq!(seen, 5);
+    assert_eq!(seen, 8, "five float and three fp16 synthetic fixtures");
 }
 
 #[test]
 fn real_fixtures_are_clean_with_their_space() {
-    let root = fixtures().join("opensearch-3.9.0");
     let mut seen = 0;
-    for mode in ["nocfs", "cfs"] {
-        for entry in fs::read_dir(root.join(mode)).unwrap() {
+    for set in [
+        "opensearch-3.9.0/nocfs",
+        "opensearch-3.9.0/cfs",
+        "opensearch-3.9.0-fp16/sq-fp16",
+        "opensearch-3.9.0-fp16/half-float",
+    ] {
+        for entry in fs::read_dir(fixtures().join(set)).unwrap() {
             let dir = entry.unwrap().path();
             let m: Manifest =
                 serde_json::from_slice(&fs::read(dir.join("manifest.json")).unwrap()).unwrap();
@@ -123,7 +129,7 @@ fn real_fixtures_are_clean_with_their_space() {
             seen += 1;
         }
     }
-    assert_eq!(seen, 6);
+    assert_eq!(seen, 12, "six float and six fp16 real fixtures");
 }
 
 #[test]
@@ -196,6 +202,25 @@ fn corrupted_fixtures_trip_their_check() {
 }
 
 #[test]
+fn quantizer_findings_point_at_their_fields() {
+    // tools/walk_faiss.py on l2-100x4-fp16: the quantizer's d at 14,675,
+    // code_size at 14,683, and the trained values' data at 14,699.
+    let dir = fixtures().join("corrupted");
+    for (file, offset, severity) in [
+        ("fp16-quantizer-dimension.faiss", 14_675, Severity::Failure),
+        ("fp16-quantizer-code-size.faiss", 14_683, Severity::Failure),
+        ("fp16-quantizer-trained.faiss", 14_699, Severity::Warning),
+    ] {
+        let bytes = fs::read(dir.join(file)).unwrap();
+        let report = knn_check::verify(&bytes, &options(None));
+        let headers = report.result(Check::Headers).unwrap();
+        assert_eq!(headers.severity, Some(severity), "{file}: {headers:#?}");
+        assert_eq!(headers.count, 1, "{file}: {headers:#?}");
+        assert_eq!(headers.findings[0].offset, Some(offset), "{file}");
+    }
+}
+
+#[test]
 fn findings_carry_offsets_and_nodes() {
     let dir = fixtures().join("corrupted");
     let bytes = fs::read(dir.join("neighbor-out-of-range.faiss")).unwrap();
@@ -253,4 +278,107 @@ fn example_cap_keeps_the_exact_count() {
         assert!(r.count >= r.findings.len());
     }
     assert!(report.result(Check::VectorCount).unwrap().failed());
+}
+
+/// A half float times two: one more in the exponent field, or for a
+/// subnormal, where the encoding is linear, the magnitude bits doubled.
+fn doubled(h: u16) -> u16 {
+    let (sign, magnitude) = (h & 0x8000, h & 0x7fff);
+    if magnitude < 0x0400 {
+        sign | (magnitude << 1)
+    } else {
+        assert!(magnitude + 0x0400 < 0x7c00, "{h:#06x} would overflow");
+        sign | (magnitude + 0x0400)
+    }
+}
+
+#[test]
+fn fp16_norms_are_checked_on_the_decoded_codes() {
+    let bytes = fs::read(fixtures().join("synthetic-fp16/ip-1000x32-fp16.faiss")).unwrap();
+    let parsed = knn_format::parse(&bytes).unwrap();
+    let codes = knn_format::view_offset(&bytes, parsed.index.index.storage.code_bytes()).unwrap();
+    let row_bytes = 2 * usize::try_from(parsed.index.header.d).unwrap();
+
+    let mut scaled = bytes.clone();
+    let row = codes + 7 * row_bytes;
+    for c in scaled[row..row + row_bytes].as_chunks_mut::<2>().0 {
+        *c = doubled(u16::from_le_bytes(*c)).to_le_bytes();
+    }
+    let report = knn_check::verify(&scaled, &options(Some(Space::Cosine)));
+    assert_eq!(report.status, Status::Warnings, "{report:#?}");
+    let norms = report.result(Check::Norms).unwrap();
+    assert_eq!(norms.count, 1, "{norms:#?}");
+    assert_eq!(norms.findings[0].node, Some(7));
+    assert_eq!(norms.findings[0].offset, Some(row));
+    assert!(
+        norms.findings[0].message.contains("length 2.00"),
+        "{}",
+        norms.findings[0].message
+    );
+
+    let mut zeroed = bytes.clone();
+    let row = codes + 2 * row_bytes;
+    zeroed[row..row + row_bytes].fill(0);
+    let report = knn_check::verify(&zeroed, &options(Some(Space::Cosine)));
+    let norms = report.result(Check::Norms).unwrap();
+    assert_eq!(norms.count, 1, "{norms:#?}");
+    assert_eq!(norms.findings[0].node, Some(2));
+    assert!(norms.findings[0].message.contains("all zeros"));
+}
+
+#[test]
+fn rows_are_walked_by_the_storage_dimension() {
+    // A header can claim any dimension. Rows are counted and walked by
+    // the storage's own, so a claim of 2^28 costs nothing; walking rows by
+    // the ID map's would step through that many missing components per
+    // row, minutes per file. Fuzzing caught a pre-release version doing
+    // just that.
+    for file in [
+        "synthetic/l2-100x4.faiss",
+        "synthetic-fp16/l2-100x4-fp16.faiss",
+    ] {
+        let mut bytes = fs::read(fixtures().join(file)).unwrap();
+        let (codes, size) = {
+            let parsed = knn_format::parse(&bytes).unwrap();
+            let storage = &parsed.index.index.storage;
+            (
+                knn_format::view_offset(&bytes, storage.code_bytes()).unwrap(),
+                storage.component_size(),
+            )
+        };
+        let row = 4 * size;
+        // The ID map's dimension follows its fourcc.
+        bytes[4..8].copy_from_slice(&(1_i32 << 28).to_le_bytes());
+        // Row 5, component 1: a NaN in either storage.
+        let nan = codes + 5 * row + size;
+        if size == 4 {
+            bytes[nan..nan + 4].copy_from_slice(&f32::NAN.to_le_bytes());
+        } else {
+            bytes[nan..nan + 2].copy_from_slice(&0x7e00_u16.to_le_bytes());
+        }
+        let report = knn_check::verify(&bytes, &options(Some(Space::Cosine)));
+        assert!(report.result(Check::Headers).unwrap().failed(), "{file}");
+
+        let values = report.result(Check::VectorValues).unwrap();
+        assert_eq!(values.count, 1, "{file}: {values:#?}");
+        assert_eq!(values.findings[0].node, Some(5), "{file}");
+        assert_eq!(values.findings[0].offset, Some(nan), "{file}");
+        assert!(
+            values.findings[0]
+                .message
+                .starts_with("vector 5 component 1 "),
+            "{file}: {}",
+            values.findings[0].message
+        );
+
+        // The L2 fixtures hold vectors of every length, so every row of
+        // four components is reported, and none beyond them, except the
+        // one with the NaN, whose length is NaN and left to vector_values.
+        let norms = report.result(Check::Norms).unwrap();
+        assert_eq!(norms.count, 99, "{file}: {norms:#?}");
+        for (i, f) in norms.findings.iter().enumerate() {
+            assert_eq!(f.node, Some(i), "{file}");
+            assert_eq!(f.offset, Some(codes + i * row), "{file}");
+        }
+    }
 }

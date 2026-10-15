@@ -153,9 +153,12 @@ def build_fp16(name: str, count: int, dim: int, metric: str, out: pathlib.Path) 
     # row: decoding them by hand gives what Faiss reconstructs.
     decoded = codes.view("<f2").astype(np.float32).reshape(count, dim)
     assert np.array_equal(decoded, storage.reconstruct_n(0, count))
-    # Faiss's float-to-half conversion matches IEEE round-to-nearest except
-    # on exact ties, which it rounds away from zero where IEEE (and NumPy)
-    # round to even. Check that this is the only difference.
+    # Faiss's portable float-to-half conversion, which the faiss-cpu 1.15.1
+    # wheel runs on Windows, where the fixtures were written, matches IEEE
+    # round-to-nearest except on exact ties, which it rounds away from zero
+    # where IEEE (and NumPy) round to even. Builds with Faiss's F16C or NEON
+    # encoder, such as the Linux wheel on an AVX2 CPU, round ties to even
+    # too. Check that ties are the only difference.
     ieee = vectors.astype(np.float16).astype(np.float32)
     differ = decoded != ieee
     x = vectors[differ].astype(np.float64)

@@ -37,6 +37,19 @@ pub enum Error {
         expected: &'static str,
     },
 
+    /// A scalar quantizer type this crate does not decode: only `QT_fp16`
+    /// is read.
+    #[error(
+        "scalar quantizer type {qtype} ({}) at offset {offset} is not supported; expected 4 (QT_fp16)",
+        crate::faiss::quantizer_type_name(*.qtype).unwrap_or("not a Faiss type")
+    )]
+    UnsupportedQuantizer {
+        /// Where the type sits.
+        offset: usize,
+        /// The type read.
+        qtype: i32,
+    },
+
     /// A count in the file is beyond what Faiss itself accepts (2^40) or
     /// what this process can address.
     #[error("{what} count {count} at offset {offset} is too large")]
@@ -116,6 +129,7 @@ impl Error {
         match self {
             Self::UnexpectedEof { offset, .. }
             | Self::UnsupportedLayout { offset, .. }
+            | Self::UnsupportedQuantizer { offset, .. }
             | Self::CountTooLarge { offset, .. }
             | Self::InvalidValue { offset, .. }
             | Self::UnexpectedCodec { offset, .. }

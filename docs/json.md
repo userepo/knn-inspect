@@ -19,10 +19,11 @@ map's values, which k-NN sets to Lucene doc ids.
 | `envelope.footer` | object, nullable | Lucene footer: `offset`, `algorithm`, `checksum` (hex string), `verified` (whether the CRC32 matches) |
 | `payload.offset`, `payload.length` | integer | Where the Faiss payload lies |
 | `payload.trailing_bytes` | integer | Bytes between the end of the index and the footer; 0 in a well-formed file |
-| `layout` | array of strings | The Faiss fourccs, outermost first: `IxMp`, `IHNf`, then `IxF2` or `IxFI` |
+| `layout` | array of strings | The Faiss fourccs, outermost first: `IxMp`, then `IHNf` and `IxF2` or `IxFI` (float32 storage), or `IHNs` and `IxSQ` (fp16 storage) |
 | `dimension` | integer | Vector dimension |
 | `count` | integer | Vector count from the ID map's header |
 | `metric` | string | `l2` or `inner_product` as the file records it; a cosine field reads `inner_product` |
+| `quantizer` | object, optional | For fp16 storage, the scalar quantizer as stored: `qtype` (4), `name` (`QT_fp16`), `dimension`, `code_size` (bytes per vector), `trained` (number of trained values; fp16 uses none). Since 0.4.0 |
 | `hnsw.m` | integer, nullable | Neighbor slots per node on the upper levels; `null` if the level table is too short to say |
 | `hnsw.ef_construction`, `hnsw.ef_search` | integer | As stored |
 | `hnsw.max_level`, `hnsw.entry_point` | integer | As stored; `-1` for an empty graph |
@@ -138,7 +139,8 @@ fails the file.
   hold the same vectors in the same order. When the vectors are found in a
   `.vec` that is damaged, `offset` still says where. It is skipped when
   no loose `.vec` lies beside the native file, as in a compound segment,
-  where the `.vec` is inside the `.cfs`. Before 0.3.0, a `.vec` that
+  where the `.vec` is inside the `.cfs`, and for a native file with fp16
+  storage, which is not compared yet. Before 0.3.0, a `.vec` that
   could not be opened was reported as `mismatch`, and a failing checksum
   was only mentioned in `detail`.
 - `lucene_docs` reads the document count from the segment's `.si` and

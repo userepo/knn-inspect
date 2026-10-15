@@ -103,7 +103,14 @@ pub fn run(args: &RecallArgs) -> anyhow::Result<ExitCode> {
         .parse()
         .with_context(|| format!("parsing {}", path.display()))?;
     let index = &parsed.index;
-    let storage = &index.index.storage;
+    let storage = index
+        .index
+        .storage
+        .flat()
+        .ok_or(knn_recall::Error::UnsupportedStorage {
+            fourcc: index.index.storage.fourcc(),
+        })
+        .with_context(|| path.display().to_string())?;
     let dimension = usize::try_from(storage.header.d)
         .ok()
         .filter(|&d| d > 0)

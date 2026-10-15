@@ -8,7 +8,9 @@ the manifest, so they need no Python.
 
 Bare synthetic files carry no footer, so a mutation there exercises just
 the structural check it targets; the real OpenSearch file carries a
-footer, so it is used for the envelope and checksum cases.
+footer, so it is used for the envelope and checksum cases. The `fp16-`
+cases mutate the smallest synthetic fp16 file, for the checks that read
+the scalar quantizer and its half-float codes.
 
 Usage:
     python tools/make_corrupted.py [--out fixtures/corrupted]
@@ -28,6 +30,7 @@ from walk_faiss import FOOTER_MAGIC, Walker  # noqa: E402
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 SYNTHETIC_L2 = ROOT / "fixtures/synthetic/l2-100x4.faiss"
 SYNTHETIC_IP = ROOT / "fixtures/synthetic/ip-100x4.faiss"
+SYNTHETIC_FP16 = ROOT / "fixtures/synthetic-fp16/l2-100x4-fp16.faiss"
 REAL_L2 = ROOT / "fixtures/opensearch-3.9.0/nocfs/l2/_2_165_vec.faiss"
 
 
@@ -241,6 +244,52 @@ def build() -> Cases:
         return d
 
     c.add("cosine-zero-vector", SYNTHETIC_IP, "vector 2 set to zeros", "norms", "warning", zero_vector, space="cosinesimil")
+
+    # --- fp16: the scalar quantizer and its codes ---
+    def fp16_qtype(d, f):
+        put(d, f["storage.sq.qtype"]["offset"], "<i", 7)
+        return d
+
+    c.add("fp16-unsupported-qtype", SYNTHETIC_FP16, "quantizer type set to 7 (QT_bf16)", "structure", "failure", fp16_qtype)
+
+    def fp16_sq_dim(d, f):
+        put(d, f["storage.sq.d"]["offset"], "<Q", 5)
+        return d
+
+    c.add("fp16-quantizer-dimension", SYNTHETIC_FP16, "quantizer dimension set to 5", "headers", "failure", fp16_sq_dim)
+
+    def fp16_code_size(d, f):
+        put(d, f["storage.sq.code_size"]["offset"], "<Q", 9)
+        return d
+
+    c.add("fp16-quantizer-code-size", SYNTHETIC_FP16, "quantizer code size set to 9 for dimension 4", "headers", "failure", fp16_code_size)
+
+    def fp16_trained(d, f):
+        o = f["storage.sq.trained.len"]["offset"]
+        put(d, o, "<Q", 1)
+        return d[: o + 8] + struct.pack("<f", 0.5) + d[o + 8 :]
+
+    c.add("fp16-quantizer-trained", SYNTHETIC_FP16, "one trained value inserted after the quantizer's count, now 1", "headers", "warning", fp16_trained)
+
+    def fp16_codes_short(d, f):
+        o = f["storage.codes.data"]["offset"]
+        n = f["storage.codes.len"]["value"]
+        put(d, f["storage.codes.len"]["offset"], "<Q", n - 8)
+        return d[: o + n - 8] + d[o + n :]
+
+    c.add("fp16-codes-short", SYNTHETIC_FP16, "last vector's 8 code bytes removed and the byte count lowered to match", "vector_count", "failure", fp16_codes_short)
+
+    def fp16_nan(d, f):
+        put(d, f["storage.codes.data"]["offset"] + 1 * 2, "<H", 0x7E00)
+        return d
+
+    c.add("fp16-nan-code", SYNTHETIC_FP16, "vector 0 component 1 set to a half-float NaN", "vector_values", "warning", fp16_nan)
+
+    def fp16_inf(d, f):
+        put(d, f["storage.codes.data"]["offset"] + 4 * 2, "<H", 0xFC00)
+        return d
+
+    c.add("fp16-inf-code", SYNTHETIC_FP16, "vector 1 component 0 set to half-float -inf", "vector_values", "warning", fp16_inf)
 
     return c
 

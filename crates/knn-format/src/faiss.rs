@@ -1,13 +1,17 @@
-//! The Faiss payload: `IxMp` wrapping `IHNf` over flat storage, as
+//! The Faiss payload: `IxMp` wrapping `IHNf` over flat float32 storage,
+//! or `IHNs` over fp16 scalar-quantized storage, as
 //! `faiss/impl/index_read.cpp` reads it.
 //!
 //! Every array is a view into the file's bytes. Element types are the
 //! unaligned little-endian wrappers from `zerocopy`; call `.get()` on an
-//! element for its native value.
+//! element for its native value. The fp16 codes are the exception, raw
+//! bytes as Faiss counts them: [`Fp16Storage::vector`] views a row as
+//! `U16`, and [`f16_to_f32`] decodes a component.
 
 use std::fmt;
 
-use zerocopy::little_endian::{F32, F64, I32, I64, U64};
+use zerocopy::little_endian::{F32, F64, I32, I64, U16, U64};
+use zerocopy::{FromBytes as _, IntoBytes as _};
 
 use crate::reader::Cursor;
 use crate::{Error, Result};
@@ -21,10 +25,14 @@ impl FourCc {
     pub const ID_MAP: Self = Self(*b"IxMp");
     /// `IndexHNSWFlat`.
     pub const HNSW_FLAT: Self = Self(*b"IHNf");
+    /// `IndexHNSWSQ`.
+    pub const HNSW_SQ: Self = Self(*b"IHNs");
     /// `IndexFlatL2`.
     pub const FLAT_L2: Self = Self(*b"IxF2");
     /// `IndexFlatIP`.
     pub const FLAT_IP: Self = Self(*b"IxFI");
+    /// `IndexScalarQuantizer`.
+    pub const SCALAR_QUANTIZER: Self = Self(*b"IxSQ");
 }
 
 impl fmt::Display for FourCc {
@@ -288,15 +296,216 @@ impl FlatStorage<'_> {
     }
 }
 
-/// `IndexHNSWFlat`: the graph plus its storage.
+/// `ScalarQuantizer::QT_fp16`: each component an IEEE half float.
+pub const QT_FP16: i32 = 4;
+
+/// The name Faiss gives a `ScalarQuantizer::QuantizerType`, or `None`
+/// for a number it does not define.
+#[must_use]
+pub fn quantizer_type_name(qtype: i32) -> Option<&'static str> {
+    Some(match qtype {
+        0 => "QT_8bit",
+        1 => "QT_4bit",
+        2 => "QT_8bit_uniform",
+        3 => "QT_4bit_uniform",
+        QT_FP16 => "QT_fp16",
+        5 => "QT_8bit_direct",
+        6 => "QT_6bit",
+        7 => "QT_bf16",
+        8 => "QT_8bit_direct_signed",
+        _ => return None,
+    })
+}
+
+/// Decodes an IEEE 754 half float, bit for bit as the portable
+/// `decode_fp16` in Faiss's `utils/fp16-inl.h` does. Every half float is
+/// exactly representable in float32, so this is exact; a NaN keeps its
+/// payload.
+#[must_use]
+pub fn f16_to_f32(bits: u16) -> f32 {
+    let sign = u32::from(bits & 0x8000) << 16;
+    let exponent = (bits >> 10) & 0x1f;
+    let mantissa = bits & 0x03ff;
+    let magnitude = match exponent {
+        // Zero and subnormals: the mantissa times 2^-24.
+        0 => (f32::from(mantissa) * f32::from_bits(0x3380_0000)).to_bits(),
+        // Infinity and NaN, payload kept.
+        0x1f => 0x7f80_0000 | (u32::from(mantissa) << 13),
+        // Normal: the exponent rebiased from 15 to 127.
+        e => ((u32::from(e) + 112) << 23) | (u32::from(mantissa) << 13),
+    };
+    f32::from_bits(sign | magnitude)
+}
+
+/// A scalar quantizer's parameters (`read_ScalarQuantizer`).
+#[derive(Debug, Clone, Copy)]
+pub struct ScalarQuantizer<'a> {
+    /// File offset of `qtype`, the first field.
+    pub offset: usize,
+    /// `QuantizerType` as stored; the parser accepts only [`QT_FP16`].
+    pub qtype: i32,
+    /// `RangeStat` as stored; fp16 does not use it.
+    pub rangestat: i32,
+    /// The range statistic's argument; fp16 does not use it.
+    pub rangestat_arg: f32,
+    /// The dimension, as the quantizer stores it.
+    pub d: u64,
+    /// Bytes per vector as stored. Faiss ignores it on load and derives
+    /// the code size from `qtype` and `d`: two bytes per component for
+    /// fp16.
+    pub code_size: u64,
+    /// Trained values; fp16 needs none.
+    pub trained: &'a [F32],
+}
+
+impl<'a> ScalarQuantizer<'a> {
+    fn read(cur: &mut Cursor<'a>) -> Result<Self> {
+        let offset = cur.offset();
+        let qtype = cur.i32("quantizer type")?;
+        if qtype != QT_FP16 {
+            return Err(Error::UnsupportedQuantizer { offset, qtype });
+        }
+        Ok(Self {
+            offset,
+            qtype,
+            rangestat: cur.i32("quantizer range statistic")?,
+            rangestat_arg: cur.f32("quantizer range argument")?,
+            d: cur.u64("quantizer dimension")?,
+            code_size: cur.u64("quantizer code size")?,
+            trained: cur.vector("quantizer trained values")?,
+        })
+    }
+}
+
+/// fp16 scalar-quantized storage (`IndexScalarQuantizer` with
+/// `QT_fp16`): each component an IEEE half float, little-endian.
+#[derive(Debug, Clone, Copy)]
+pub struct Fp16Storage<'a> {
+    /// The storage index's own header.
+    pub header: IndexHeader,
+    /// The quantizer's parameters.
+    pub quantizer: ScalarQuantizer<'a>,
+    /// All codes, row-major, two bytes per component. Faiss stores their
+    /// length in bytes, so a damaged file can hold an odd number.
+    pub codes: &'a [u8],
+}
+
+impl<'a> Fp16Storage<'a> {
+    /// Vector `i` as half-float bits, or `None` when it is not entirely
+    /// inside `codes`. [`f16_to_f32`] decodes a component.
+    #[must_use]
+    pub fn vector(&self, i: usize) -> Option<&'a [U16]> {
+        let row = usize::try_from(self.header.d).ok()?.checked_mul(2)?;
+        let start = i.checked_mul(row)?;
+        let bytes = self.codes.get(start..start.checked_add(row)?)?;
+        <[U16]>::ref_from_bytes(bytes).ok()
+    }
+
+    /// Rows that `codes` holds in full.
+    #[must_use]
+    pub fn row_count(&self) -> usize {
+        match usize::try_from(self.header.d) {
+            Ok(d) if d > 0 => self.codes.len() / d.saturating_mul(2),
+            _ => 0,
+        }
+    }
+}
+
+/// An HNSW index's vectors.
+#[derive(Debug, Clone, Copy)]
+pub enum Storage<'a> {
+    /// Float32, under `IHNf`.
+    Flat(FlatStorage<'a>),
+    /// fp16, under `IHNs`.
+    Fp16(Fp16Storage<'a>),
+}
+
+impl<'a> Storage<'a> {
+    /// The storage index's fourcc.
+    #[must_use]
+    pub fn fourcc(&self) -> FourCc {
+        match self {
+            Self::Flat(s) => s.fourcc,
+            Self::Fp16(_) => FourCc::SCALAR_QUANTIZER,
+        }
+    }
+
+    /// The storage index's own header.
+    #[must_use]
+    pub fn header(&self) -> &IndexHeader {
+        match self {
+            Self::Flat(s) => &s.header,
+            Self::Fp16(s) => &s.header,
+        }
+    }
+
+    /// The float32 storage, when that is what the file holds.
+    #[must_use]
+    pub fn flat(&self) -> Option<&FlatStorage<'a>> {
+        match self {
+            Self::Flat(s) => Some(s),
+            Self::Fp16(_) => None,
+        }
+    }
+
+    /// Rows the storage holds in full.
+    #[must_use]
+    pub fn row_count(&self) -> usize {
+        match self {
+            Self::Flat(s) => s.row_count(),
+            Self::Fp16(s) => s.row_count(),
+        }
+    }
+
+    /// Bytes per stored component: 4 for float32, 2 for fp16.
+    #[must_use]
+    pub fn component_size(&self) -> usize {
+        match self {
+            Self::Flat(_) => 4,
+            Self::Fp16(_) => 2,
+        }
+    }
+
+    /// The stored vectors' bytes, as they lie in the file.
+    #[must_use]
+    pub fn code_bytes(&self) -> &'a [u8] {
+        match self {
+            Self::Flat(s) => s.codes.as_bytes(),
+            Self::Fp16(s) => s.codes,
+        }
+    }
+
+    /// Components the storage holds in full, over all rows.
+    #[must_use]
+    pub fn component_count(&self) -> usize {
+        self.code_bytes().len() / self.component_size()
+    }
+
+    /// Component `i` of the row-major storage, decoded to float32.
+    #[must_use]
+    pub fn component(&self, i: usize) -> Option<f32> {
+        match self {
+            Self::Flat(s) => s.codes.get(i).map(|v| v.get()),
+            Self::Fp16(s) => {
+                let start = i.checked_mul(2)?;
+                let pair = s.codes.get(start..start.checked_add(2)?)?;
+                U16::read_from_bytes(pair).ok().map(|v| f16_to_f32(v.get()))
+            }
+        }
+    }
+}
+
+/// An HNSW index: the graph plus its storage.
 #[derive(Debug, Clone, Copy)]
 pub struct HnswIndex<'a> {
+    /// `IHNf` over float32 storage, or `IHNs` over fp16.
+    pub fourcc: FourCc,
     /// The HNSW index's own header.
     pub header: IndexHeader,
     /// The graph.
     pub graph: HnswGraph<'a>,
     /// The vectors.
-    pub storage: FlatStorage<'a>,
+    pub storage: Storage<'a>,
 }
 
 /// `IndexIDMap`: the outermost index, mapping node ids to labels.
@@ -312,12 +521,26 @@ pub struct IdMapIndex<'a> {
     pub end: usize,
 }
 
+impl IdMapIndex<'_> {
+    /// The three fourccs, outermost first.
+    #[must_use]
+    pub fn layout(&self) -> [FourCc; 3] {
+        [
+            FourCc::ID_MAP,
+            self.index.fourcc,
+            self.index.storage.fourcc(),
+        ]
+    }
+}
+
 /// Parses the payload, `base` being its offset in the file.
 ///
 /// # Errors
 ///
-/// Returns an error for any fourcc outside the supported layout, a
-/// negative dimension or count, or a structure running past the data.
+/// Returns an error for any fourcc or HNSW and storage pairing outside the
+/// supported layouts, a scalar quantizer type other than `QT_fp16`, a
+/// negative dimension or count, a count beyond what Faiss accepts, or a
+/// structure running past the data.
 pub fn parse(payload: &[u8], base: usize) -> Result<IdMapIndex<'_>> {
     let mut cur = Cursor::new(payload, base);
 
@@ -326,31 +549,49 @@ pub fn parse(payload: &[u8], base: usize) -> Result<IdMapIndex<'_>> {
     let header = IndexHeader::read(&mut cur, offset)?;
 
     let hnsw_offset = cur.offset();
-    expect_fourcc(&mut cur, &[FourCc::HNSW_FLAT], "IHNf")?;
+    let hnsw_fourcc = expect_fourcc(
+        &mut cur,
+        &[FourCc::HNSW_FLAT, FourCc::HNSW_SQ],
+        "IHNf or IHNs",
+    )?;
     let hnsw_header = IndexHeader::read(&mut cur, hnsw_offset)?;
     let graph = HnswGraph::read(&mut cur)?;
 
+    // Faiss reads any storage under any HNSW tag; k-NN writes each tag
+    // over one kind only, and only those pairs are accepted.
     let storage_offset = cur.offset();
-    let fourcc = expect_fourcc(
-        &mut cur,
-        &[FourCc::FLAT_L2, FourCc::FLAT_IP],
-        "IxF2 or IxFI",
-    )?;
-    let storage_header = IndexHeader::read(&mut cur, storage_offset)?;
-    let codes = cur.xb_vector("vectors")?;
+    let storage = if hnsw_fourcc == FourCc::HNSW_SQ {
+        expect_fourcc(&mut cur, &[FourCc::SCALAR_QUANTIZER], "IxSQ")?;
+        let header = IndexHeader::read(&mut cur, storage_offset)?;
+        let quantizer = ScalarQuantizer::read(&mut cur)?;
+        Storage::Fp16(Fp16Storage {
+            header,
+            quantizer,
+            codes: cur.vector("fp16 codes")?,
+        })
+    } else {
+        let fourcc = expect_fourcc(
+            &mut cur,
+            &[FourCc::FLAT_L2, FourCc::FLAT_IP],
+            "IxF2 or IxFI",
+        )?;
+        let header = IndexHeader::read(&mut cur, storage_offset)?;
+        Storage::Flat(FlatStorage {
+            fourcc,
+            header,
+            codes: cur.xb_vector("vectors")?,
+        })
+    };
 
     let id_map = cur.vector("id_map")?;
 
     Ok(IdMapIndex {
         header,
         index: HnswIndex {
+            fourcc: hnsw_fourcc,
             header: hnsw_header,
             graph,
-            storage: FlatStorage {
-                fourcc,
-                header: storage_header,
-                codes,
-            },
+            storage,
         },
         id_map,
         end: cur.offset(),

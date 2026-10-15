@@ -14,7 +14,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use knn_format::faiss::{FlatStorage, FourCc, HnswGraph, HnswIndex, IndexHeader};
+use knn_format::faiss::{FlatStorage, FourCc, HnswGraph, HnswIndex, IndexHeader, Storage};
 use knn_format::{F32, F64, I32, U64};
 use knn_recall::{
     Error, Labels, Queries, Searcher, ground_truth, result_labels, score, search_all,
@@ -97,8 +97,15 @@ fn own_search_matches_faiss() {
 
         // Within 0.01 of Faiss's recall for the same queries and parameters.
         let labels = Labels::from_id_map(index.id_map).unwrap();
-        let truth = ground_truth(&index.index.storage, &queries, b.k).unwrap();
-        let r = score(&index.index.storage, &labels, &queries, &truth, &own).unwrap();
+        let truth = ground_truth(index.index.storage.flat().unwrap(), &queries, b.k).unwrap();
+        let r = score(
+            index.index.storage.flat().unwrap(),
+            &labels,
+            &queries,
+            &truth,
+            &own,
+        )
+        .unwrap();
         assert!(
             (r.recall - b.recall).abs() <= 0.01,
             "{}: own recall {} vs Faiss {}",
@@ -202,6 +209,7 @@ impl Built {
             metric_arg: None,
         };
         HnswIndex {
+            fourcc: FourCc::HNSW_FLAT,
             header,
             graph: HnswGraph {
                 assign_probas: &self.probas,
@@ -215,7 +223,7 @@ impl Built {
                 ef_search: 16,
                 upper_beam: 1,
             },
-            storage: FlatStorage {
+            storage: Storage::Flat(FlatStorage {
                 fourcc: if self.metric_type == 1 {
                     FourCc::FLAT_L2
                 } else {
@@ -223,7 +231,7 @@ impl Built {
                 },
                 header,
                 codes: &self.codes,
-            },
+            }),
         }
     }
 }
@@ -453,10 +461,22 @@ fn search_checks_its_inputs() {
 }
 
 #[test]
+fn fp16_storage_is_refused_for_now() {
+    let bytes = fs::read(fixtures().join("synthetic-fp16/l2-100x4-fp16.faiss")).unwrap();
+    let parsed = knn_format::parse(&bytes).unwrap();
+    let index = &parsed.index.index;
+    let refused = |r: &Result<_, Error>| matches!(r, Err(Error::UnsupportedStorage { fourcc }) if *fourcc == FourCc::SCALAR_QUANTIZER);
+    let mut s = Searcher::new(index.graph.node_count());
+    assert!(refused(&s.search(index, &[0.0; 4], 1, 16).map(|_| ())));
+    let queries = Queries::from_rows(4, vec![0.0; 4]).unwrap();
+    assert!(refused(&search_all(index, &queries, 1, 16).map(|_| ())));
+}
+
+#[test]
 fn sampling_is_deterministic_and_distinct() {
     let bytes = fs::read(fixtures().join("synthetic/l2-1000x32.faiss")).unwrap();
     let parsed = knn_format::parse(&bytes).unwrap();
-    let storage = &parsed.index.index.storage;
+    let storage = parsed.index.index.storage.flat().unwrap();
     let (q1, rows1) = knn_recall::sample_queries(storage, 50, 7).unwrap();
     let (q2, rows2) = knn_recall::sample_queries(storage, 50, 7).unwrap();
     assert_eq!(rows1, rows2);
