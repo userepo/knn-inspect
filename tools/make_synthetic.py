@@ -4,9 +4,9 @@
 Each fixture mirrors what the OpenSearch k-NN plugin writes for an HNSW
 field: an `IndexIDMap` wrapping `IndexHNSWFlat` with flat float32
 storage, added with explicit labels, in `fixtures/synthetic/`; and the
-same over `IndexHNSWSQ` with fp16 storage (`QT_fp16`, the encoding
-k-NN's `sq` encoder with `type: fp16` uses, per k-NN#3566) in
-`fixtures/synthetic-fp16/`.
+same over `IndexHNSWSQ` with fp16 storage (`QT_fp16`, the native layout
+k-NN writes for its `sq` encoder with `type: fp16` and its `half_float`
+data type) in `fixtures/synthetic-fp16/`.
 Next to every `.faiss` file an `.expected.json` records the values the
 Rust parser must report, read back from the same in-memory index. An
 fp16 case draws the same vectors as the float case of the same shape.

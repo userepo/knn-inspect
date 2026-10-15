@@ -12,7 +12,7 @@ MAX_LEN=200000
 dest=corpus/parse_and_verify
 mkdir -p "$dest"
 seeded=0
-for f in ../fixtures/synthetic/*.faiss ../fixtures/synthetic-fp16/*.faiss ../fixtures/opensearch-3.9.0/*/*/*.faiss* ../fixtures/opensearch-3.9.0/*/*/*.si ../fixtures/corrupted/*.faiss; do
+for f in ../fixtures/synthetic/*.faiss ../fixtures/synthetic-fp16/*.faiss ../fixtures/opensearch-3.9.0/*/*/*.faiss* ../fixtures/opensearch-3.9.0/*/*/*.si ../fixtures/opensearch-3.9.0-fp16/*/*/*.faiss ../fixtures/corrupted/*.faiss; do
     size=$(wc -c < "$f")
     if [ "$size" -gt "$MAX_LEN" ]; then
         echo "skipped $f ($size bytes > $MAX_LEN)"

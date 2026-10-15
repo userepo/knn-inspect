@@ -205,14 +205,19 @@ fixtures and baselines use faiss-cpu 1.15.1.
   `innerproduct`, `cosinesimil`); the native file is `_2_165_vec.faiss`
 - `fixtures/opensearch-3.9.0/cfs/` - the same with compound files on; the
   native file sits beside the `.cfs` as `_2_165_vec.faissc`
-- `*.stats.json` beside each synthetic fixture and `stats.json` beside
-  each real one - the graph statistics Faiss Python computes from the
-  same file, the baseline `stats` must match
+- `fixtures/opensearch-3.9.0-fp16/` - real segments of the same vectors
+  with an fp16 field, compound files off, one per space type, in
+  `sq-fp16/` (the `sq` encoder with `type: fp16`) and `half-float/` (the
+  `half_float` data type); until fp16 support the tool reports them as
+  an unsupported layout
+- `*.stats.json` beside each synthetic float fixture and `stats.json`
+  beside each real float one - the graph statistics Faiss Python
+  computes from the same file, the baseline `stats` must match
 - `*.queries.f32`, `*.results.jsonl`, and `*.recall.json` beside each
-  synthetic fixture (`queries.f32`, `results.jsonl`, `recall.json` beside
-  each real one) - 100 fixed queries, the labels Faiss's HNSW search
-  returns for them, and the recall@10 Faiss computes for those results,
-  the baseline `recall` must match
+  synthetic float fixture (`queries.f32`, `results.jsonl`, `recall.json`
+  beside each real float one) - 100 fixed queries, the labels Faiss's
+  HNSW search returns for them, and the recall@10 Faiss computes for
+  those results, the baseline `recall` must match
 - `fixtures/corrupted/` - one file per structural check, each derived
   from a clean fixture by a single mutation; `manifest.json` records the
   mutation and the check and severity it must trip
@@ -243,6 +248,8 @@ Real fixtures need Docker:
 docker compose -f tools\docker-compose.yml up -d
 .venv\Scripts\python tools\extract_opensearch.py --out fixtures\opensearch-3.9.0\nocfs
 .venv\Scripts\python tools\extract_opensearch.py --out fixtures\opensearch-3.9.0\cfs --compound
+.venv\Scripts\python tools\extract_opensearch.py --out fixtures\opensearch-3.9.0-fp16\sq-fp16 --encoding sq-fp16
+.venv\Scripts\python tools\extract_opensearch.py --out fixtures\opensearch-3.9.0-fp16\half-float --encoding half-float
 docker compose -f tools\docker-compose.yml down -v
 ```
 

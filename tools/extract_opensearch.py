@@ -12,10 +12,17 @@ indexed vectors as row-major little-endian float32, in doc-id order so
 row i is Faiss label i) and `manifest.json` (versions, settings, mapping,
 the file list, and `pos_of_doc`, the insertion position of each doc).
 
+`--encoding` picks how the field stores its vectors: `float` (the
+default), `sq-fp16` (the `sq` encoder with `type: fp16`, `bits: 16`),
+or `half-float` (the `half_float` data type). The vectors indexed are
+the same for every encoding.
+
 Usage:
     docker compose -f tools/docker-compose.yml up -d
     python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0/nocfs
     python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0/cfs --compound
+    python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-fp16/sq-fp16 --encoding sq-fp16
+    python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-fp16/half-float --encoding half-float
 """
 
 from __future__ import annotations
@@ -33,6 +40,7 @@ import numpy as np
 import requests
 
 SPACES = ["l2", "innerproduct", "cosinesimil"]
+ENCODINGS = ["float", "sq-fp16", "half-float"]
 M = 16
 EF_CONSTRUCTION = 100
 SEED = 20261013
@@ -64,7 +72,17 @@ def plugin_version(host: str, name: str) -> str | None:
     return None
 
 
-def create_index(host: str, index: str, space: str, dim: int, compound: bool) -> dict:
+def create_index(host: str, index: str, space: str, dim: int, compound: bool, encoding: str) -> dict:
+    parameters: dict = {"m": M, "ef_construction": EF_CONSTRUCTION}
+    if encoding == "sq-fp16":
+        # Indexes created by 3.6.0 or later must give the encoder's bits;
+        # 16 is fp16.
+        parameters["encoder"] = {"name": "sq", "parameters": {"type": "fp16", "bits": 16}}
+    field: dict = {"type": "knn_vector", "dimension": dim}
+    if encoding == "half-float":
+        field["data_type"] = "half_float"
+    field["space_type"] = space
+    field["method"] = {"name": "hnsw", "engine": "faiss", "parameters": parameters}
     body = {
         "settings": {
             "index": {
@@ -77,21 +95,7 @@ def create_index(host: str, index: str, space: str, dim: int, compound: bool) ->
                 "use_compound_file": compound,
             }
         },
-        "mappings": {
-            "properties": {
-                "pos": {"type": "integer"},
-                "vec": {
-                    "type": "knn_vector",
-                    "dimension": dim,
-                    "space_type": space,
-                    "method": {
-                        "name": "hnsw",
-                        "engine": "faiss",
-                        "parameters": {"m": M, "ef_construction": EF_CONSTRUCTION},
-                    },
-                },
-            }
-        },
+        "mappings": {"properties": {"pos": {"type": "integer"}, "vec": field}},
     }
     requests.delete(f"{host}/{index}", timeout=30)
     r = requests.put(f"{host}/{index}", json=body, timeout=60)
@@ -185,6 +189,7 @@ def main() -> None:
     parser.add_argument("--dim", type=int, default=16)
     parser.add_argument("--spaces", nargs="+", default=SPACES, choices=SPACES)
     parser.add_argument("--batches", type=int, default=2, help="bulk batches before the force merge")
+    parser.add_argument("--encoding", default="float", choices=ENCODINGS, help="how the field stores its vectors")
     args = parser.parse_args()
     if args.count > MAX_RESULT_WINDOW:
         parser.error(f"--count above {MAX_RESULT_WINDOW} exceeds index.max_result_window, which doc_order reads in one page")
@@ -192,7 +197,10 @@ def main() -> None:
     info = wait_for_cluster(args.host, timeout=180)
     os_version = info["version"]["number"]
     knn_version = plugin_version(args.host, "opensearch-knn")
-    print(f"OpenSearch {os_version}, k-NN plugin {knn_version}, compound files {'on' if args.compound else 'off'}")
+    print(
+        f"OpenSearch {os_version}, k-NN plugin {knn_version}, compound files {'on' if args.compound else 'off'}, "
+        f"encoding {args.encoding}"
+    )
 
     # One draw per space in a fixed order, so a space gets the same vectors
     # whether or not the other spaces are requested in this run.
@@ -200,13 +208,14 @@ def main() -> None:
     draws = {space: rng.standard_normal((args.count, args.dim), dtype=np.float32) for space in SPACES}
     for space in args.spaces:
         vectors = draws[space]
-        index = f"knn-{space}"
+        # Float indexes keep the names they had before `--encoding` existed.
+        index = f"knn-{space}" if args.encoding == "float" else f"knn-{space}-{args.encoding}"
         dest = args.out / space
         if dest.exists():
             shutil.rmtree(dest)
         dest.mkdir(parents=True)
 
-        body = create_index(args.host, index, space, args.dim, args.compound)
+        body = create_index(args.host, index, space, args.dim, args.compound, args.encoding)
         bulk_index(args.host, index, vectors, args.batches)
         segment = force_merge(args.host, index)
         pos_of_doc = doc_order(args.host, index, args.count)
@@ -226,6 +235,7 @@ def main() -> None:
             "index_uuid": uuid,
             "segment": segment,
             "compound_files": args.compound,
+            "encoding": args.encoding,
             "space_type": space,
             "count": args.count,
             "dimension": args.dim,

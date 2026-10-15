@@ -1,9 +1,11 @@
 # Native file format notes
 
-What a k-NN native file for a float HNSW field looks like on disk, confirmed
-byte by byte against the pinned sources and fixture files. The Rust parser
-in `knn-format` is checked against this document and the Python walker in
-`tools/walk_faiss.py`, which is a direct transcription of the Faiss read path.
+What a k-NN native file for a float HNSW field (and, ahead of parser
+support, an fp16 one) looks like on disk, confirmed byte by byte against
+the pinned sources and fixture files. The Rust parser in `knn-format` is
+checked against this document and the Python walker in
+`tools/walk_faiss.py`, which is a direct transcription of the Faiss read
+path.
 
 ## Pinned versions
 
@@ -168,14 +170,18 @@ Not yet read by `knn-inspect`, which reports these files as an
 unsupported layout at the `IHNs` tag (offset 37, right after the ID
 map's header). This section records the layout ahead of that support.
 
-k-NN's `sq` encoder with `type: fp16` on the Faiss engine stores vectors
-through Faiss's scalar quantizer with `QT_fp16`; per k-NN#3566 the
-`half_float` data type does the same. The layout below comes from Faiss's
-source and synthetic files; it is not yet confirmed against a file
-OpenSearch wrote, as the float layout is. Before indexing, k-NN checks every
-component (`FaissFP16Util` at tag 3.9.0.0): it must be finite and within
-the half-float range [-65504, 65504], or the document is rejected; with
-the encoder's `clip: true`, out-of-range values are clamped to the range
+k-NN stores fp16 vectors through Faiss's scalar quantizer with `QT_fp16`
+in two ways: the `sq` encoder with `type: fp16` (and `bits: 16`, which
+indexes created by 3.6.0 or later must give), and the `half_float` data
+type. Both write the same native layout below, confirmed against files
+OpenSearch 3.9.0 wrote (see "Real fp16 files" below); they differ in
+what Lucene's own copy of the vectors holds.
+
+Before indexing, k-NN checks every component: it must be finite and
+within the half-float range [-65504, 65504], or the document is
+rejected (at tag 3.9.0.0, `FaissFP16Util` for the encoder and
+`KNNValidationUtil.validateHalfFloatVectorValue` for the data type).
+Only the encoder's `clip: true` clamps out-of-range values to the range
 instead. A file k-NN wrote therefore holds no infinite or NaN codes.
 
 The layout differs from the float one only below the HNSW graph
@@ -220,15 +226,52 @@ same shape, and their graphs have the same levels and entry points,
 since Faiss draws levels from its own seed whatever the storage. The
 neighbor lists differ only where rounding to fp16 reorders close
 candidates: not at all in the 100x4 file, in about 1% and 0.5% of slots
-in the 1000x32 ones (331 and 174 of 32,960). The generator asserts that the codes decode to Faiss's own
-reconstruction and differ from NumPy's half-float rounding only on ties
-rounded away from zero; the three files hold 0, 2, and 3 such ties.
+in the 1000x32 ones (331 and 174 of 32,960). The generator asserts that
+the codes decode to Faiss's own reconstruction and differ from NumPy's
+half-float rounding only on ties rounded away from zero; the three files
+hold 0, 2, and 3 such ties.
 
 `tools/walk_faiss.py` reads all three to the end with no trailing bytes.
 In `l2-100x4-fp16.faiss` (16,315 bytes): `IHNs` at 37, `IxSQ` at 14,626,
 the quantizer's `qtype` at 14,663, the codes' byte count (800, for 100
 vectors of 8 bytes) at 14,699 and the codes at 14,707, the ID map's
 labels at 15,515, end at 16,315.
+
+### Real fp16 files from OpenSearch 3.9.0
+
+`tools/extract_opensearch.py --encoding sq-fp16` and `--encoding
+half-float` index the same 500 16-dimensional vectors as the float
+fixtures, one index per space type, compound files off, into
+`fixtures/opensearch-3.9.0-fp16/sq-fp16/` and `.../half-float/`. All six
+native files are `_2_165_vec.faiss`, 91,947 bytes: 15,964 fewer than
+the float ones, two bytes saved on each of 500 x 16 components, less
+the quantizer's 36 bytes of parameters. Each walks to the end with no
+trailing bytes and a verifying footer: `IxMp` > `IHNs` > `IxSQ`,
+`qtype` 4 (`QT_fp16`), `code_size` 32, a codes count of 16,000 bytes,
+`metric_type` 1 for `l2` and 0 for the other two.
+
+The codes are the field's vectors in fp16, but Lucene's copy differs by
+encoding:
+
+| Encoding | Lucene vector file | What it holds |
+| --- | --- | --- |
+| `sq` fp16 | `_2_NativeEngines990KnnVectorsFormat_0.vec`, codec `Lucene99FlatVectorsFormatData` | float32: the indexed vectors for `l2` and `innerproduct`, k-NN's normalized ones for `cosinesimil`; the codes are exactly these rounded to fp16 the Faiss way |
+| `half_float` | `_2_NativeEngines990HalfFloatKnnVectorsFormat_0.vec`, codec `KNN1040HalfFloatFlatVectorsFormatData` | fp16: the same bytes as the codes, at offset 128 |
+
+So a check against Lucene's copy can compare a `half_float` field byte
+for byte, as for float fields, but must round an `sq` fp16 field's
+float32 copy the Faiss way first. The only exact tie in these vectors,
+one component of the normalized cosine vectors, falls where rounding
+away from zero and rounding to even agree, so they cannot show which
+rounding `half_float` uses on a tie; that the codes match Lucene's bytes
+is what is confirmed.
+
+For `cosinesimil`, k-NN's normalized float32 vectors differ by up to
+about 1e-7 from a NumPy normalization of the same input, so a check must
+use Lucene's stored copy, not a recomputed one. The `.vec` of the `sq`
+fp16 cosine segment holds the same float32 vectors as the float cosine
+fixture's; the two files differ only in the header's segment ID and the
+checksum.
 
 ## Real files from OpenSearch 3.9.0
 
