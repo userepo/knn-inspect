@@ -1,3 +1,9 @@
 # Fixtures are byte-exact test inputs: never apply line-ending conversion,
 # whatever a clone's core.autocrlf says.
 fixtures/** -text
+
+# Shell scripts and checksum lists break with CRLF line endings, which a
+# Windows clone with core.autocrlf=true would give them, and they are run
+# from such clones under WSL.
+*.sh text eol=lf
+*.SHA256SUMS text eol=lf

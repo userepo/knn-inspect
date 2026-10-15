@@ -1,0 +1,5 @@
+# Benchmark side only: builds the indexes and runs the Faiss Python
+# baselines. The Rust crates never link Faiss.
+faiss-cpu==1.15.1
+numpy==2.5.4
+h5py==3.16.0
