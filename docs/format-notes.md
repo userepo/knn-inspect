@@ -165,9 +165,8 @@ walker's dimension, count, metric, level counts, entry point, and
 
 ## Scalar-quantized storage (fp16)
 
-`knn-inspect` reads these files with every command; only the `.vec`
-cross-check of `scan` skips them so far. Any quantizer type other than
-`QT_fp16` is reported as unsupported.
+`knn-inspect` reads these files with every command. Any quantizer type
+other than `QT_fp16` is reported as unsupported.
 
 k-NN stores fp16 vectors through Faiss's scalar quantizer with `QT_fp16`
 in two ways: the `sq` encoder with `type: fp16` (and `bits: 16`, which
@@ -224,8 +223,8 @@ synthetic fixtures on Windows rounds ties away from zero; k-NN on Linux
 x86 loads Faiss's AVX2 or AVX-512 build when the CPU supports it, and
 then rounds them to even. Anything that re-encodes float32 vectors to
 compare them with stored codes, such as a check against Lucene's float32
-copy, must accept either neighbor on an exact tie or report false
-mismatches.
+copy, must accept on an exact tie the code either rule gives (the one
+away from zero, or the even one) or report false mismatches.
 
 Faiss computes a query's distance to fp16 codes over the decoded float32
 values (`ScalarQuantizer::get_distance_computer` at `5616caa`). Its
@@ -281,13 +280,14 @@ encoding:
 | `sq` fp16 | `_2_NativeEngines990KnnVectorsFormat_0.vec`, codec `Lucene99FlatVectorsFormatData` | float32: the indexed vectors for `l2` and `innerproduct`, k-NN's normalized ones for `cosinesimil`; the codes are exactly these rounded to the nearest half float |
 | `half_float` | `_2_NativeEngines990HalfFloatKnnVectorsFormat_0.vec`, codec `KNN1040HalfFloatFlatVectorsFormatData` | fp16: the same bytes as the codes, at offset 128 |
 
-So a check against Lucene's copy can compare a `half_float` field byte
-for byte, as for float fields, but must round an `sq` fp16 field's
-float32 copy to the nearest half float first, accepting either neighbor
-on an exact tie. The only exact tie in these vectors, one component of
-the normalized cosine vectors, falls where rounding away from zero and
-rounding to even agree, so these files cannot show which tie rule either
-encoding used; that the codes match Lucene's copy is what is confirmed.
+So a check against Lucene's copy, such as `scan`'s, can compare a
+`half_float` field byte for byte, as for float fields, but must round an
+`sq` fp16 field's float32 copy to the nearest half float first,
+accepting on an exact tie the code either rule gives. The only exact tie
+in these vectors, one component of the normalized cosine vectors, falls
+where rounding away from zero and rounding to even agree, so these files
+cannot show which tie rule either encoding used; that the codes match
+Lucene's copy is what is confirmed.
 
 For `cosinesimil`, k-NN's normalized float32 vectors differ by up to
 about 1e-7 from a NumPy normalization of the same input, so a check must

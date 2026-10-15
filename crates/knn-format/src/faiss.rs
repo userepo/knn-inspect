@@ -337,6 +337,76 @@ pub fn f16_to_f32(bits: u16) -> f32 {
     f32::from_bits(sign | magnitude)
 }
 
+/// The float32 values that round to one half float, for checking fp16
+/// codes against the float32 vectors they were made from.
+///
+/// Faiss's tie rule depends on its build: the portable encoder rounds a
+/// value exactly halfway between two half floats away from zero, the F16C
+/// and NEON encoders to the even one. A tie matches the code either rule
+/// gives, so a code takes the midpoint below it always (it is the one away
+/// from zero there) and the midpoint above it only when it is even. The
+/// sign of a zero is not compared. Infinity and NaN codes match nothing;
+/// k-NN stores neither.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HalfRounding {
+    /// Smallest magnitude that rounds to the code, inclusive.
+    low: f64,
+    /// Largest magnitude that rounds to the code.
+    high: f64,
+    /// Whether `high` itself does: only for an even code, which rounding
+    /// to even keeps. The largest finite half float is odd, and rounds up
+    /// to infinity from 65520 on.
+    high_inclusive: bool,
+    /// The sign a value must have; `None` for a zero.
+    negative: Option<bool>,
+}
+
+impl HalfRounding {
+    /// The range of half float `code`, or `None` for infinity and NaN.
+    #[must_use]
+    pub fn of(code: u16) -> Option<Self> {
+        let magnitude = code & 0x7fff;
+        if magnitude >= 0x7c00 {
+            return None;
+        }
+        // Half floats and their midpoints are exact in f64.
+        let value = f64::from(f16_to_f32(magnitude));
+        let midpoint = |neighbor: u16| f64::midpoint(value, f64::from(f16_to_f32(neighbor)));
+        let low = if magnitude == 0 {
+            0.0
+        } else {
+            midpoint(magnitude - 1)
+        };
+        let high = if magnitude == 0x7bff {
+            65520.0
+        } else {
+            midpoint(magnitude + 1)
+        };
+        let high_inclusive = magnitude & 1 == 0;
+        Some(Self {
+            low,
+            high,
+            high_inclusive,
+            negative: (magnitude != 0).then_some(code & 0x8000 != 0),
+        })
+    }
+
+    /// Whether `x` rounds to the code.
+    #[must_use]
+    pub fn contains(&self, x: f32) -> bool {
+        if !x.is_finite() || self.negative.is_some_and(|n| n != x.is_sign_negative()) {
+            return false;
+        }
+        let m = f64::from(x.abs());
+        self.low <= m
+            && if self.high_inclusive {
+                m <= self.high
+            } else {
+                m < self.high
+            }
+    }
+}
+
 /// A scalar quantizer's parameters (`read_ScalarQuantizer`).
 #[derive(Debug, Clone, Copy)]
 pub struct ScalarQuantizer<'a> {

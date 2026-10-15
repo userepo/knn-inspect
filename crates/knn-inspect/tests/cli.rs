@@ -1212,14 +1212,181 @@ fn scan_reads_fp16_segments() {
             serde_json::json!(["IxMp", "IHNs", "IxSQ"]),
             "{f}"
         );
-        assert_eq!(f["lucene_vectors"]["status"], "skipped", "{f}");
-        assert!(
-            f["lucene_vectors"]["detail"]
-                .as_str()
-                .unwrap()
-                .contains("fp16"),
-            "{f}"
-        );
+        let lv = &f["lucene_vectors"];
+        assert_eq!(lv["status"], "match", "{f}");
+        assert_eq!(lv["offset"], 128, "{f}");
+        // half_float keeps the codes themselves; the sq encoder keeps the
+        // float32 vectors they were rounded from.
+        let how = if f["file"].as_str().unwrap().contains("half-float") {
+            "byte for byte"
+        } else {
+            "as float32 values that round to the stored half floats"
+        };
+        assert!(lv["detail"].as_str().unwrap().contains(how), "{f}");
         assert_eq!(f["lucene_docs"]["status"], "match", "{f}");
     }
+}
+
+/// A copy of a real fp16 segment's native file and `.vec`, with the
+/// offset of the native codes. The `.vec`'s vector data starts at 128 in
+/// these fixtures.
+struct Fp16Segment {
+    scratch: Scratch,
+    native: Vec<u8>,
+    vec_name: &'static str,
+    vec: Vec<u8>,
+    codes: usize,
+}
+
+impl Fp16Segment {
+    fn new(name: &str, encoding: &str) -> Self {
+        let dir = fixtures()
+            .join("opensearch-3.9.0-fp16")
+            .join(encoding)
+            .join("l2");
+        let native = std::fs::read(dir.join("_2_165_vec.faiss")).unwrap();
+        let vec_name = if encoding == "half-float" {
+            "_2_NativeEngines990HalfFloatKnnVectorsFormat_0.vec"
+        } else {
+            "_2_NativeEngines990KnnVectorsFormat_0.vec"
+        };
+        let vec = std::fs::read(dir.join(vec_name)).unwrap();
+        let codes = {
+            let parsed = knn_format::parse(&native).unwrap();
+            let storage = parsed.index.index.storage;
+            knn_format::view_offset(&native, storage.code_bytes()).unwrap()
+        };
+        Self {
+            scratch: Scratch::new(name),
+            native,
+            vec_name,
+            vec,
+            codes,
+        }
+    }
+
+    /// Writes both files under their names in the segment and scans.
+    fn scan(&self) -> serde_json::Value {
+        std::fs::write(self.scratch.0.join("_2_165_vec.faiss"), &self.native).unwrap();
+        std::fs::write(self.scratch.0.join(self.vec_name), &self.vec).unwrap();
+        let o = run(&["scan", self.scratch.0.to_str().unwrap(), "--json"]);
+        let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+        v["files"][0]["lucene_vectors"].clone()
+    }
+
+    fn code(&self, i: usize) -> u16 {
+        let at = self.codes + 2 * i;
+        u16::from_le_bytes([self.native[at], self.native[at + 1]])
+    }
+
+    fn set_code(&mut self, i: usize, code: u16) {
+        let at = self.codes + 2 * i;
+        self.native[at..at + 2].copy_from_slice(&code.to_le_bytes());
+    }
+
+    fn set_float(&mut self, i: usize, x: f32) {
+        let at = 128 + 4 * i;
+        self.vec[at..at + 4].copy_from_slice(&x.to_le_bytes());
+    }
+}
+
+const SQ_VEC: &str = "_2_NativeEngines990KnnVectorsFormat_0.vec";
+
+#[test]
+fn scan_accepts_the_code_either_tie_rule_gives() {
+    use knn_format::faiss::f16_to_f32;
+    let mut seg = Fp16Segment::new("fp16-tie", "sq-fp16");
+    let components = 500 * 16;
+
+    // An even code with its float32 source moved to exactly halfway up
+    // to the next half float: rounding to even (F16C, NEON) keeps the
+    // code, rounding away from zero (Faiss's portable encoder) takes the
+    // next one. Both match.
+    let i = (0..components).find(|&i| seg.code(i) & 1 == 0).unwrap();
+    let even = seg.code(i);
+    let tie = f32::midpoint(f16_to_f32(even), f16_to_f32(even + 1));
+    assert_eq!(
+        f64::from(tie),
+        f64::midpoint(f64::from(f16_to_f32(even)), f64::from(f16_to_f32(even + 1))),
+        "an exact midpoint"
+    );
+    seg.set_float(i, tie);
+    reseal(&mut seg.vec);
+    let lv = seg.scan();
+    assert_eq!(lv["status"], "match", "even rule: {lv}");
+    assert_eq!(lv["offset"], 128, "{lv}");
+    seg.set_code(i, even + 1);
+    reseal(&mut seg.native);
+    assert_eq!(seg.scan()["status"], "match", "away rule");
+
+    // An odd code below such a tie: both rules round up, so a file that
+    // kept the odd code was not written by Faiss.
+    let j = (0..components).find(|&j| seg.code(j) & 1 == 1).unwrap();
+    let odd = seg.code(j);
+    seg.set_float(j, f32::midpoint(f16_to_f32(odd), f16_to_f32(odd + 1)));
+    reseal(&mut seg.vec);
+    assert_eq!(seg.scan()["status"], "mismatch");
+}
+
+#[test]
+fn scan_flags_fp16_sources_that_round_elsewhere() {
+    use knn_format::faiss::f16_to_f32;
+    let mut seg = Fp16Segment::new("fp16-off", "sq-fp16");
+    // Component 5's source moved one float32 step past the midpoint up to
+    // the next half float, which it then rounds to under either rule. The
+    // sound .vec contradicts the native file.
+    let code = seg.code(5);
+    let tie = f32::midpoint(f16_to_f32(code), f16_to_f32(code + 1));
+    seg.set_float(5, f32::from_bits(tie.to_bits() + 1));
+    reseal(&mut seg.vec);
+    let lv = seg.scan();
+    assert_eq!(lv["status"], "mismatch", "{lv}");
+    assert!(lv["detail"].as_str().unwrap().contains(SQ_VEC), "{lv}");
+
+    // The same .vec without a fresh checksum: damaged, which outranks the
+    // mismatch.
+    let at = seg.vec.len() - 1;
+    seg.vec[at] ^= 0xff;
+    let lv = seg.scan();
+    assert_eq!(lv["status"], "damaged", "{lv}");
+}
+
+#[test]
+fn scan_compares_half_float_codes_byte_for_byte() {
+    let mut seg = Fp16Segment::new("fp16-half", "half-float");
+    // One code in the .vec one half float off, the file resealed.
+    let at = 128 + 2 * 7;
+    let code = u16::from_le_bytes([seg.vec[at], seg.vec[at + 1]]);
+    seg.vec[at..at + 2].copy_from_slice(&(code ^ 1).to_le_bytes());
+    reseal(&mut seg.vec);
+    let lv = seg.scan();
+    assert_eq!(lv["status"], "mismatch", "{lv}");
+}
+
+#[test]
+fn scan_gives_up_on_repetitive_float32_data() {
+    // Native codes all zero but the last, and a sound .vec whose data is
+    // all zeros: every aligned offset matches far into the codes. The
+    // search must stop within its budget and say it could not tell,
+    // rather than run in quadratic time or claim a mismatch.
+    let mut seg = Fp16Segment::new("fp16-zeros", "sq-fp16");
+    let codes = 500 * 16;
+    let (start, end) = (seg.codes, seg.codes + 2 * codes);
+    seg.native[start..end].fill(0);
+    seg.native[end - 2..end].copy_from_slice(&0x3c00_u16.to_le_bytes());
+    reseal(&mut seg.native);
+    seg.vec[128..128 + 4 * codes].fill(0);
+    reseal(&mut seg.vec);
+    let started = std::time::Instant::now();
+    let lv = seg.scan();
+    assert_eq!(lv["status"], "skipped", "{lv}");
+    assert!(
+        lv["detail"].as_str().unwrap().contains("repeat too much"),
+        "{lv}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "took {:?}",
+        started.elapsed()
+    );
 }

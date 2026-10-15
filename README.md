@@ -9,8 +9,7 @@ Rust, read-only, and does not link Faiss or talk to a cluster.
 
 ## Status
 
-Early development: every planned command works on every fixture, except
-that `scan` skips its `.vec` cross-check for fp16 storage. See
+Early development: every planned command works on every fixture. See
 [docs/format-notes.md](docs/format-notes.md) for the file format and
 [docs/json.md](docs/json.md) for the JSON output of each command.
 
@@ -110,18 +109,20 @@ the rest of the tree still is.
 its segment. The `.vec` file holds the same vectors in the same order,
 and the native file's storage must appear in it byte for byte; a
 compound segment keeps its `.vec` inside the `.cfs`, so this check is
-skipped there. It is also skipped for fp16 storage for now, without
-opening the `.vec`, so a damaged `.vec` beside an fp16 file is not
-reported yet. The `.si` file gives the segment's document count, and
-every label in the ID map, which k-NN sets to a doc id, must be one of
-the segment's doc ids. A `.vec` or `.si` that is there but cannot be
-read, or fails its own checksum, fails the native file too: the segment
-cannot be trusted as it stands. A sound `.si` in a format this tool does
-not read, as a newer Lucene may write, is skipped instead. `--space`
-applies to every file found; leave it out when the directory mixes space
-types. Exit code 0 when every file is clean, 1 if any failed (or would
-not open, a subdirectory could not be read, or none was found), 2 if the
-worst verdict was a warning.
+skipped there. For fp16 storage, a `half_float` field's `.vec` holds the
+codes byte for byte too, and an `sq` fp16 field's holds the float32
+vectors the codes were rounded from: each value must round to its code,
+on an exact tie either way one of Faiss's builds would round it. The
+`.si` file gives the segment's document count, and every label in the ID
+map, which k-NN sets to a doc id, must be one of the segment's doc ids.
+A `.vec` or `.si` that is there but cannot be read, or fails its own
+checksum, fails the native file too: the segment cannot be trusted as it
+stands. A sound `.si` in a format this tool does not read, as a newer
+Lucene may write, is skipped instead. `--space` applies to every file
+found; leave it out when the directory mixes space types. Exit code 0
+when every file is clean, 1 if any failed (or would not open, a
+subdirectory could not be read, or none was found), 2 if the worst
+verdict was a warning.
 
 ## Benchmarks
 
@@ -188,9 +189,8 @@ segment) for HNSW fields: an ID map wrapping HNSW with flat float32
 storage, or with fp16 scalar-quantized storage (the `sq` encoder with
 `type: fp16`, and the `half_float` data type), L2 or inner product
 (k-NN's `cosinesimil` is inner product over normalized vectors), with or
-without the Lucene footer. Every command reads both, though `scan` does
-not yet cross-check fp16 storage against the segment's `.vec`. Fixtures
-and format notes target OpenSearch 3.9.0.
+without the Lucene footer. Every command reads both. Fixtures and format
+notes target OpenSearch 3.9.0.
 
 Not yet: other scalar-quantized storage (such as bf16), byte and binary
 vectors, product quantization, and IVF. Their files are refused rather

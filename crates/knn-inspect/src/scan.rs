@@ -1,7 +1,6 @@
 //! The `scan` command: every native file under a directory, each verified
 //! and summarized, plus a cross-check of its vectors against the Lucene
-//! flat-vector file (`.vec`) of the same segment when one lies beside it
-//! and the native file stores float32 vectors.
+//! flat-vector file (`.vec`) of the same segment when one lies beside it.
 
 use std::fmt::Write as _;
 use std::fs;
@@ -11,7 +10,9 @@ use std::process::ExitCode;
 use anyhow::Context;
 use clap::Args;
 use knn_check::{Options, Severity, Space, Status};
+use knn_format::U16;
 use knn_format::envelope::Envelope;
+use knn_format::faiss::{HalfRounding, Storage};
 use knn_format::segment_info::SegmentInfo;
 use knn_format::{NativeFile, view_offset};
 use serde::Serialize;
@@ -145,9 +146,9 @@ enum CrossCheck {
     Damaged,
     /// Not compared: the Lucene file is not beside the native file (a
     /// compound segment keeps its `.vec` inside the `.cfs`), is a sound
-    /// file in a format this tool does not read, the native file stores
-    /// fp16 vectors (the `.vec` is then not opened), or there was nothing
-    /// to compare. `detail` says which.
+    /// file in a format this tool does not read, repeats its values too
+    /// much to search for fp16 codes' float32 sources in bounded time, or
+    /// there was nothing to compare. `detail` says which.
     Skipped,
 }
 
@@ -469,27 +470,36 @@ fn lucene_vectors(path: &Path, bytes: &[u8], parsed: &knn_format::Parsed<'_>) ->
             "no .vec file of segment {segment} beside the native file (a compound segment keeps its .vec inside the .cfs)"
         ));
     }
-    // The .vec of an fp16 field holds float32 for the sq encoder and
-    // the codes themselves for half_float; neither is compared yet.
-    let Some(flat) = parsed.index.index.storage.flat() else {
-        return skipped(
-            "the native file stores fp16 vectors, which are not compared with the .vec yet"
-                .to_owned(),
-        );
-    };
-    let codes = flat.codes;
-    let Some(storage) = view_offset(bytes, codes)
-        .and_then(|start| bytes.get(start..start.checked_add(codes.len().checked_mul(4)?)?))
-    else {
-        return skipped("the storage view could not be located in the file".to_owned());
+    // The bytes to look for: float32 storage as it lies in the file, or
+    // every whole fp16 code, which a half_float field's .vec holds byte for
+    // byte. An sq fp16 field's .vec holds the float32 vectors the codes
+    // were rounded from instead, so fp16 codes are also looked for that
+    // way.
+    let (storage, halves) = match &parsed.index.index.storage {
+        Storage::Flat(flat) => {
+            let codes = flat.codes;
+            let Some(storage) = view_offset(bytes, codes).and_then(|start| {
+                bytes.get(start..start.checked_add(codes.len().checked_mul(4)?)?)
+            }) else {
+                return skipped("the storage view could not be located in the file".to_owned());
+            };
+            (storage, None)
+        }
+        Storage::Fp16(fp16) => (
+            fp16.codes.get(..fp16.codes.len() & !1).unwrap_or_default(),
+            Some(fp16.components()),
+        ),
     };
     if storage.is_empty() {
         return skipped("the native file holds no vectors".to_owned());
     }
+    let rows = parsed.index.index.storage.row_count();
 
-    // .vec files read cleanly but not holding the vectors, and those that
-    // could not be trusted.
+    // .vec files read cleanly but not holding the vectors, those whose
+    // values repeat too much to search, and those that could not be
+    // trusted.
     let mut tried = Vec::new();
+    let mut repetitive = Vec::new();
     let mut untrusted = Vec::new();
     for candidate in &candidates {
         // Mapped, not read: a .vec can be as large as the index itself.
@@ -502,11 +512,9 @@ fn lucene_vectors(path: &Path, bytes: &[u8], parsed: &knn_format::Parsed<'_>) ->
         };
         let vec = mapped.bytes();
         let sound = lucene_footer(vec);
-        if let Some(offset) = find(vec, storage) {
-            let found = format!(
-                "{} vectors found byte for byte at offset {offset}",
-                parsed.index.index.storage.row_count()
-            );
+        let located = locate(vec, storage, halves);
+        if let Located::At(offset, how) = located {
+            let found = format!("{rows} vectors found {how} at offset {offset}");
             let (status, detail) = match sound {
                 Ok(()) => (CrossCheck::Match, found),
                 Err(why) => (CrossCheck::Damaged, format!("{found}, but the .vec {why}")),
@@ -519,6 +527,9 @@ fn lucene_vectors(path: &Path, bytes: &[u8], parsed: &knn_format::Parsed<'_>) ->
             };
         }
         match sound {
+            Ok(()) if located == Located::GaveUp => {
+                repetitive.push(candidate.display().to_string());
+            }
             Ok(()) => tried.push(candidate.display().to_string()),
             Err(why) => untrusted.push(format!("{} {why}", candidate.display())),
         }
@@ -535,6 +546,13 @@ fn lucene_vectors(path: &Path, bytes: &[u8], parsed: &knn_format::Parsed<'_>) ->
                 untrusted.join("; ")
             ),
         };
+    }
+    // A search that gave up cannot say the vectors are not there.
+    if !repetitive.is_empty() {
+        return skipped(format!(
+            "the float32 values of {} repeat too much to search for the fp16 codes' sources in bounded time",
+            repetitive.join(", ")
+        ));
     }
     LuceneVectors {
         status: CrossCheck::Mismatch,
@@ -589,6 +607,86 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         return None;
     }
     memchr::memmem::find(haystack, needle)
+}
+
+/// Where a `.vec` holds the native file's vectors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Located {
+    /// At this offset, found as described.
+    At(usize, &'static str),
+    /// Not in the file.
+    Absent,
+    /// The search for fp16 codes' float32 sources gave up.
+    GaveUp,
+}
+
+/// Looks for `storage` byte for byte, then, for fp16 codes (`halves`),
+/// for the float32 values they were rounded from.
+fn locate(vec: &[u8], storage: &[u8], halves: Option<&[U16]>) -> Located {
+    if let Some(offset) = find(vec, storage) {
+        return Located::At(offset, "byte for byte");
+    }
+    match halves.map(|h| find_rounded(vec, h)) {
+        Some(Rounded::Found(offset)) => Located::At(
+            offset,
+            "as float32 values that round to the stored half floats",
+        ),
+        Some(Rounded::GaveUp) => Located::GaveUp,
+        Some(Rounded::Missing) | None => Located::Absent,
+    }
+}
+
+/// How a search for fp16 codes' float32 sources ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rounded {
+    /// The sources start at this offset.
+    Found(usize),
+    /// They are not in the file.
+    Missing,
+    /// The file repeats its values too much to search in bounded time.
+    GaveUp,
+}
+
+/// Looks in `vec` for float32 values that round, one by one, to `codes`.
+/// Lucene starts float32 vector data at a multiple of 4 bytes (Lucene
+/// 10.5.1 at a multiple of 64), so only those offsets are tried. Each
+/// offset whose first value rounds to the first code is followed until a
+/// value does not. On data that repeats long runs, following every such
+/// offset would take quadratic time, so the follow-up work is capped at
+/// about four passes over the file; past that the search gives up.
+/// Nothing is allocated.
+fn find_rounded(vec: &[u8], codes: &[U16]) -> Rounded {
+    let Some(first) = codes.first().and_then(|c| HalfRounding::of(c.get())) else {
+        return Rounded::Missing;
+    };
+    let (words, _) = vec.as_chunks::<4>();
+    if codes.len() > words.len() {
+        return Rounded::Missing;
+    }
+    let mut budget = words.len().saturating_add(codes.len()).saturating_mul(4);
+    for (index, window) in words.windows(codes.len()).enumerate() {
+        if !window
+            .first()
+            .is_some_and(|w| first.contains(f32::from_le_bytes(*w)))
+        {
+            continue;
+        }
+        let mut all = true;
+        for (w, code) in window.iter().zip(codes).skip(1) {
+            let Some(left) = budget.checked_sub(1) else {
+                return Rounded::GaveUp;
+            };
+            budget = left;
+            if !HalfRounding::of(code.get()).is_some_and(|r| r.contains(f32::from_le_bytes(*w))) {
+                all = false;
+                break;
+            }
+        }
+        if all {
+            return Rounded::Found(index.saturating_mul(4));
+        }
+    }
+    Rounded::Missing
 }
 
 fn text(out: &Output) -> String {

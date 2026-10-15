@@ -17,7 +17,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use knn_format::faiss::{
-    FourCc, Fp16Storage, Metric, QT_FP16, Storage, f16_to_f32, quantizer_type_name,
+    FourCc, Fp16Storage, HalfRounding, Metric, QT_FP16, Storage, f16_to_f32, quantizer_type_name,
 };
 use knn_format::{Error, NativeFile};
 use serde::Deserialize;
@@ -229,10 +229,10 @@ fn synthetic_fixtures_match_faiss_python() {
     }
 }
 
-/// Whether `code` is a half float nearest to `x`. On an exact tie either
-/// neighbor passes: Faiss's portable encoder rounds a tie away from zero,
-/// its F16C and NEON encoders to even, and which one ran depends on the
-/// build that wrote the file.
+/// Whether one of Faiss's encoders would store `x` as `code`: `code` is a
+/// half float nearest to `x`, and on an exact tie the one away from zero
+/// (the portable encoder) or the even one (the F16C and NEON encoders);
+/// which encoder ran depends on the build that wrote the file.
 fn is_nearest_half(x: f32, code: u16) -> bool {
     let x = f64::from(x);
     let got = f64::from(f16_to_f32(code));
@@ -247,7 +247,7 @@ fn is_nearest_half(x: f32, code: u16) -> bool {
     neighbors.into_iter().all(|n| {
         let other = f64::from(f16_to_f32(n));
         let (d_got, d_other) = ((got - x).abs(), (other - x).abs());
-        d_got <= d_other
+        d_got < d_other || (d_got <= d_other && (got.abs() > other.abs() || code & 1 == 0))
     })
 }
 
@@ -483,4 +483,101 @@ fn an_odd_code_length_parses_and_keeps_whole_rows_only() {
     assert!(s.vector(98).is_some());
     assert_eq!(storage.component_count(), 399);
     assert!(storage.component(399).is_none());
+}
+
+/// The float32 values one step either side of `x`, and `x`.
+fn around(x: f32) -> [f32; 3] {
+    let bits = x.to_bits();
+    [f32::from_bits(bits - 1), x, f32::from_bits(bits + 1)]
+}
+
+#[test]
+#[allow(
+    clippy::manual_midpoint,
+    reason = "midpoints worked out by hand, apart from the library's f64::midpoint"
+)]
+fn half_rounding_agrees_with_the_nearest_half_oracle() {
+    let mut checked = 0;
+    for code in 0..=u16::MAX {
+        let magnitude = code & 0x7fff;
+        let Some(range) = HalfRounding::of(code) else {
+            assert!(magnitude >= 0x7c00, "{code:#06x} is finite");
+            continue;
+        };
+        let value = f16_to_f32(code);
+        // The value, and both midpoints with a step either side: every
+        // boundary the range has.
+        let mut points = vec![value];
+        let sign = code & 0x8000;
+        let neighbors = [
+            sign | (magnitude + 1),
+            if magnitude == 0 {
+                (0x8000 ^ sign) | 1
+            } else {
+                sign | (magnitude - 1)
+            },
+        ];
+        for n in neighbors {
+            let other = f16_to_f32(n);
+            if !other.is_finite() {
+                continue;
+            }
+            let mid = (f64::from(value) + f64::from(other)) / 2.0;
+            let mid = mid as f32;
+            assert_eq!(f64::from(mid), (f64::from(value) + f64::from(other)) / 2.0);
+            points.extend(around(mid));
+        }
+        for x in points {
+            // At the top the oracle sees no finite upper neighbor and
+            // takes anything above; 65504 rounds to infinity from 65520.
+            if x.abs() >= 65520.0 {
+                assert!(!range.contains(x), "{code:#06x} at {x}");
+                continue;
+            }
+            assert_eq!(
+                range.contains(x),
+                is_nearest_half(x, code),
+                "{code:#06x} at {x}"
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked > 300_000, "{checked} points");
+
+    // Not finite: nothing matches, and no code takes NaN or infinity.
+    assert!(HalfRounding::of(0x7c00).is_none());
+    assert!(HalfRounding::of(0xfe00).is_none());
+    let one = HalfRounding::of(0x3c00).unwrap();
+    assert!(one.contains(1.0) && !one.contains(f32::NAN) && !one.contains(f32::INFINITY));
+    // A sign is compared except on zero.
+    assert!(!one.contains(-1.0));
+    let zero = HalfRounding::of(0x0000).unwrap();
+    assert!(zero.contains(-0.0) && zero.contains(1e-9) && zero.contains(-1e-9));
+    assert!(!HalfRounding::of(0x8001).unwrap().contains(1e-8));
+}
+
+#[test]
+fn random_floats_round_to_the_codes_the_oracle_picks() {
+    // A fixed xorshift sequence over finite float32 bit patterns.
+    let mut state = 0x2545_f491_4f6c_dd1d_u64;
+    let mut seen = 0;
+    while seen < 64 {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let x = f32::from_bits((state >> 32) as u32);
+        if !x.is_finite() || x.abs() >= 65520.0 {
+            continue;
+        }
+        let ours: Vec<u16> = (0..=u16::MAX)
+            .filter(|&c| HalfRounding::of(c).is_some_and(|r| r.contains(x)))
+            .collect();
+        let oracle: Vec<u16> = (0..=u16::MAX)
+            .filter(|&c| (c & 0x7fff) < 0x7c00 && is_nearest_half(x, c))
+            .collect();
+        assert_eq!(ours, oracle, "{x}");
+        // One code, or two: a tie, or a value that rounds to either zero.
+        assert!(matches!(ours.len(), 1 | 2), "{x}: {ours:?}");
+        seen += 1;
+    }
 }

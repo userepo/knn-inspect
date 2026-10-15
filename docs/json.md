@@ -136,13 +136,18 @@ fails the file.
 
 - `lucene_vectors` looks for the native file's stored vectors, byte for
   byte, inside the segment's `.vec` (Lucene flat vectors) files, which
-  hold the same vectors in the same order. When the vectors are found in a
-  `.vec` that is damaged, `offset` still says where. It is skipped when
-  no loose `.vec` lies beside the native file, as in a compound segment,
-  where the `.vec` is inside the `.cfs`, and for a native file with fp16
-  storage, which is not compared yet. Before 0.3.0, a `.vec` that
-  could not be opened was reported as `mismatch`, and a failing checksum
-  was only mentioned in `detail`.
+  hold the same vectors in the same order. For fp16 storage it also looks
+  for float32 values that round to the stored half floats, which is what
+  the `.vec` of k-NN's `sq` fp16 encoder holds (the `.vec` of a
+  `half_float` field holds the codes byte for byte); `detail` says which
+  way they were found. When the vectors are found in a `.vec` that is
+  damaged, `offset` still says where. It is skipped when no loose `.vec`
+  lies beside the native file, as in a compound segment, where the `.vec`
+  is inside the `.cfs`, or when the float32 values of a sound `.vec`
+  repeat too much to search for fp16 sources in bounded time (since 0.4.0,
+  the first version to read fp16 files). Before 0.3.0, a `.vec` that could
+  not be opened was reported as `mismatch`, and a failing checksum was
+  only mentioned in `detail`.
 - `lucene_docs` reads the document count from the segment's `.si` and
   checks that every label in the ID map, which k-NN sets to a doc id,
   lies in `0..doc_count`, with no more labels than documents. The `.si`
