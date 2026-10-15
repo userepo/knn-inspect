@@ -189,6 +189,27 @@ the name that exists on disk: `_2.si` names `_2_165_vec.faiss` in the
 non-compound set and `_2_165_vec.faissc` in the compound set, so a
 directory scan driven by `.si` file lists can use the names as listed.
 
+### Segment info (`.si`)
+
+`scan` reads the document count from the segment's `.si`, which is never
+inside the `.cfs`. The layout is `Lucene99SegmentInfoFormat` at Lucene
+10.5.1 (`parseSegmentInfo`), under codec name `Lucene90SegmentInfo`,
+version 0. After the big-endian `CodecUtil` index header, the fields are
+little-endian:
+
+| Field | Type | All six fixtures |
+| --- | --- | --- |
+| Lucene version that wrote the segment | 3 x int32 (major, minor, bugfix) | 10, 5, 1 |
+| Minimum version flag | int8, 0 or 1 | 1 |
+| Minimum contributing version, when the flag is 1 | 3 x int32 | 10, 5, 1 |
+| Document count, deleted documents included | int32 | 500 |
+| Compound file | int8: 1 yes, -1 no | -1 in `nocfs/`, 1 in `cfs/` |
+
+Diagnostics, the file list, attributes, and the index sort follow, then
+the footer; the reader stops after the compound byte. Every doc id in
+the segment is below the document count, which is what the ID map's
+labels are checked against.
+
 ### Bytes
 
 Head of `nocfs/l2/_2_165_vec.faiss`:

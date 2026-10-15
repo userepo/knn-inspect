@@ -11,6 +11,9 @@
 //! or `IxFI` flat storage. See `docs/format-notes.md` in the repository
 //! for the byte-level description.
 //!
+//! [`segment_info`] reads one more Lucene file of the segment, as far as
+//! the document count: the segment info (`.si`).
+//!
 //! Only little-endian targets are supported. The views here decode the
 //! payload's little-endian fields explicitly, but the crates above are
 //! free to read vector data in place, which assumes the host's byte order
@@ -25,6 +28,7 @@ mod error;
 pub mod faiss;
 mod mmap;
 mod reader;
+pub mod segment_info;
 
 use std::path::{Path, PathBuf};
 

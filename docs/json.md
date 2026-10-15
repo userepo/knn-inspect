@@ -111,17 +111,30 @@ Each entry of `files`:
 | --- | --- | --- |
 | `file` | string | The file's path |
 | `size` | integer, nullable | Bytes; `null` when the file would not open |
-| `error` | string, optional | Why the file would not open; `failures`, `warnings`, and `checks` are then absent, and `lucene_vectors` is `skipped` |
+| `error` | string, optional | Why the file would not open; `failures`, `warnings`, and `checks` are then absent, and both cross-checks are `skipped` |
 | `layout`, `dimension`, `count`, `metric` | optional | As for `info`; absent when the file did not parse |
-| `status` | string | `clean`, `warnings`, or `failed`, counting the Lucene cross-check |
+| `status` | string | `clean`, `warnings`, or `failed`, counting both Lucene cross-checks |
 | `failures`, `warnings`, `checks` | optional | As for `verify` |
 | `lucene_vectors.status` | string | `match`, `mismatch`, or `skipped` |
 | `lucene_vectors.file` | string, optional | The segment's `.vec` file the vectors were found in, or the first one looked in |
 | `lucene_vectors.offset` | integer, optional | Where in that file the stored vectors begin |
 | `lucene_vectors.detail` | string | What was found, or why the check was skipped |
+| `lucene_docs.status` | string | `match`, `mismatch`, or `skipped` |
+| `lucene_docs.file` | string, optional | The segment's `.si` file that was read |
+| `lucene_docs.doc_count` | integer, optional | Documents in the segment, deleted ones included |
+| `lucene_docs.detail` | string | What was found, or why the check was skipped |
 
-The Lucene cross-check looks for the native file's stored vectors, byte
-for byte, inside the `.vec` (Lucene flat vectors) files of the same
-segment, which hold the same vectors in the same order; a `mismatch`
-fails the file. It is skipped when no loose `.vec` lies beside the native
-file, as in a compound segment, where the `.vec` is inside the `.cfs`.
+The two Lucene cross-checks compare the native file with files of the
+same segment, and a `mismatch` in either fails the file:
+
+- `lucene_vectors` looks for the native file's stored vectors, byte for
+  byte, inside the segment's `.vec` (Lucene flat vectors) files, which
+  hold the same vectors in the same order. It is skipped when no loose
+  `.vec` lies beside the native file, as in a compound segment, where the
+  `.vec` is inside the `.cfs`.
+- `lucene_docs` reads the document count from the segment's `.si` and
+  checks that every label in the ID map, which k-NN sets to a doc id,
+  lies in `0..doc_count`, with no more labels than documents. The `.si`
+  is never inside the `.cfs`, so compound segments are checked too. It is
+  skipped when there is no `.si` beside the native file or it cannot be
+  read.

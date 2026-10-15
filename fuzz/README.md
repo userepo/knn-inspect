@@ -2,9 +2,9 @@
 
 One libFuzzer target, `parse_and_verify`, feeds arbitrary bytes to
 `knn_format::parse`, `knn_check::verify`, `knn_check::graph_stats`, and
-an HNSW search (`knn_recall::Searcher`) over whatever graph parsed. The
-rule under test: any input yields a result, never a panic or an
-out-of-bounds read.
+an HNSW search (`knn_recall::Searcher`) over whatever graph parsed, and
+to the segment info reader (`knn_format::segment_info`). The rule under
+test: any input yields a result, never a panic or an out-of-bounds read.
 
 cargo-fuzz needs a nightly toolchain and does not support Windows MSVC;
 run it on Linux (WSL works). CI does not run it.
@@ -17,7 +17,8 @@ cargo +nightly fuzz run parse_and_verify -- -max_len=200000
 ```
 
 `seed.sh` fills `corpus/parse_and_verify/` with the committed fixtures,
-clean and corrupted, skipping any larger than the 200,000-byte
+clean and corrupted, and the real segments' `.si` files for the segment
+info reader, skipping any larger than the 200,000-byte
 `-max_len`: libFuzzer would only see their first 200 KB, which is just
 another truncated file, a case the truncation tests already cover.
 libFuzzer adds to the corpus as it finds new coverage.

@@ -101,14 +101,16 @@ back up the tree cannot loop; a link to a native file is scanned like the
 file. A subdirectory that cannot be read is listed as not scanned, and
 the rest of the tree still is.
 
-`scan` also cross-checks the vectors against Lucene's own copy: the
-segment's `.vec` file holds the same vectors in the same order, and the
-native file's storage must appear in it byte for byte. A compound
-segment keeps its `.vec` inside the `.cfs`, so the check is skipped
-there. `--space` applies to every file found; leave it out when the
-directory mixes space types. Exit code 0 when every file is clean, 1 if
-any failed (or would not open, a subdirectory could not be read, or none
-was found), 2 if the worst verdict was a warning.
+`scan` also cross-checks each native file against two Lucene files of
+its segment. The `.vec` file holds the same vectors in the same order,
+and the native file's storage must appear in it byte for byte; a
+compound segment keeps its `.vec` inside the `.cfs`, so this check is
+skipped there. The `.si` file gives the segment's document count, and
+every label in the ID map, which k-NN sets to a doc id, must be one of
+the segment's doc ids. `--space` applies to every file found; leave it
+out when the directory mixes space types. Exit code 0 when every file is
+clean, 1 if any failed (or would not open, a subdirectory could not be
+read, or none was found), 2 if the worst verdict was a warning.
 
 ## Benchmarks
 

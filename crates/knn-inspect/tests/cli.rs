@@ -665,6 +665,11 @@ fn scan_walks_a_directory_and_cross_checks_lucene_vectors() {
                 "{f}"
             );
         }
+        // The .si sits outside the .cfs, so both sets have one.
+        let ld = &f["lucene_docs"];
+        assert_eq!(ld["status"], "match", "{f}");
+        assert_eq!(ld["doc_count"], 500, "{f}");
+        assert!(ld["file"].as_str().unwrap().ends_with("_2.si"), "{f}");
     }
 
     let o = run(&["scan", root.to_str().unwrap()]);
@@ -900,4 +905,56 @@ fn scan_reports_unreadable_subdirectories_and_continues() {
     assert_eq!(unreadable.len(), 1, "{v}");
     assert!(unreadable[0]["path"].as_str().unwrap().ends_with("locked"));
     assert_ne!(unreadable[0]["error"].as_str().unwrap(), "");
+}
+
+#[test]
+fn scan_flags_labels_that_are_not_doc_ids_of_the_segment() {
+    // The real l2 segment with its .si claiming 400 documents: labels
+    // 400..499 are then no doc ids of it.
+    let scratch = Scratch::new("scan-si");
+    let l2 = fixtures().join("opensearch-3.9.0/nocfs/l2");
+    for name in [
+        "_2_165_vec.faiss",
+        "_2_NativeEngines990KnnVectorsFormat_0.vec",
+    ] {
+        std::fs::copy(l2.join(name), scratch.0.join(name)).unwrap();
+    }
+    let mut si = std::fs::read(l2.join("_2.si")).unwrap();
+    let header = knn_format::envelope::Envelope::parse(&si)
+        .unwrap()
+        .header
+        .unwrap();
+    // Header, three version ints, the minimum-version flag (1), three ints.
+    let at = header.length + 12 + 1 + 12;
+    assert_eq!(&si[at..at + 4], &500_i32.to_le_bytes());
+    si[at..at + 4].copy_from_slice(&400_i32.to_le_bytes());
+    std::fs::write(scratch.0.join("_2.si"), &si).unwrap();
+
+    let o = run(&["scan", scratch.0.to_str().unwrap(), "--json"]);
+    assert_eq!(o.status.code(), Some(1), "{}", stdout(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    let f = &v["files"][0];
+    assert_eq!(f["failures"], 0, "verify itself is clean: {f}");
+    assert_eq!(f["lucene_vectors"]["status"], "match", "{f}");
+    assert_eq!(f["status"], "failed", "{f}");
+    let ld = &f["lucene_docs"];
+    assert_eq!(ld["status"], "mismatch", "{f}");
+    assert_eq!(ld["doc_count"], 400, "{f}");
+    let detail = ld["detail"].as_str().unwrap();
+    assert!(
+        detail.starts_with("100 of 500 labels are not doc ids of the 400-document segment"),
+        "{detail}"
+    );
+    // The edit broke the .si's own checksum, and the detail says so.
+    assert!(
+        detail.ends_with("but its footer checksum does not verify"),
+        "{detail}"
+    );
+
+    let o = run(&["scan", scratch.0.to_str().unwrap()]);
+    assert!(
+        stdout(&o).contains("FAIL      lucene_docs"),
+        "{}",
+        stdout(&o)
+    );
 }

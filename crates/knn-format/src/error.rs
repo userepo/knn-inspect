@@ -60,6 +60,18 @@ pub enum Error {
         value: i64,
     },
 
+    /// A Lucene file's codec header names a codec or version this crate
+    /// does not read.
+    #[error("{found} at offset {offset}; expected {expected}")]
+    UnexpectedCodec {
+        /// Where the header starts.
+        offset: usize,
+        /// The codec and version found, or that there is no header.
+        found: String,
+        /// The codec this reader expects.
+        expected: &'static str,
+    },
+
     /// The footer names a checksum algorithm other than CRC32.
     #[error(
         "footer at offset {offset} names checksum algorithm {algorithm}, only 0 (CRC32) is defined"
@@ -106,6 +118,7 @@ impl Error {
             | Self::UnsupportedLayout { offset, .. }
             | Self::CountTooLarge { offset, .. }
             | Self::InvalidValue { offset, .. }
+            | Self::UnexpectedCodec { offset, .. }
             | Self::UnknownChecksumAlgorithm { offset, .. }
             | Self::InvalidChecksum { offset, .. }
             | Self::InvalidString { offset } => Some(*offset),

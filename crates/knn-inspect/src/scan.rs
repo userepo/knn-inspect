@@ -11,6 +11,7 @@ use anyhow::Context;
 use clap::Args;
 use knn_check::{Options, Severity, Space, Status};
 use knn_format::envelope::Envelope;
+use knn_format::segment_info::SegmentInfo;
 use knn_format::{NativeFile, view_offset};
 use serde::Serialize;
 
@@ -76,12 +77,13 @@ struct FileReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     checks: Option<Vec<knn_check::CheckResult>>,
     lucene_vectors: LuceneVectors,
+    lucene_docs: LuceneDocs,
 }
 
 /// The vectors compared with the segment's Lucene flat-vector file.
 #[derive(Serialize)]
 struct LuceneVectors {
-    status: VecStatus,
+    status: CrossCheck,
     /// The `.vec` file the vectors were found in, or looked for in.
     #[serde(skip_serializing_if = "Option::is_none")]
     file: Option<String>,
@@ -91,17 +93,54 @@ struct LuceneVectors {
     detail: String,
 }
 
+impl LuceneVectors {
+    fn skipped(detail: String) -> Self {
+        Self {
+            status: CrossCheck::Skipped,
+            file: None,
+            offset: None,
+            detail,
+        }
+    }
+}
+
+/// The ID map's labels, which k-NN sets to Lucene doc ids, checked
+/// against the document count in the segment's info file (`.si`).
+#[derive(Serialize)]
+struct LuceneDocs {
+    status: CrossCheck,
+    /// The `.si` file read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file: Option<String>,
+    /// Documents in the segment, deleted ones included.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    doc_count: Option<u32>,
+    detail: String,
+}
+
+impl LuceneDocs {
+    fn skipped(detail: String) -> Self {
+        Self {
+            status: CrossCheck::Skipped,
+            file: None,
+            doc_count: None,
+            detail,
+        }
+    }
+}
+
+/// The outcome of comparing the native file with a Lucene file of the
+/// same segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum VecStatus {
-    /// The native file's vectors appear, byte for byte, in a `.vec` file
-    /// of the segment.
+enum CrossCheck {
+    /// The native file agrees with the Lucene file.
     Match,
-    /// `.vec` files of the segment exist and none holds the vectors.
+    /// The Lucene file exists and the native file contradicts it.
     Mismatch,
-    /// Not compared: no loose `.vec` of the segment beside the file (as in
-    /// a compound segment, which keeps it inside the `.cfs`), or nothing
-    /// to compare. `detail` says which.
+    /// Not compared: the Lucene file is not beside the native file (a
+    /// compound segment keeps its `.vec` inside the `.cfs`), could not be
+    /// read, or there was nothing to compare. `detail` says which.
     Skipped,
 }
 
@@ -242,12 +281,10 @@ fn scan_file(path: &Path, options: &Options) -> FileReport {
                 failures: None,
                 warnings: None,
                 checks: None,
-                lucene_vectors: LuceneVectors {
-                    status: VecStatus::Skipped,
-                    file: None,
-                    offset: None,
-                    detail: "the native file could not be opened".to_owned(),
-                },
+                lucene_vectors: LuceneVectors::skipped(
+                    "the native file could not be opened".to_owned(),
+                ),
+                lucene_docs: LuceneDocs::skipped("the native file could not be opened".to_owned()),
             };
         }
     };
@@ -256,19 +293,16 @@ fn scan_file(path: &Path, options: &Options) -> FileReport {
     let parsed = knn_format::parse(bytes).ok();
     let idx = parsed.as_ref().map(|p| &p.index);
 
-    let (lucene_vectors, vec_failed) = match &parsed {
-        Some(p) => lucene_vectors(path, bytes, p),
+    let (lucene_vectors, lucene_docs) = match &parsed {
+        Some(p) => (lucene_vectors(path, bytes, p), lucene_docs(path, p)),
         None => (
-            LuceneVectors {
-                status: VecStatus::Skipped,
-                file: None,
-                offset: None,
-                detail: "the native file did not parse".to_owned(),
-            },
-            false,
+            LuceneVectors::skipped("the native file did not parse".to_owned()),
+            LuceneDocs::skipped("the native file did not parse".to_owned()),
         ),
     };
-    let status = if vec_failed {
+    let crossed =
+        lucene_vectors.status == CrossCheck::Mismatch || lucene_docs.status == CrossCheck::Mismatch;
+    let status = if crossed {
         Status::Failed
     } else {
         report.status
@@ -292,27 +326,97 @@ fn scan_file(path: &Path, options: &Options) -> FileReport {
         warnings: Some(report.warnings),
         checks: Some(report.checks),
         lucene_vectors,
+        lucene_docs,
+    }
+}
+
+/// Reads the `.si` of the native file's segment and checks that every
+/// label is one of its doc ids: no more labels than documents, and each
+/// in `0..doc_count`.
+fn lucene_docs(path: &Path, parsed: &knn_format::Parsed<'_>) -> LuceneDocs {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return LuceneDocs::skipped("the native file's name is not UTF-8".to_owned());
+    };
+    let segment = segment_of(name);
+    let si_path = path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!("{segment}.si"));
+    if !si_path.is_file() {
+        return LuceneDocs::skipped(format!("no {segment}.si beside the native file"));
+    }
+    let si_file = match NativeFile::open(&si_path) {
+        Ok(f) => f,
+        Err(e) => {
+            return LuceneDocs::skipped(format!("{} could not be opened: {e}", si_path.display()));
+        }
+    };
+    let si_bytes = si_file.bytes();
+    let info = match SegmentInfo::parse(si_bytes) {
+        Ok(info) => info,
+        Err(e) => {
+            return LuceneDocs::skipped(format!("{} could not be read: {e}", si_path.display()));
+        }
+    };
+    let footer = match Envelope::parse(si_bytes) {
+        Ok(env) => match env.footer.map(|f| f.verify(si_bytes)) {
+            Some(Ok(_)) => "its footer checksum verifies",
+            Some(Err(_)) => "but its footer checksum does not verify",
+            None => "it has no Lucene footer",
+        },
+        Err(_) => "its envelope did not parse",
+    };
+
+    let docs = i64::from(info.doc_count);
+    let labels = parsed.index.id_map;
+    // One pass, keeping a count and the first offender: a corrupt count
+    // can put every label out of range, and nothing more is reported.
+    let mut outside = 0_usize;
+    let mut first = None;
+    for (node, label) in labels.iter().map(|l| l.get()).enumerate() {
+        if !(0..docs).contains(&label) {
+            outside = outside.saturating_add(1);
+            first.get_or_insert((node, label));
+        }
+    }
+    let too_many = u64::try_from(labels.len()).unwrap_or(u64::MAX) > u64::from(info.doc_count);
+    let (status, detail) = if let Some((node, label)) = first {
+        (
+            CrossCheck::Mismatch,
+            format!(
+                "{outside} of {} labels are not doc ids of the {docs}-document segment; first: node {node} has label {label}; {footer}",
+                labels.len()
+            ),
+        )
+    } else if too_many {
+        (
+            CrossCheck::Mismatch,
+            format!(
+                "{} labels for a {docs}-document segment; {footer}",
+                labels.len()
+            ),
+        )
+    } else {
+        (
+            CrossCheck::Match,
+            format!(
+                "{} labels, all doc ids of the {docs}-document segment; {footer}",
+                labels.len()
+            ),
+        )
+    };
+    LuceneDocs {
+        status,
+        file: Some(si_path.display().to_string()),
+        doc_count: Some(info.doc_count),
+        detail,
     }
 }
 
 /// Looks for the native file's stored vectors inside the `.vec` files of
-/// its segment. Returns the outcome and whether it counts as a failure.
-fn lucene_vectors(
-    path: &Path,
-    bytes: &[u8],
-    parsed: &knn_format::Parsed<'_>,
-) -> (LuceneVectors, bool) {
-    let skipped = |detail: String| {
-        (
-            LuceneVectors {
-                status: VecStatus::Skipped,
-                file: None,
-                offset: None,
-                detail,
-            },
-            false,
-        )
-    };
+/// its segment.
+fn lucene_vectors(path: &Path, bytes: &[u8], parsed: &knn_format::Parsed<'_>) -> LuceneVectors {
+    let skipped = LuceneVectors::skipped;
     let candidates = match segment_vec_files(path) {
         Ok(c) => c,
         Err(e) => return skipped(format!("could not list the segment's files: {e}")),
@@ -356,33 +460,27 @@ fn lucene_vectors(
                 },
                 Err(_) => "its envelope did not parse",
             };
-            return (
-                LuceneVectors {
-                    status: VecStatus::Match,
-                    file: Some(candidate.display().to_string()),
-                    offset: Some(offset),
-                    detail: format!(
-                        "{} vectors found byte for byte at offset {offset}; {footer}",
-                        parsed.index.index.storage.row_count()
-                    ),
-                },
-                false,
-            );
+            return LuceneVectors {
+                status: CrossCheck::Match,
+                file: Some(candidate.display().to_string()),
+                offset: Some(offset),
+                detail: format!(
+                    "{} vectors found byte for byte at offset {offset}; {footer}",
+                    parsed.index.index.storage.row_count()
+                ),
+            };
         }
         tried.push(candidate.display().to_string());
     }
-    (
-        LuceneVectors {
-            status: VecStatus::Mismatch,
-            file: candidates.first().map(|c| c.display().to_string()),
-            offset: None,
-            detail: format!(
-                "the stored vectors appear in none of the segment's .vec files: {}",
-                tried.join(", ")
-            ),
-        },
-        true,
-    )
+    LuceneVectors {
+        status: CrossCheck::Mismatch,
+        file: candidates.first().map(|c| c.display().to_string()),
+        offset: None,
+        detail: format!(
+            "the stored vectors appear in none of the segment's .vec files: {}",
+            tried.join(", ")
+        ),
+    }
 }
 
 /// The `.vec` files of the native file's segment, in name order. A
@@ -465,15 +563,19 @@ fn text(out: &Output) -> String {
             writeln!(s, "    {tag}      {:<20} {first}{more}", c.name)
                 .expect("writing to a String cannot fail");
         }
-        let tag = match r.lucene_vectors.status {
-            VecStatus::Match => "pass",
-            VecStatus::Mismatch => "FAIL",
-            VecStatus::Skipped => "skip",
-        };
+        let tag = cross_tag(r.lucene_vectors.status);
         writeln!(
             s,
             "    {tag}      {:<20} {}",
             "lucene_vectors", r.lucene_vectors.detail
+        )
+        .expect("writing to a String cannot fail");
+        writeln!(
+            s,
+            "    {}      {:<20} {}",
+            cross_tag(r.lucene_docs.status),
+            "lucene_docs",
+            r.lucene_docs.detail
         )
         .expect("writing to a String cannot fail");
     }
@@ -494,4 +596,12 @@ fn text(out: &Output) -> String {
     )
     .expect("writing to a String cannot fail");
     s
+}
+
+fn cross_tag(status: CrossCheck) -> &'static str {
+    match status {
+        CrossCheck::Match => "pass",
+        CrossCheck::Mismatch => "FAIL",
+        CrossCheck::Skipped => "skip",
+    }
 }
