@@ -1,8 +1,9 @@
 //! Brute-force ground truth and recall@k for k-NN segment files.
 //!
 //! [`ground_truth`] finds, for every query, how far away its k-th nearest
-//! vector in the file's flat storage is, by exhaustive search in parallel
-//! over the queries. [`score`] then counts, per query, how many labels of
+//! stored vector is, by exhaustive search in parallel over the queries.
+//! Storage is float32, or fp16 decoded exactly to float32 as Faiss
+//! decodes it. [`score`] then counts, per query, how many labels of
 //! an externally produced result list are at least that close. A tie with
 //! the k-th neighbor counts, so a result list that is exactly right scores
 //! 1.0 even when the top k is not unique.
@@ -13,19 +14,21 @@
 //! from [`search_all`], an HNSW search over the file's graph that follows
 //! Faiss's; [`sample_queries`] draws queries from the file's vectors.
 //!
-//! Distances are float32 sums in element order, as Faiss computes them but
-//! without its SIMD regrouping, so two neighbors a last bit apart can
-//! order differently here than in Faiss.
+//! Distances are float32 sums in element order. That is how Faiss's
+//! portable scalar-quantizer code computes fp16 distances; its float32
+//! code, and its SIMD builds' fp16 code, regroup the sums, so two
+//! neighbors a last bit apart can order differently here than in Faiss.
 
 mod hnsw;
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::sync::LazyLock;
 
 pub use hnsw::{Hit, Searcher, result_labels, search_all};
 
-use knn_format::faiss::{FlatStorage, FourCc, Metric, Storage};
-use knn_format::{F32, I64};
+use knn_format::faiss::{Metric, Storage, f16_to_f32};
+use knn_format::{F32, I64, U16};
 use rayon::prelude::*;
 use serde::Serialize;
 
@@ -101,14 +104,6 @@ pub enum Error {
         count: usize,
         /// Vectors in the file.
         rows: usize,
-    },
-    /// The file's vectors are not float32.
-    #[error(
-        "{fourcc} storage is not supported yet; recall reads float32 storage (IxF2 or IxFI) only"
-    )]
-    UnsupportedStorage {
-        /// The storage index's fourcc.
-        fourcc: FourCc,
     },
 }
 
@@ -251,28 +246,25 @@ impl Labels {
 }
 
 /// `count` distinct rows of `storage` as queries, chosen by a fixed
-/// generator from `seed`, with the rows they came from. The same seed
-/// and file give the same queries on every platform.
+/// generator from `seed`, with the rows they came from; fp16 rows are
+/// decoded. The same seed and file give the same queries on every
+/// platform.
 ///
 /// # Errors
 ///
 /// Returns an error when `count` is 0 or exceeds the vector count, or
 /// the dimension is unusable.
 pub fn sample_queries(
-    storage: &FlatStorage<'_>,
+    storage: &Storage<'_>,
     count: usize,
     seed: u64,
 ) -> Result<(Queries, Vec<usize>)> {
-    let rows = storage.row_count();
+    let vectors = Vectors::of(storage)?;
+    let rows = vectors.rows();
     if count > rows {
         return Err(Error::SampleTooLarge { count, rows });
     }
-    let d = usize::try_from(storage.header.d)
-        .ok()
-        .filter(|&d| d > 0)
-        .ok_or(Error::Dimension {
-            d: storage.header.d,
-        })?;
+    let d = vectors.d;
     // A partial Fisher-Yates shuffle over the identity permutation, kept
     // sparse: only positions a swap has touched are stored, so memory
     // follows the sample size, not the file. The first `count` positions
@@ -291,13 +283,7 @@ pub fn sample_queries(
     let order: Vec<usize> = (0..count).map(|i| at(&moved, i)).collect();
     let mut data = Vec::with_capacity(count.saturating_mul(d));
     for &row in &order {
-        data.extend(
-            storage
-                .vector(row)
-                .unwrap_or_default()
-                .iter()
-                .map(|v| v.get()),
-        );
+        vectors.extend_row(row, &mut data);
     }
     Ok((Queries::from_rows(d, data)?, order))
 }
@@ -319,25 +305,133 @@ pub(crate) enum Distance {
 }
 
 impl Distance {
-    fn of_storage(storage: &FlatStorage<'_>) -> Result<Self> {
-        match storage.header.metric() {
+    fn of_storage(storage: &Storage<'_>) -> Result<Self> {
+        match storage.header().metric() {
             Metric::L2 => Ok(Self::L2),
             Metric::InnerProduct => Ok(Self::NegatedInnerProduct),
             Metric::Other(metric_type) => Err(Error::Metric { metric_type }),
         }
     }
 
-    fn between(self, v: &[F32], q: &[f32]) -> f32 {
+    fn between<T: Component>(self, v: &[T], q: &[f32]) -> f32 {
         match self {
             Self::L2 => v
                 .iter()
                 .zip(q)
                 .map(|(x, y)| {
-                    let d = x.get() - y;
+                    let d = x.value() - y;
                     d * d
                 })
                 .sum(),
-            Self::NegatedInnerProduct => -v.iter().zip(q).map(|(x, y)| x.get() * y).sum::<f32>(),
+            Self::NegatedInnerProduct => -v.iter().zip(q).map(|(x, y)| x.value() * y).sum::<f32>(),
+        }
+    }
+}
+
+/// A stored vector component, as float32.
+trait Component: Copy {
+    fn value(self) -> f32;
+}
+
+impl Component for F32 {
+    fn value(self) -> f32 {
+        self.get()
+    }
+}
+
+/// Every half float decoded, indexed by its bits. Brute force decodes each
+/// stored component once per query, and a lookup is cheaper than the bit
+/// work in [`f16_to_f32`]: about 1.75 times faster over a whole file.
+/// Built on first use from that function, so the values are its own, NaN
+/// payloads included; 256 KB, on the heap.
+static HALVES: LazyLock<Box<[f32; 1 << 16]>> = LazyLock::new(|| {
+    (0..=u16::MAX)
+        .map(f16_to_f32)
+        .collect::<Box<[f32]>>()
+        .try_into()
+        .expect("one entry per u16 bit pattern")
+});
+
+impl Component for U16 {
+    fn value(self) -> f32 {
+        // A u16 always indexes the table, so the fallback never runs.
+        HALVES
+            .get(usize::from(self.get()))
+            .copied()
+            .unwrap_or(f32::NAN)
+    }
+}
+
+/// The stored vectors as the distance code reads them.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Vectors<'a> {
+    /// The storage's dimension, at least 1.
+    d: usize,
+    codes: Codes<'a>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Codes<'a> {
+    F32(&'a [F32]),
+    F16(&'a [U16]),
+}
+
+impl<'a> Vectors<'a> {
+    /// The storage's vectors, its dimension checked.
+    fn of(storage: &Storage<'a>) -> Result<Self> {
+        let header = storage.header();
+        let d = usize::try_from(header.d)
+            .ok()
+            .filter(|&d| d > 0)
+            .ok_or(Error::Dimension { d: header.d })?;
+        let codes = match storage {
+            Storage::Flat(s) => Codes::F32(s.codes),
+            Storage::Fp16(s) => Codes::F16(s.components()),
+        };
+        Ok(Self { d, codes })
+    }
+
+    /// Rows stored in full.
+    fn rows(&self) -> usize {
+        match self.codes {
+            Codes::F32(c) => c.len() / self.d,
+            Codes::F16(c) => c.len() / self.d,
+        }
+    }
+
+    /// Row `row`'s distance from `q`, or `None` when the row is not
+    /// stored in full.
+    fn distance(&self, distance: Distance, row: usize, q: &[f32]) -> Option<f32> {
+        let start = row.checked_mul(self.d)?;
+        let range = start..start.checked_add(self.d)?;
+        Some(match self.codes {
+            Codes::F32(c) => distance.between(c.get(range)?, q),
+            Codes::F16(c) => distance.between(c.get(range)?, q),
+        })
+    }
+
+    /// Appends row `row`, decoded, to `out`; nothing when it is not stored
+    /// in full.
+    fn extend_row(&self, row: usize, out: &mut Vec<f32>) {
+        let Some(start) = row.checked_mul(self.d) else {
+            return;
+        };
+        let Some(end) = start.checked_add(self.d) else {
+            return;
+        };
+        match self.codes {
+            Codes::F32(c) => out.extend(
+                c.get(start..end)
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|v| v.value()),
+            ),
+            Codes::F16(c) => out.extend(
+                c.get(start..end)
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|v| v.value()),
+            ),
         }
     }
 }
@@ -360,28 +454,16 @@ impl Ord for Ordered {
     }
 }
 
-/// The float32 storage an index holds; other storage is an error.
-fn flat<'s, 'a>(storage: &'s Storage<'a>) -> Result<&'s FlatStorage<'a>> {
-    storage.flat().ok_or(Error::UnsupportedStorage {
-        fourcc: storage.fourcc(),
-    })
-}
-
-/// The file's dimension as a usable row width, checked against the queries.
-fn checked_dimension(storage: &FlatStorage<'_>, queries: &Queries) -> Result<usize> {
-    let d = usize::try_from(storage.header.d)
-        .ok()
-        .filter(|&d| d > 0)
-        .ok_or(Error::Dimension {
-            d: storage.header.d,
-        })?;
-    if d != queries.d() {
+/// The file's vectors, their dimension checked against the queries'.
+fn checked_vectors<'a>(storage: &Storage<'a>, queries: &Queries) -> Result<Vectors<'a>> {
+    let vectors = Vectors::of(storage)?;
+    if vectors.d != queries.d() {
         return Err(Error::DimensionMismatch {
-            file: d,
+            file: vectors.d,
             queries: queries.d(),
         });
     }
-    Ok(d)
+    Ok(vectors)
 }
 
 /// Per query, how close the k-th nearest stored vector is.
@@ -432,46 +514,56 @@ impl GroundTruth {
 ///
 /// Returns an error when `k` is 0, the file's dimension or metric is
 /// unusable, or the queries' dimension differs from the file's.
-pub fn ground_truth(storage: &FlatStorage<'_>, queries: &Queries, k: usize) -> Result<GroundTruth> {
+pub fn ground_truth(storage: &Storage<'_>, queries: &Queries, k: usize) -> Result<GroundTruth> {
     if k == 0 {
         return Err(Error::ZeroK);
     }
-    let d = checked_dimension(storage, queries)?;
+    let vectors = checked_vectors(storage, queries)?;
     let distance = Distance::of_storage(storage)?;
-    let rows = storage.codes.chunks_exact(d);
-    // The heap never holds more than k entries or more than there are
-    // vectors, whatever k the caller asked for.
-    let capacity = k.min(rows.len()).saturating_add(1);
-
     let nearest_per_query = queries
         .rows()
         .collect::<Vec<_>>()
         .into_par_iter()
-        .map(|q| {
-            // The k nearest so far, farthest on top.
-            let mut nearest = BinaryHeap::with_capacity(capacity);
-            for v in rows.clone() {
-                let dist = distance.between(v, q);
-                if !dist.is_finite() {
-                    continue;
-                }
-                if nearest.len() < k {
-                    nearest.push(Ordered(dist));
-                } else if nearest.peek().is_some_and(|&Ordered(top)| dist < top) {
-                    nearest.pop();
-                    nearest.push(Ordered(dist));
-                }
-            }
-            Nearest {
-                threshold: nearest.peek().map(|&Ordered(top)| top),
-                found: nearest.len(),
-            }
+        .map(|q| match vectors.codes {
+            Codes::F32(c) => nearest(c, vectors.d, distance, q, k),
+            Codes::F16(c) => nearest(c, vectors.d, distance, q, k),
         })
         .collect();
     Ok(GroundTruth {
         k,
         queries: nearest_per_query,
     })
+}
+
+/// One query's exhaustive pass over every whole row of `codes`.
+fn nearest<T: Component>(
+    codes: &[T],
+    d: usize,
+    distance: Distance,
+    q: &[f32],
+    k: usize,
+) -> Nearest {
+    let rows = codes.chunks_exact(d);
+    // The k nearest so far, farthest on top. The heap never holds more
+    // than k entries or more than there are vectors, whatever k the
+    // caller asked for.
+    let mut nearest = BinaryHeap::with_capacity(k.min(rows.len()).saturating_add(1));
+    for v in rows {
+        let dist = distance.between(v, q);
+        if !dist.is_finite() {
+            continue;
+        }
+        if nearest.len() < k {
+            nearest.push(Ordered(dist));
+        } else if nearest.peek().is_some_and(|&Ordered(top)| dist < top) {
+            nearest.pop();
+            nearest.push(Ordered(dist));
+        }
+    }
+    Nearest {
+        threshold: nearest.peek().map(|&Ordered(top)| top),
+        found: nearest.len(),
+    }
 }
 
 /// Recall@k of a set of result lists.
@@ -514,7 +606,7 @@ pub struct Recall {
 /// Returns an error when the lists, the ground truth, and the queries do
 /// not pair up, or the file's dimension or metric is unusable.
 pub fn score(
-    storage: &FlatStorage<'_>,
+    storage: &Storage<'_>,
     labels: &Labels,
     queries: &Queries,
     truth: &GroundTruth,
@@ -532,7 +624,7 @@ pub fn score(
             queries: queries.len(),
         });
     }
-    checked_dimension(storage, queries)?;
+    let vectors = checked_vectors(storage, queries)?;
     let distance = Distance::of_storage(storage)?;
     let k = truth.k();
     let k_effective = truth.queries.iter().map(|n| n.found).max().unwrap_or(0);
@@ -572,11 +664,13 @@ pub fn score(
                 recall.duplicates = recall.duplicates.saturating_add(1);
                 continue;
             }
-            let Some(v) = labels.node(label).and_then(|node| storage.vector(node)) else {
+            let Some(dist) = labels
+                .node(label)
+                .and_then(|node| vectors.distance(distance, node, q))
+            else {
                 recall.unknown = recall.unknown.saturating_add(1);
                 continue;
             };
-            let dist = distance.between(v, q);
             if nearest
                 .threshold
                 .is_some_and(|t| dist.is_finite() && dist <= t)

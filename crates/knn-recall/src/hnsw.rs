@@ -30,7 +30,7 @@ use std::collections::BinaryHeap;
 use knn_format::faiss::{HnswGraph, HnswIndex, IdMapIndex};
 use rayon::prelude::*;
 
-use crate::{Distance, Error, Queries, Result, checked_dimension, flat};
+use crate::{Distance, Error, Queries, Result, Vectors, checked_vectors};
 
 /// One result of a search.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -66,9 +66,8 @@ impl Searcher {
     ///
     /// # Errors
     ///
-    /// Returns an error when `k` is 0, the storage is not float32, the
-    /// file's dimension or metric is unusable, or `query` has another
-    /// dimension.
+    /// Returns an error when `k` is 0, the file's dimension or metric is
+    /// unusable, or `query` has another dimension.
     pub fn search(
         &mut self,
         index: &HnswIndex<'_>,
@@ -79,26 +78,20 @@ impl Searcher {
         if k == 0 {
             return Err(Error::ZeroK);
         }
-        let storage = flat(&index.storage)?;
-        let d = usize::try_from(storage.header.d)
-            .ok()
-            .filter(|&d| d > 0)
-            .ok_or(Error::Dimension {
-                d: storage.header.d,
-            })?;
-        if query.len() != d {
+        let vectors = Vectors::of(&index.storage)?;
+        if query.len() != vectors.d {
             return Err(Error::DimensionMismatch {
-                file: d,
+                file: vectors.d,
                 queries: query.len(),
             });
         }
-        let distance = Distance::of_storage(storage)?;
+        let distance = Distance::of_storage(&index.storage)?;
         let graph = &index.graph;
         if self.visited.len() != graph.node_count() {
             self.visited = vec![0; graph.node_count()];
             self.stamp = 1;
         }
-        let dist_to = |node: usize| storage.vector(node).map(|v| distance.between(v, query));
+        let dist_to = |node: usize| vectors.distance(distance, node, query);
 
         // Greedy descent: on each upper level, move to the closest
         // neighbor until none is closer.
@@ -253,9 +246,8 @@ fn neighbor_list<'g>(
 ///
 /// # Errors
 ///
-/// Returns an error when `k` is 0, the storage is not float32, the file's
-/// dimension or metric is unusable, or the queries' dimension differs
-/// from the file's.
+/// Returns an error when `k` is 0, the file's dimension or metric is
+/// unusable, or the queries' dimension differs from the file's.
 pub fn search_all(
     index: &HnswIndex<'_>,
     queries: &Queries,
@@ -265,9 +257,8 @@ pub fn search_all(
     if k == 0 {
         return Err(Error::ZeroK);
     }
-    let storage = flat(&index.storage)?;
-    checked_dimension(storage, queries)?;
-    Distance::of_storage(storage)?;
+    checked_vectors(&index.storage, queries)?;
+    Distance::of_storage(&index.storage)?;
     let nodes = index.graph.node_count();
     queries
         .rows()

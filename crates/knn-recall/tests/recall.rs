@@ -15,7 +15,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use knn_format::F32;
-use knn_format::faiss::{FlatStorage, FourCc, IndexHeader};
+use knn_format::faiss::{FlatStorage, FourCc, IndexHeader, Storage};
 use knn_recall::{Error, GroundTruth, Labels, Queries, ground_truth, score};
 use serde::Deserialize;
 
@@ -36,17 +36,24 @@ struct Baseline {
 }
 
 /// Every baseline: `<name>.recall.json` beside each synthetic fixture,
-/// `recall.json` beside each real one.
+/// `recall.json` beside each real one, float and fp16.
 fn baselines() -> Vec<PathBuf> {
     let mut out = Vec::new();
-    for entry in fs::read_dir(fixtures().join("synthetic")).unwrap() {
-        let p = entry.unwrap().path();
-        if p.to_string_lossy().ends_with(".recall.json") {
-            out.push(p);
+    for synthetic in ["synthetic", "synthetic-fp16"] {
+        for entry in fs::read_dir(fixtures().join(synthetic)).unwrap() {
+            let p = entry.unwrap().path();
+            if p.to_string_lossy().ends_with(".recall.json") {
+                out.push(p);
+            }
         }
     }
-    for mode in ["nocfs", "cfs"] {
-        for entry in fs::read_dir(fixtures().join("opensearch-3.9.0").join(mode)).unwrap() {
+    for set in [
+        "opensearch-3.9.0/nocfs",
+        "opensearch-3.9.0/cfs",
+        "opensearch-3.9.0-fp16/sq-fp16",
+        "opensearch-3.9.0-fp16/half-float",
+    ] {
+        for entry in fs::read_dir(fixtures().join(set)).unwrap() {
             out.push(entry.unwrap().path().join("recall.json"));
         }
     }
@@ -75,7 +82,7 @@ fn recall_matches_faiss_python() {
         let b: Baseline = serde_json::from_slice(&fs::read(&baseline).unwrap()).unwrap();
         let bytes = fs::read(dir.join(&b.file)).unwrap();
         let parsed = knn_format::parse(&bytes).unwrap();
-        let storage = parsed.index.index.storage.flat().unwrap();
+        let storage = &parsed.index.index.storage;
         let queries =
             Queries::from_bytes(&fs::read(dir.join(&b.queries_file)).unwrap(), b.dimension)
                 .unwrap();
@@ -101,10 +108,11 @@ fn recall_matches_faiss_python() {
         }
         seen += 1;
     }
-    assert_eq!(seen, 11, "5 synthetic and 6 real baselines");
-    // Four synthetic files at efSearch 16 miss neighbors, so the
-    // comparison covers partial matches, not only the perfect case.
-    assert_eq!(imperfect, 4);
+    assert_eq!(seen, 20, "8 synthetic and 12 real baselines");
+    // Seven synthetic files at efSearch 16 miss neighbors, three of them
+    // fp16, so the comparison covers partial matches, not only the
+    // perfect case.
+    assert_eq!(imperfect, 7);
 }
 
 /// Flat storage over rows spelled out in the test.
@@ -134,8 +142,8 @@ impl Built {
         Self::new(i32::try_from(rows[0].len()).unwrap(), 1, rows)
     }
 
-    fn storage(&self) -> FlatStorage<'_> {
-        FlatStorage {
+    fn storage(&self) -> Storage<'_> {
+        Storage::Flat(FlatStorage {
             fourcc: if self.metric_type == 1 {
                 FourCc::FLAT_L2
             } else {
@@ -151,7 +159,7 @@ impl Built {
                 metric_arg: None,
             },
             codes: &self.codes,
-        }
+        })
     }
 
     fn labels(&self) -> Labels {

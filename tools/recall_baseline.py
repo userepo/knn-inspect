@@ -16,8 +16,10 @@ Usage:
 
 Writes, next to each synthetic fixture, `<name>.queries.f32`,
 `<name>.results.jsonl`, and `<name>.recall.json`; next to each real
-fixture's manifest, `queries.f32`, `results.jsonl`, and `recall.json`.
-Rewrite them whenever the fixtures are regenerated.
+fixture's manifest, `queries.f32`, `results.jsonl`, and `recall.json`;
+float and fp16 fixtures alike. For fp16 storage the brute force runs over
+the vectors Faiss decodes from the codes. Rewrite them whenever the
+fixtures are regenerated.
 """
 
 from __future__ import annotations
@@ -51,7 +53,9 @@ def baseline(path: pathlib.Path, out_dir: pathlib.Path, prefix: str) -> dict:
     storage = faiss.downcast_index(hnsw.storage)
     d = storage.d
     metric = storage.metric_type
-    vectors = faiss.vector_to_array(storage.codes).view(np.float32).reshape(-1, d)
+    # The stored vectors as Faiss reads them: a copy of float32 storage, or
+    # fp16 codes decoded (exactly) to float32.
+    vectors = storage.reconstruct_n(0, storage.ntotal)
     labels = faiss.vector_to_array(index.id_map)
 
     rng = np.random.default_rng(SEED)
@@ -113,9 +117,12 @@ def main() -> None:
     args = parser.parse_args()
 
     faiss.omp_set_num_threads(1)
-    for path in sorted((args.fixtures / "synthetic").glob("*.faiss")):
-        baseline(path, path.parent, f"{path.stem}.")
-    for manifest in sorted((args.fixtures / "opensearch-3.9.0").glob("*/*/manifest.json")):
+    for synthetic in ("synthetic", "synthetic-fp16"):
+        for path in sorted((args.fixtures / synthetic).glob("*.faiss")):
+            baseline(path, path.parent, f"{path.stem}.")
+    for manifest in sorted(
+        m for real in ("opensearch-3.9.0", "opensearch-3.9.0-fp16") for m in (args.fixtures / real).glob("*/*/manifest.json")
+    ):
         files = json.loads(manifest.read_text(encoding="utf-8"))["files"]
         native = next(f["name"] for f in files if f["name"].endswith((".faiss", ".faissc")))
         baseline(manifest.parent / native, manifest.parent, "")

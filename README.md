@@ -9,11 +9,10 @@ Rust, read-only, and does not link Faiss or talk to a cluster.
 
 ## Status
 
-Early development: every planned command works on every float fixture;
-on the fp16 fixtures every command but `recall` does, and `scan` skips
-its `.vec` cross-check. See [docs/format-notes.md](docs/format-notes.md)
-for the file format and [docs/json.md](docs/json.md) for the JSON output
-of each command.
+Early development: every planned command works on every fixture, except
+that `scan` skips its `.vec` cross-check for fp16 storage. See
+[docs/format-notes.md](docs/format-notes.md) for the file format and
+[docs/json.md](docs/json.md) for the JSON output of each command.
 
 ## Install
 
@@ -81,8 +80,8 @@ search with efSearch below k can return fewer than k results; the report
 counts the empty slots as missing, and an `--ef-search` of at least k
 avoids them. `--queries` is the query vectors as row-major little-endian
 float32 in the file's dimension; `--sample N` takes N of the file's own
-vectors instead, chosen by `--seed`. `recall` reads float32 storage only
-so far, and stops with an error on a file with fp16 storage.
+vectors instead, chosen by `--seed`. For fp16 storage the search and the
+brute force both work on the codes decoded to float32, as Faiss's do.
 
 With `--results`, the tool scores lists produced elsewhere (Faiss, or a
 live OpenSearch query): one line per query, in the same order, holding
@@ -189,9 +188,9 @@ segment) for HNSW fields: an ID map wrapping HNSW with flat float32
 storage, or with fp16 scalar-quantized storage (the `sq` encoder with
 `type: fp16`, and the `half_float` data type), L2 or inner product
 (k-NN's `cosinesimil` is inner product over normalized vectors), with or
-without the Lucene footer. `info`, `verify`, `stats`, and `scan` read
-both; `recall` and the `.vec` cross-check of `scan` read float32 storage
-only so far. Fixtures and format notes target OpenSearch 3.9.0.
+without the Lucene footer. Every command reads both, though `scan` does
+not yet cross-check fp16 storage against the segment's `.vec`. Fixtures
+and format notes target OpenSearch 3.9.0.
 
 Not yet: other scalar-quantized storage (such as bf16), byte and binary
 vectors, product quantization, and IVF. Their files are refused rather
@@ -225,8 +224,8 @@ fixtures and baselines use faiss-cpu 1.15.1.
   each real one - the graph statistics Faiss Python computes from the
   same file, the baseline `stats` must match
 - `*.queries.f32`, `*.results.jsonl`, and `*.recall.json` beside each
-  synthetic float fixture (`queries.f32`, `results.jsonl`, `recall.json`
-  beside each real float one) - 100 fixed queries, the labels Faiss's
+  synthetic fixture (`queries.f32`, `results.jsonl`, `recall.json`
+  beside each real one) - 100 fixed queries, the labels Faiss's
   HNSW search returns for them, and the recall@10 Faiss computes for
   those results, the baseline `recall` must match
 - `fixtures/corrupted/` - one file per structural check, each derived

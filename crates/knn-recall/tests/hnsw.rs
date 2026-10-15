@@ -14,7 +14,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use knn_format::faiss::{FlatStorage, FourCc, HnswGraph, HnswIndex, IndexHeader, Storage};
+use knn_format::faiss::{
+    FlatStorage, FourCc, HnswGraph, HnswIndex, IndexHeader, Storage, f16_to_f32,
+};
 use knn_format::{F32, F64, I32, U64};
 use knn_recall::{
     Error, Labels, Queries, Searcher, ground_truth, result_labels, score, search_all,
@@ -38,14 +40,21 @@ struct Baseline {
 
 fn baselines() -> Vec<PathBuf> {
     let mut out = Vec::new();
-    for entry in fs::read_dir(fixtures().join("synthetic")).unwrap() {
-        let p = entry.unwrap().path();
-        if p.to_string_lossy().ends_with(".recall.json") {
-            out.push(p);
+    for synthetic in ["synthetic", "synthetic-fp16"] {
+        for entry in fs::read_dir(fixtures().join(synthetic)).unwrap() {
+            let p = entry.unwrap().path();
+            if p.to_string_lossy().ends_with(".recall.json") {
+                out.push(p);
+            }
         }
     }
-    for mode in ["nocfs", "cfs"] {
-        for entry in fs::read_dir(fixtures().join("opensearch-3.9.0").join(mode)).unwrap() {
+    for set in [
+        "opensearch-3.9.0/nocfs",
+        "opensearch-3.9.0/cfs",
+        "opensearch-3.9.0-fp16/sq-fp16",
+        "opensearch-3.9.0-fp16/half-float",
+    ] {
+        for entry in fs::read_dir(fixtures().join(set)).unwrap() {
             out.push(entry.unwrap().path().join("recall.json"));
         }
     }
@@ -97,15 +106,8 @@ fn own_search_matches_faiss() {
 
         // Within 0.01 of Faiss's recall for the same queries and parameters.
         let labels = Labels::from_id_map(index.id_map).unwrap();
-        let truth = ground_truth(index.index.storage.flat().unwrap(), &queries, b.k).unwrap();
-        let r = score(
-            index.index.storage.flat().unwrap(),
-            &labels,
-            &queries,
-            &truth,
-            &own,
-        )
-        .unwrap();
+        let truth = ground_truth(&index.index.storage, &queries, b.k).unwrap();
+        let r = score(&index.index.storage, &labels, &queries, &truth, &own).unwrap();
         assert!(
             (r.recall - b.recall).abs() <= 0.01,
             "{}: own recall {} vs Faiss {}",
@@ -123,12 +125,13 @@ fn own_search_matches_faiss() {
         }
         seen += 1;
     }
-    assert_eq!(seen, 11, "5 synthetic and 6 real baselines");
+    assert_eq!(seen, 20, "8 synthetic and 12 real baselines");
     // The search follows Faiss step for step, and on these fixtures every
-    // list comes out identical. A last-bit difference in a distance sum
-    // (this crate sums in order, Faiss's SIMD regroups) could legitimately
-    // change a list on other data; here, a mismatch means a changed
-    // search, so the check is exact.
+    // list comes out identical, fp16 ones included. A last-bit difference
+    // in a distance sum (this crate sums in order; Faiss's float32 code
+    // and its SIMD builds' fp16 code regroup) could legitimately change a
+    // list on other data; here, a mismatch means a changed search, so the
+    // check is exact.
     assert_eq!(
         identical, lists,
         "{identical} of {lists} result lists identical to Faiss's"
@@ -461,22 +464,33 @@ fn search_checks_its_inputs() {
 }
 
 #[test]
-fn fp16_storage_is_refused_for_now() {
-    let bytes = fs::read(fixtures().join("synthetic-fp16/l2-100x4-fp16.faiss")).unwrap();
+fn fp16_samples_are_the_decoded_rows() {
+    let bytes = fs::read(fixtures().join("synthetic-fp16/l2-1000x32-fp16.faiss")).unwrap();
     let parsed = knn_format::parse(&bytes).unwrap();
-    let index = &parsed.index.index;
-    let refused = |r: &Result<_, Error>| matches!(r, Err(Error::UnsupportedStorage { fourcc }) if *fourcc == FourCc::SCALAR_QUANTIZER);
-    let mut s = Searcher::new(index.graph.node_count());
-    assert!(refused(&s.search(index, &[0.0; 4], 1, 16).map(|_| ())));
-    let queries = Queries::from_rows(4, vec![0.0; 4]).unwrap();
-    assert!(refused(&search_all(index, &queries, 1, 16).map(|_| ())));
+    let storage = &parsed.index.index.storage;
+    let Storage::Fp16(fp16) = storage else {
+        panic!("fp16 storage");
+    };
+    let (q, rows) = knn_recall::sample_queries(storage, 20, 7).unwrap();
+    // The draw depends only on the row count and the seed: the same rows
+    // as from the float file of the same shape.
+    assert_eq!(&rows[..8], &[487, 727, 212, 720, 842, 285, 158, 580]);
+    for (q, &row) in q.rows().zip(&rows) {
+        let v: Vec<f32> = fp16
+            .vector(row)
+            .unwrap()
+            .iter()
+            .map(|h| f16_to_f32(h.get()))
+            .collect();
+        assert_eq!(q, &v[..]);
+    }
 }
 
 #[test]
 fn sampling_is_deterministic_and_distinct() {
     let bytes = fs::read(fixtures().join("synthetic/l2-1000x32.faiss")).unwrap();
     let parsed = knn_format::parse(&bytes).unwrap();
-    let storage = parsed.index.index.storage.flat().unwrap();
+    let storage = &parsed.index.index.storage;
     let (q1, rows1) = knn_recall::sample_queries(storage, 50, 7).unwrap();
     let (q2, rows2) = knn_recall::sample_queries(storage, 50, 7).unwrap();
     assert_eq!(rows1, rows2);
@@ -493,6 +507,8 @@ fn sampling_is_deterministic_and_distinct() {
     // Each query is the row it names.
     for (q, &row) in q1.rows().zip(&rows1) {
         let v: Vec<f32> = storage
+            .flat()
+            .unwrap()
             .vector(row)
             .unwrap()
             .iter()

@@ -10,7 +10,7 @@ use std::time::Instant;
 use anyhow::{Context, bail};
 use clap::Args;
 use knn_format::NativeFile;
-use knn_format::faiss::{FlatStorage, IdMapIndex};
+use knn_format::faiss::{IdMapIndex, Storage};
 use knn_recall::{Labels, Queries, Recall};
 use serde::Serialize;
 
@@ -103,22 +103,15 @@ pub fn run(args: &RecallArgs) -> anyhow::Result<ExitCode> {
         .parse()
         .with_context(|| format!("parsing {}", path.display()))?;
     let index = &parsed.index;
-    let storage = index
-        .index
-        .storage
-        .flat()
-        .ok_or(knn_recall::Error::UnsupportedStorage {
-            fourcc: index.index.storage.fourcc(),
-        })
-        .with_context(|| path.display().to_string())?;
-    let dimension = usize::try_from(storage.header.d)
+    let storage = &index.index.storage;
+    let dimension = usize::try_from(storage.header().d)
         .ok()
         .filter(|&d| d > 0)
         .with_context(|| {
             format!(
                 "{}: dimension {} is not usable",
                 path.display(),
-                storage.header.d
+                storage.header().d
             )
         })?;
 
@@ -140,7 +133,7 @@ pub fn run(args: &RecallArgs) -> anyhow::Result<ExitCode> {
         search,
         dimension,
         vectors: storage.row_count(),
-        metric: storage.header.metric().name(),
+        metric: storage.header().metric().name(),
         ground_truth_ms,
         recall: &recall,
     };
@@ -155,7 +148,7 @@ pub fn run(args: &RecallArgs) -> anyhow::Result<ExitCode> {
 /// The queries from `--queries`, or sampled from the file for `--sample`.
 fn load_queries(
     args: &RecallArgs,
-    storage: &FlatStorage<'_>,
+    storage: &Storage<'_>,
     dimension: usize,
 ) -> anyhow::Result<(Queries, Option<Sample>)> {
     if let Some(p) = &args.queries {

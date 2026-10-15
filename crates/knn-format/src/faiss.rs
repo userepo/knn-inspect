@@ -409,6 +409,17 @@ impl<'a> Fp16Storage<'a> {
             _ => 0,
         }
     }
+
+    /// Every whole component as half-float bits, row-major. The odd
+    /// trailing byte a damaged file can hold is left out.
+    #[must_use]
+    pub fn components(&self) -> &'a [U16] {
+        let whole = self.codes.len() & !1;
+        self.codes
+            .get(..whole)
+            .and_then(|bytes| <[U16]>::ref_from_bytes(bytes).ok())
+            .unwrap_or_default()
+    }
 }
 
 /// An HNSW index's vectors.

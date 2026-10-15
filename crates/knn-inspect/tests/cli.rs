@@ -1149,12 +1149,51 @@ fn fp16_files_are_read() {
 }
 
 #[test]
-fn recall_says_fp16_is_not_read_yet() {
-    let real = fixtures().join("opensearch-3.9.0-fp16/sq-fp16/l2/_2_165_vec.faiss");
-    let o = run(&["recall", real.to_str().unwrap(), "--sample", "5"]);
-    assert_eq!(o.status.code(), Some(1));
-    let err = String::from_utf8_lossy(&o.stderr);
-    assert!(err.contains("IxSQ storage is not supported yet"), "{err}");
+fn recall_reads_fp16_files() {
+    let dir = fixtures().join("synthetic-fp16");
+    let file = dir.join("l2-1000x32-fp16.faiss");
+    let queries = dir.join("l2-1000x32-fp16.queries.f32");
+    let results = dir.join("l2-1000x32-fp16.results.jsonl");
+    let base = [
+        "recall",
+        file.to_str().unwrap(),
+        "--queries",
+        queries.to_str().unwrap(),
+    ];
+
+    // Faiss's own result lists score what Faiss Python computed.
+    let o = run(&[
+        &base[..],
+        &["--results", results.to_str().unwrap(), "--json"],
+    ]
+    .concat());
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["recall"], 0.907);
+    assert_eq!(v["vectors"], 1000);
+    assert_eq!(v["metric"], "l2");
+
+    // The tool's own search returns the same lists, so the same recall.
+    let o = run(&[&base[..], &["--json"]].concat());
+    assert_eq!(o.status.code(), Some(0));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["search"]["ef_search"], 16);
+    assert_eq!(v["recall"], 0.907);
+
+    // Sampled queries are the file's own decoded vectors, each its own
+    // nearest neighbor.
+    let real = fixtures().join("opensearch-3.9.0-fp16/half-float/cosinesimil/_2_165_vec.faiss");
+    let o = run(&["recall", real.to_str().unwrap(), "--sample", "20", "--json"]);
+    assert_eq!(o.status.code(), Some(0));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["queries"], 20);
+    assert_eq!(v["metric"], "inner_product");
+    assert_eq!(v["recall"], 1.0);
 }
 
 #[test]

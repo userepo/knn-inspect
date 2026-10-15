@@ -165,10 +165,9 @@ walker's dimension, count, metric, level counts, entry point, and
 
 ## Scalar-quantized storage (fp16)
 
-`knn-inspect` reads these files for `info`, `verify`, `stats`, and
-`scan`; `recall` and the `.vec` cross-check of `scan` read float32
-storage only so far. Any quantizer type other than `QT_fp16` is reported
-as unsupported.
+`knn-inspect` reads these files with every command; only the `.vec`
+cross-check of `scan` skips them so far. Any quantizer type other than
+`QT_fp16` is reported as unsupported.
 
 k-NN stores fp16 vectors through Faiss's scalar quantizer with `QT_fp16`
 in two ways: the `sq` encoder with `type: fp16` (and `bits: 16`, which
@@ -227,6 +226,17 @@ then rounds them to even. Anything that re-encodes float32 vectors to
 compare them with stored codes, such as a check against Lucene's float32
 copy, must accept either neighbor on an exact tie or report false
 mismatches.
+
+Faiss computes a query's distance to fp16 codes over the decoded float32
+values (`ScalarQuantizer::get_distance_computer` at `5616caa`). Its
+portable build sums the squared differences, or the products, one
+component at a time in component order (`DCTemplate<..., 1>`); its F16C
+and NEON builds, when the dimension is a multiple of 8 (16 with
+AVX-512), accumulate in 8 or 16 lanes with fused multiply-adds and add
+the lanes at the end, which can round the last bit differently.
+`knn-inspect recall` sums in component order, and on every fp16 fixture
+its result lists are identical to those of the faiss-cpu wheel that
+wrote the baselines.
 
 ### Synthetic fp16 fixtures
 
