@@ -168,13 +168,18 @@ The scripts are in [bench/](bench/README.md); the raw results and dataset
 checksums of this run are in
 [bench/results/2026-10-15/](bench/results/2026-10-15/README.md).
 
-## Scope (v1)
+## Supported files
 
-- Faiss engine files: ID map wrapping HNSW with flat float32 storage
-  (L2 and inner product), with or without the Lucene codec envelope
-- Memory-mapped, read-only access
-- Human-readable and JSON output
-- Single files and whole segment directories
+Faiss-engine native files (`.faiss`, and `.faissc` beside a compound
+segment) for float vector fields: an ID map wrapping HNSW with flat
+float32 storage, L2 or inner product (k-NN's `cosinesimil` is inner
+product over normalized vectors), with or without the Lucene footer.
+Fixtures and format notes target OpenSearch 3.9.0.
+
+Not yet: scalar-quantized fields (`half_float`, fp16), byte and binary
+vectors, product quantization, and IVF. Their files are reported as an
+unsupported layout rather than misread. NMSLIB and Lucene-engine fields
+write no `.faiss` file, so `scan` does not see them.
 
 ## Pinned versions
 
