@@ -1,0 +1,56 @@
+{
+  "file": "l2-100x4-fp16.faiss",
+  "size": 16315,
+  "faiss_version": "1.15.1",
+  "seed": 20261013,
+  "layout": [
+    "IxMp",
+    "IHNs",
+    "IxSQ"
+  ],
+  "dimension": 4,
+  "count": 100,
+  "metric": "l2",
+  "faiss_metric_type": 1,
+  "hnsw": {
+    "m": 16,
+    "ef_construction": 100,
+    "ef_search": 16,
+    "max_level": 1,
+    "entry_point": 12,
+    "level_counts": [
+      100,
+      6
+    ],
+    "levels_len": 100,
+    "offsets_len": 101,
+    "neighbors_len": 3296,
+    "levels_crc32": 3073793771
+  },
+  "sq": {
+    "qtype": 4,
+    "qtype_name": "QT_fp16",
+    "rangestat": 0,
+    "rangestat_arg": 0.0,
+    "d": 4,
+    "code_size": 8,
+    "trained_len": 0
+  },
+  "ids": {
+    "len": 100,
+    "first": 1000,
+    "last": 1099,
+    "crc32": 1526159279
+  },
+  "codes": {
+    "bytes": 800,
+    "crc32": 490030420,
+    "first_decoded": [
+      0.27587890625,
+      -0.65478515625,
+      0.077392578125,
+      0.232177734375
+    ],
+    "ties_rounded_away": 0
+  }
+}

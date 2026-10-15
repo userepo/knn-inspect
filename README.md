@@ -197,6 +197,9 @@ fixtures and baselines use faiss-cpu 1.15.1.
 
 - `fixtures/synthetic/` - small indexes written by Faiss Python, each with
   an `.expected.json` of the values the parser must report
+- `fixtures/synthetic-fp16/` - the same shapes with fp16 scalar-quantized
+  storage, ahead of fp16 support; until then the tool reports them as an
+  unsupported layout (see [docs/format-notes.md](docs/format-notes.md))
 - `fixtures/opensearch-3.9.0/nocfs/` - real segments from OpenSearch
   3.9.0 with compound files off, one per space type (`l2`,
   `innerproduct`, `cosinesimil`); the native file is `_2_165_vec.faiss`

@@ -1,9 +1,11 @@
 #!/usr/bin/env python
-"""Walk a Faiss `IxMp` > `IHNf` > `IxF2`/`IxFI` file and print every field with its offset.
+"""Walk a Faiss HNSW file and print every field with its offset.
 
 This is the reference the format notes and the Rust parser are checked
 against: a straight transcription of `faiss/impl/index_read.cpp` for the
-one layout k-NN writes for float HNSW fields, with no Faiss dependency.
+layouts k-NN writes for HNSW fields, with no Faiss dependency: `IxMp` >
+`IHNf` > `IxF2`/`IxFI` (float32 storage), and `IxMp` > `IHNs` > `IxSQ`
+(scalar-quantized storage, such as fp16).
 A file with a Lucene envelope is accepted; the footer is skipped (see
 strip_envelope.py for its layout).
 
@@ -21,6 +23,20 @@ import sys
 
 FOOTER_MAGIC = 0xC02893E8
 METRICS = {0: "inner_product", 1: "l2"}
+# ScalarQuantizer::QuantizerType, in declaration order.
+QTYPES = {
+    0: "QT_8bit",
+    1: "QT_4bit",
+    2: "QT_8bit_uniform",
+    3: "QT_4bit_uniform",
+    4: "QT_fp16",
+    5: "QT_8bit_direct",
+    6: "QT_6bit",
+    7: "QT_bf16",
+    8: "QT_8bit_direct_signed",
+}
+# ScalarQuantizer::RangeStat, in declaration order.
+RANGESTATS = {0: "RS_minmax", 1: "RS_meanstd", 2: "RS_quantiles", 3: "RS_optim"}
 
 
 class Walker:
@@ -79,9 +95,9 @@ class Walker:
             raise ValueError(f"expected IxMp at offset {self.base}, found {tag!r}")
         out["idmap"] = self.index_header("idmap")
 
-        tag = self.fourcc("hnsw.fourcc")
-        if tag != "IHNf":
-            raise ValueError(f"expected IHNf, found {tag!r}")
+        hnsw_tag = self.fourcc("hnsw.fourcc")
+        if hnsw_tag not in ("IHNf", "IHNs"):
+            raise ValueError(f"expected IHNf or IHNs, found {hnsw_tag!r}")
         out["hnsw"] = self.index_header("hnsw")
         self.vector("hnsw.assign_probas", "<d")
         self.vector("hnsw.cum_nneighbor_per_level", "<i")
@@ -97,10 +113,33 @@ class Walker:
         out["hnsw"]["level_counts"] = [sum(1 for v in levels if v > i) for i in range(out["hnsw"]["max_level"] + 1)]
 
         tag = self.fourcc("storage.fourcc")
-        if tag not in ("IxF2", "IxFI", "IxFl"):
-            raise ValueError(f"expected flat storage, found {tag!r}")
-        out["storage"] = self.index_header("storage")
-        self.vector("storage.codes", "<B", size_multiplier=4)
+        if hnsw_tag == "IHNf":
+            if tag not in ("IxF2", "IxFI", "IxFl"):
+                raise ValueError(f"expected flat storage, found {tag!r}")
+            out["storage"] = self.index_header("storage")
+            self.vector("storage.codes", "<B", size_multiplier=4)
+        else:
+            if tag != "IxSQ":
+                raise ValueError(f"expected IxSQ under IHNs, found {tag!r}")
+            out["storage"] = self.index_header("storage")
+            # read_ScalarQuantizer: the enums are 4-byte ints, d and
+            # code_size are size_t.
+            qtype = self._take("<i", "storage.sq.qtype")
+            self.fields[-1]["note"] = QTYPES.get(qtype, "unknown")
+            rangestat = self._take("<i", "storage.sq.rangestat")
+            self.fields[-1]["note"] = RANGESTATS.get(rangestat, "unknown")
+            self._take("<f", "storage.sq.rangestat_arg")
+            sq_d = self._take("<Q", "storage.sq.d")
+            code_size = self._take("<Q", "storage.sq.code_size", "bytes per vector")
+            self.vector("storage.sq.trained", "<f")
+            # read_vector(codes): a byte vector, ntotal * code_size bytes.
+            self.vector("storage.codes", "<B")
+            out["storage"]["sq"] = {
+                "qtype": QTYPES.get(qtype, qtype),
+                "rangestat": RANGESTATS.get(rangestat, rangestat),
+                "d": sq_d,
+                "code_size": code_size,
+            }
 
         self.vector("idmap.id_map", "<q")
         out["end"] = self.base + self.pos

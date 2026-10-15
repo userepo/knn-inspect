@@ -162,6 +162,74 @@ walker's dimension, count, metric, level counts, entry point, and
 `efConstruction`/`efSearch` match the values Faiss Python reports in the
 `.expected.json` beside each file.
 
+## Scalar-quantized storage (fp16)
+
+Not yet read by `knn-inspect`, which reports these files as an
+unsupported layout at the `IHNs` tag (offset 37, right after the ID
+map's header). This section records the layout ahead of that support.
+
+k-NN's `sq` encoder with `type: fp16` on the Faiss engine stores vectors
+through Faiss's scalar quantizer with `QT_fp16`; per k-NN#3566 the
+`half_float` data type does the same. The layout below comes from Faiss's
+source and synthetic files; it is not yet confirmed against a file
+OpenSearch wrote, as the float layout is. Before indexing, k-NN checks every
+component (`FaissFP16Util` at tag 3.9.0.0): it must be finite and within
+the half-float range [-65504, 65504], or the document is rejected; with
+the encoder's `clip: true`, out-of-range values are clamped to the range
+instead. A file k-NN wrote therefore holds no infinite or NaN codes.
+
+The layout differs from the float one only below the HNSW graph
+(`faiss/impl/index_read.cpp` and `index_write.cpp` at `5616caa`):
+
+```
+IxMp  IndexIDMap            header
+IHNs  IndexHNSWSQ           header, then the HNSW graph exactly as under IHNf
+IxSQ  IndexScalarQuantizer  header
+      ScalarQuantizer       qtype              int32, 4 = QT_fp16
+                            rangestat          int32, 0 = RS_minmax (unused by fp16)
+                            rangestat_arg      float32, 0 (unused by fp16)
+                            d                  uint64
+                            code_size          uint64, bytes per vector: 2 x d for fp16
+                            trained            vector<float32>, empty for fp16
+                            codes              vector<uint8>: ntotal x code_size bytes
+      id_map                vector<int64>, one label per node (back in IndexIDMap)
+```
+
+Two differences from the flat layout matter to a reader. The codes'
+count is a byte count (`read_vector` of uint8), where the flat layout's
+count is in float32 elements (`READXBVECTOR`); a reader that assumes the
+float convention would read four times too far. And `d` and `code_size`
+are 8-byte `size_t` fields, unlike the 4-byte `d` in the index header.
+
+Each vector is `code_size` bytes: one IEEE 754 half-precision float per
+component, little-endian, in component order. Decoding to float32 is
+exact, and matches what Faiss reconstructs. Encoding is not quite IEEE:
+Faiss's float-to-half conversion rounds a value exactly halfway between
+two half floats away from zero, where IEEE round-to-nearest (and
+NumPy's `astype(float16)`) rounds it to the even one. Everything else
+rounds the same. Anything that re-encodes float32 vectors to compare
+them with stored codes, such as a check against Lucene's float32 copy,
+must round ties the way Faiss does or report false mismatches.
+
+### Synthetic fp16 fixtures
+
+`tools/make_synthetic.py` writes three to `fixtures/synthetic-fp16/`, each
+with an `.expected.json`: `l2-100x4-fp16`, `l2-1000x32-fp16`, and
+`ip-1000x32-fp16`. They draw the same vectors as the float fixtures of the
+same shape, and their graphs have the same levels and entry points,
+since Faiss draws levels from its own seed whatever the storage. The
+neighbor lists differ only where rounding to fp16 reorders close
+candidates: not at all in the 100x4 file, in about 1% and 0.5% of slots
+in the 1000x32 ones (331 and 174 of 32,960). The generator asserts that the codes decode to Faiss's own
+reconstruction and differ from NumPy's half-float rounding only on ties
+rounded away from zero; the three files hold 0, 2, and 3 such ties.
+
+`tools/walk_faiss.py` reads all three to the end with no trailing bytes.
+In `l2-100x4-fp16.faiss` (16,315 bytes): `IHNs` at 37, `IxSQ` at 14,626,
+the quantizer's `qtype` at 14,663, the codes' byte count (800, for 100
+vectors of 8 bytes) at 14,699 and the codes at 14,707, the ID map's
+labels at 15,515, end at 16,315.
+
 ## Real files from OpenSearch 3.9.0
 
 `tools/extract_opensearch.py` indexed 500 random 16-dimensional vectors
