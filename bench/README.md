@@ -65,6 +65,10 @@ the median. The published run, behind the main README's
   graph with several threads, so a rebuilt index has slightly different
   neighbor lists: expect recall a little off any published figure, with
   the two sides still agreeing with each other.
+- **Nodes no search can reach**, per level, from `knn-inspect stats`.
+  This is a property of the index, not a comparison: it is recorded
+  because it bounds recall, since a vector no search reaches is never
+  returned.
 - **HNSW search time** and **ground-truth time**, measured in process.
   Faiss computes its exact neighbors through BLAS matrix products;
   `knn-inspect` computes each distance as a plain sum in element order,

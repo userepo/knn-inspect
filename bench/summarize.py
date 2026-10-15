@@ -68,10 +68,16 @@ def summarize(out: pathlib.Path) -> str:
         )
     machine = (out / "machine.txt").read_text(encoding="utf-8").strip().splitlines()
     out_lines = []
-    for label, measurements in rows:
+    for (label, measurements), name in zip(rows, ("sift", "glove")):
         out_lines += [f"**{label}**", "", "| Measurement | knn-inspect | Faiss Python |", "| --- | --- | --- |"]
         out_lines += [f"| {m} | {a} | {b} |" for m, a, b in measurements]
         out_lines.append("")
+        # Runs from before run.sh recorded stats have no stats file.
+        stats_path = out / f"{name}.stats.json"
+        if stats_path.exists():
+            layers = json.loads(stats_path.read_text(encoding="utf-8"))["layers"]
+            per_level = ", ".join(f"level {l['level']}: {l['unreachable']:,}" for l in layers if l["unreachable"])
+            out_lines += [f"Nodes no search can reach (`knn-inspect stats`): {per_level or 'none'}", ""]
     out_lines += ["Machine and versions:", "", "```", *machine, "```"]
     return "\n".join(out_lines)
 

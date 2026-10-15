@@ -73,6 +73,9 @@ for name in sift glove; do
     for i in $(seq "$RUNS"); do
         "$PYTHON" "$here/faiss_ops.py" recall "$index" "$queries"
     done > "$out/$name.recall.faiss.jsonl"
+
+    # Graph statistics: the nodes no search can reach, per level.
+    "$KNN_INSPECT" stats "$index" --json > "$out/$name.stats.json"
 done
 
 "$PYTHON" "$here/summarize.py" "$out" | tee "$out/summary.md"
