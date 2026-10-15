@@ -68,7 +68,7 @@ fn other_files_are_not_segment_infos() {
     .unwrap();
     let err = SegmentInfo::parse(&vec).unwrap_err();
     assert!(
-        matches!(&err, Error::UnexpectedCodec { found, expected: "Lucene90SegmentInfo", .. }
+        matches!(&err, Error::UnexpectedCodec { found, expected: "Lucene90SegmentInfo version 0", .. }
             if found.starts_with("Lucene99FlatVectorsFormatData")),
         "{err}"
     );

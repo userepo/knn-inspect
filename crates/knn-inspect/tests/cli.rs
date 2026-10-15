@@ -4,6 +4,7 @@
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
+    clippy::indexing_slicing,
     reason = "test crate"
 )]
 
@@ -837,10 +838,124 @@ fn scan_searches_zero_filled_vectors_in_linear_time() {
     let elapsed = started.elapsed();
     assert_eq!(o.status.code(), Some(1), "{}", stdout(&o));
     let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
-    assert_eq!(v["files"][0]["lucene_vectors"]["status"], "mismatch");
+    // The search ran to the end without finding the vectors; a zero-filled
+    // .vec has no footer, so the outcome is damaged, not a mismatch.
+    let lv = &v["files"][0]["lucene_vectors"];
+    assert_eq!(lv["status"], "damaged", "{lv}");
+    assert!(
+        lv["detail"]
+            .as_str()
+            .unwrap()
+            .contains("has no Lucene footer"),
+        "{lv}"
+    );
     assert!(
         elapsed < std::time::Duration::from_secs(10),
         "the .vec search took {elapsed:?}"
+    );
+}
+
+/// Recomputes a Lucene file's footer checksum after an edit, so the file
+/// is sound again and only the edit itself is under test.
+fn reseal(bytes: &mut [u8]) {
+    let footer = knn_format::envelope::Envelope::parse(bytes)
+        .unwrap()
+        .footer
+        .unwrap();
+    if let Err(knn_format::Error::ChecksumMismatch { computed, .. }) = footer.verify(bytes) {
+        let at = bytes.len() - 8;
+        bytes[at..].copy_from_slice(&u64::from(computed).to_be_bytes());
+    }
+    // Parsed again: `footer` holds the checksum as it was stored.
+    let resealed = knn_format::envelope::Envelope::parse(bytes)
+        .unwrap()
+        .footer
+        .unwrap();
+    assert!(resealed.verify(bytes).is_ok());
+}
+
+#[test]
+fn scan_fails_files_whose_lucene_files_are_damaged() {
+    let l2 = fixtures().join("opensearch-3.9.0/nocfs/l2");
+    let native = "_2_165_vec.faiss";
+    let vec = "_2_NativeEngines990KnnVectorsFormat_0.vec";
+
+    // The .vec holds the vectors, but a byte of the padding between its
+    // 89-byte header and the vectors at 128 is flipped, so only its
+    // checksum fails; the .si is sound.
+    let scratch = Scratch::new("scan-damaged-vec");
+    std::fs::copy(l2.join(native), scratch.0.join(native)).unwrap();
+    std::fs::copy(l2.join("_2.si"), scratch.0.join("_2.si")).unwrap();
+    let mut bytes = std::fs::read(l2.join(vec)).unwrap();
+    bytes[100] ^= 0xFF;
+    std::fs::write(scratch.0.join(vec), &bytes).unwrap();
+    let o = run(&["scan", scratch.0.to_str().unwrap(), "--json"]);
+    assert_eq!(o.status.code(), Some(1), "{}", stdout(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    let f = &v["files"][0];
+    assert_eq!(f["status"], "failed", "{f}");
+    assert_eq!(f["lucene_vectors"]["status"], "damaged", "{f}");
+    assert_eq!(
+        f["lucene_vectors"]["offset"], 128,
+        "found, but not trusted: {f}"
+    );
+    assert!(
+        f["lucene_vectors"]["detail"]
+            .as_str()
+            .unwrap()
+            .ends_with("but the .vec fails its footer checksum"),
+        "{f}"
+    );
+    assert_eq!(f["lucene_docs"]["status"], "match", "{f}");
+    drop(scratch);
+
+    // The .si is cut short; the .vec is sound.
+    let scratch = Scratch::new("scan-damaged-si");
+    std::fs::copy(l2.join(native), scratch.0.join(native)).unwrap();
+    std::fs::copy(l2.join(vec), scratch.0.join(vec)).unwrap();
+    let si = std::fs::read(l2.join("_2.si")).unwrap();
+    std::fs::write(scratch.0.join("_2.si"), &si[..30]).unwrap();
+    let o = run(&["scan", scratch.0.to_str().unwrap(), "--json"]);
+    assert_eq!(o.status.code(), Some(1), "{}", stdout(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    let f = &v["files"][0];
+    assert_eq!(f["status"], "failed", "{f}");
+    assert_eq!(f["lucene_vectors"]["status"], "match", "{f}");
+    let ld = &f["lucene_docs"];
+    assert_eq!(ld["status"], "damaged", "{f}");
+    assert!(ld.get("doc_count").is_none(), "nothing was read: {f}");
+    assert!(
+        ld["detail"]
+            .as_str()
+            .unwrap()
+            .starts_with("the .si could not be read: unexpected end of data"),
+        "{f}"
+    );
+
+    // A .si that reads but fails its checksum: the count is reported, not
+    // trusted.
+    let mut flipped = si.clone();
+    let last_body_byte = flipped.len() - 17;
+    flipped[last_body_byte] ^= 0xFF;
+    std::fs::write(scratch.0.join("_2.si"), &flipped).unwrap();
+    let o = run(&["scan", scratch.0.to_str().unwrap(), "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    let ld = &v["files"][0]["lucene_docs"];
+    assert_eq!(ld["status"], "damaged", "{ld}");
+    assert_eq!(ld["doc_count"], 500, "{ld}");
+    assert!(
+        ld["detail"]
+            .as_str()
+            .unwrap()
+            .ends_with("fails its footer checksum, so its document count (500) is not trusted"),
+        "{ld}"
+    );
+
+    let o = run(&["scan", scratch.0.to_str().unwrap()]);
+    assert!(
+        stdout(&o).contains("FAIL      lucene_docs"),
+        "{}",
+        stdout(&o)
     );
 }
 
@@ -909,8 +1024,9 @@ fn scan_reports_unreadable_subdirectories_and_continues() {
 
 #[test]
 fn scan_flags_labels_that_are_not_doc_ids_of_the_segment() {
-    // The real l2 segment with its .si claiming 400 documents: labels
-    // 400..499 are then no doc ids of it.
+    // The real l2 segment with its .si claiming 400 documents, resealed
+    // so the .si itself is sound: labels 400..499 are then no doc ids of
+    // it.
     let scratch = Scratch::new("scan-si");
     let l2 = fixtures().join("opensearch-3.9.0/nocfs/l2");
     for name in [
@@ -928,6 +1044,7 @@ fn scan_flags_labels_that_are_not_doc_ids_of_the_segment() {
     let at = header.length + 12 + 1 + 12;
     assert_eq!(&si[at..at + 4], &500_i32.to_le_bytes());
     si[at..at + 4].copy_from_slice(&400_i32.to_le_bytes());
+    reseal(&mut si);
     std::fs::write(scratch.0.join("_2.si"), &si).unwrap();
 
     let o = run(&["scan", scratch.0.to_str().unwrap(), "--json"]);
@@ -941,14 +1058,9 @@ fn scan_flags_labels_that_are_not_doc_ids_of_the_segment() {
     assert_eq!(ld["status"], "mismatch", "{f}");
     assert_eq!(ld["doc_count"], 400, "{f}");
     let detail = ld["detail"].as_str().unwrap();
-    assert!(
-        detail.starts_with("100 of 500 labels are not doc ids of the 400-document segment"),
-        "{detail}"
-    );
-    // The edit broke the .si's own checksum, and the detail says so.
-    assert!(
-        detail.ends_with("but its footer checksum does not verify"),
-        "{detail}"
+    assert_eq!(
+        detail,
+        "100 of 500 labels are not doc ids of the 400-document segment; first: node 400 has label 400"
     );
 
     let o = run(&["scan", scratch.0.to_str().unwrap()]);
@@ -957,4 +1069,47 @@ fn scan_flags_labels_that_are_not_doc_ids_of_the_segment() {
         "{}",
         stdout(&o)
     );
+}
+
+#[test]
+fn scan_skips_a_sound_si_in_a_newer_format() {
+    // A future Lucene may bump the segment info version. A .si in a
+    // format this tool does not read, whose checksum verifies, is skipped,
+    // not reported as damage.
+    let scratch = Scratch::new("scan-si-newer");
+    let l2 = fixtures().join("opensearch-3.9.0/nocfs/l2");
+    for name in [
+        "_2_165_vec.faiss",
+        "_2_NativeEngines990KnnVectorsFormat_0.vec",
+    ] {
+        std::fs::copy(l2.join(name), scratch.0.join(name)).unwrap();
+    }
+    let mut si = std::fs::read(l2.join("_2.si")).unwrap();
+    // Header: magic (4 bytes), the codec name as a one-byte length and its
+    // bytes, then the version as a big-endian int32.
+    let name_len = usize::from(si[4]);
+    assert_eq!(&si[5..5 + name_len], b"Lucene90SegmentInfo");
+    let at = 5 + name_len;
+    assert_eq!(&si[at..at + 4], &0_i32.to_be_bytes());
+    si[at..at + 4].copy_from_slice(&1_i32.to_be_bytes());
+    reseal(&mut si);
+    std::fs::write(scratch.0.join("_2.si"), &si).unwrap();
+
+    let o = run(&["scan", scratch.0.to_str().unwrap(), "--json"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    let ld = &v["files"][0]["lucene_docs"];
+    assert_eq!(ld["status"], "skipped", "{ld}");
+    assert_eq!(
+        ld["detail"],
+        "the .si is in a format this tool does not read (Lucene90SegmentInfo version 1)"
+    );
+
+    // The same .si without the reseal fails its checksum: damaged.
+    si[at..at + 4].copy_from_slice(&2_i32.to_be_bytes());
+    std::fs::write(scratch.0.join("_2.si"), &si).unwrap();
+    let o = run(&["scan", scratch.0.to_str().unwrap(), "--json"]);
+    assert_eq!(o.status.code(), Some(1), "{}", stdout(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["files"][0]["lucene_docs"]["status"], "damaged");
 }

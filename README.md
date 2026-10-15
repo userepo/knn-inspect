@@ -107,10 +107,14 @@ and the native file's storage must appear in it byte for byte; a
 compound segment keeps its `.vec` inside the `.cfs`, so this check is
 skipped there. The `.si` file gives the segment's document count, and
 every label in the ID map, which k-NN sets to a doc id, must be one of
-the segment's doc ids. `--space` applies to every file found; leave it
-out when the directory mixes space types. Exit code 0 when every file is
-clean, 1 if any failed (or would not open, a subdirectory could not be
-read, or none was found), 2 if the worst verdict was a warning.
+the segment's doc ids. A `.vec` or `.si` that is there but cannot be
+read, or fails its own checksum, fails the native file too: the segment
+cannot be trusted as it stands. A sound `.si` in a format this tool does
+not read, as a newer Lucene may write, is skipped instead. `--space`
+applies to every file found; leave it out when the directory mixes space
+types. Exit code 0 when every file is clean, 1 if any failed (or would
+not open, a subdirectory could not be read, or none was found), 2 if the
+worst verdict was a warning.
 
 ## Benchmarks
 

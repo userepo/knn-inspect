@@ -136,12 +136,24 @@ impl LuceneDocs {
 enum CrossCheck {
     /// The native file agrees with the Lucene file.
     Match,
-    /// The Lucene file exists and the native file contradicts it.
+    /// The Lucene file is sound and the native file contradicts it.
     Mismatch,
+    /// The Lucene file exists but cannot be trusted: it could not be
+    /// opened or read, has no footer, or fails its footer checksum. The
+    /// segment cannot be trusted as it stands, so the file fails.
+    Damaged,
     /// Not compared: the Lucene file is not beside the native file (a
-    /// compound segment keeps its `.vec` inside the `.cfs`), could not be
-    /// read, or there was nothing to compare. `detail` says which.
+    /// compound segment keeps its `.vec` inside the `.cfs`), is a sound
+    /// file in a format this tool does not read, or there was nothing to
+    /// compare. `detail` says which.
     Skipped,
+}
+
+impl CrossCheck {
+    /// Whether the outcome fails the native file.
+    fn fails(self) -> bool {
+        matches!(self, Self::Mismatch | Self::Damaged)
+    }
 }
 
 /// Runs `scan`; the exit code is the worst verdict over the files found:
@@ -300,8 +312,7 @@ fn scan_file(path: &Path, options: &Options) -> FileReport {
             LuceneDocs::skipped("the native file did not parse".to_owned()),
         ),
     };
-    let crossed =
-        lucene_vectors.status == CrossCheck::Mismatch || lucene_docs.status == CrossCheck::Mismatch;
+    let crossed = lucene_vectors.status.fails() || lucene_docs.status.fails();
     let status = if crossed {
         Status::Failed
     } else {
@@ -345,27 +356,43 @@ fn lucene_docs(path: &Path, parsed: &knn_format::Parsed<'_>) -> LuceneDocs {
     if !si_path.is_file() {
         return LuceneDocs::skipped(format!("no {segment}.si beside the native file"));
     }
+    let damaged = |doc_count: Option<u32>, detail: String| LuceneDocs {
+        status: CrossCheck::Damaged,
+        file: Some(si_path.display().to_string()),
+        doc_count,
+        detail,
+    };
     let si_file = match NativeFile::open(&si_path) {
         Ok(f) => f,
-        Err(e) => {
-            return LuceneDocs::skipped(format!("{} could not be opened: {e}", si_path.display()));
-        }
+        Err(e) => return damaged(None, format!("the .si could not be opened: {e}")),
     };
     let si_bytes = si_file.bytes();
     let info = match SegmentInfo::parse(si_bytes) {
         Ok(info) => info,
-        Err(e) => {
-            return LuceneDocs::skipped(format!("{} could not be read: {e}", si_path.display()));
+        // A codec header this tool does not know, on a file whose footer
+        // verifies, is a newer format, not damage: a future Lucene that
+        // bumps the version must not fail every segment it writes.
+        Err(knn_format::Error::UnexpectedCodec { found, .. })
+            if has_codec_header(si_bytes) && lucene_footer(si_bytes).is_ok() =>
+        {
+            return LuceneDocs {
+                status: CrossCheck::Skipped,
+                file: Some(si_path.display().to_string()),
+                doc_count: None,
+                detail: format!("the .si is in a format this tool does not read ({found})"),
+            };
         }
+        Err(e) => return damaged(None, format!("the .si could not be read: {e}")),
     };
-    let footer = match Envelope::parse(si_bytes) {
-        Ok(env) => match env.footer.map(|f| f.verify(si_bytes)) {
-            Some(Ok(_)) => "its footer checksum verifies",
-            Some(Err(_)) => "but its footer checksum does not verify",
-            None => "it has no Lucene footer",
-        },
-        Err(_) => "its envelope did not parse",
-    };
+    if let Err(why) = lucene_footer(si_bytes) {
+        return damaged(
+            Some(info.doc_count),
+            format!(
+                "the .si {why}, so its document count ({}) is not trusted",
+                info.doc_count
+            ),
+        );
+    }
 
     let docs = i64::from(info.doc_count);
     let labels = parsed.index.id_map;
@@ -384,23 +411,20 @@ fn lucene_docs(path: &Path, parsed: &knn_format::Parsed<'_>) -> LuceneDocs {
         (
             CrossCheck::Mismatch,
             format!(
-                "{outside} of {} labels are not doc ids of the {docs}-document segment; first: node {node} has label {label}; {footer}",
+                "{outside} of {} labels are not doc ids of the {docs}-document segment; first: node {node} has label {label}",
                 labels.len()
             ),
         )
     } else if too_many {
         (
             CrossCheck::Mismatch,
-            format!(
-                "{} labels for a {docs}-document segment; {footer}",
-                labels.len()
-            ),
+            format!("{} labels for a {docs}-document segment", labels.len()),
         )
     } else {
         (
             CrossCheck::Match,
             format!(
-                "{} labels, all doc ids of the {docs}-document segment; {footer}",
+                "{} labels, all doc ids of the {docs}-document segment",
                 labels.len()
             ),
         )
@@ -411,6 +435,25 @@ fn lucene_docs(path: &Path, parsed: &knn_format::Parsed<'_>) -> LuceneDocs {
         doc_count: Some(info.doc_count),
         detail,
     }
+}
+
+/// Whether a file starts with a Lucene codec header.
+fn has_codec_header(bytes: &[u8]) -> bool {
+    Envelope::parse(bytes).is_ok_and(|e| e.header.is_some())
+}
+
+/// Whether a Lucene file's envelope is sound: it parses, ends in a footer,
+/// and the footer's checksum verifies. The error says what is wrong.
+fn lucene_footer(bytes: &[u8]) -> Result<(), String> {
+    let envelope =
+        Envelope::parse(bytes).map_err(|e| format!("has an envelope that did not parse ({e})"))?;
+    let Some(footer) = envelope.footer else {
+        return Err("has no Lucene footer".to_owned());
+    };
+    footer
+        .verify(bytes)
+        .map(|_| ())
+        .map_err(|_| "fails its footer checksum".to_owned())
 }
 
 /// Looks for the native file's stored vectors inside the `.vec` files of
@@ -440,37 +483,54 @@ fn lucene_vectors(path: &Path, bytes: &[u8], parsed: &knn_format::Parsed<'_>) ->
         return skipped("the native file holds no vectors".to_owned());
     }
 
+    // .vec files read cleanly but not holding the vectors, and those that
+    // could not be trusted.
     let mut tried = Vec::new();
+    let mut untrusted = Vec::new();
     for candidate in &candidates {
         // Mapped, not read: a .vec can be as large as the index itself.
         let mapped = match NativeFile::open(candidate) {
             Ok(m) => m,
             Err(e) => {
-                tried.push(format!("{}: {e}", candidate.display()));
+                untrusted.push(format!("{} could not be opened: {e}", candidate.display()));
                 continue;
             }
         };
         let vec = mapped.bytes();
+        let sound = lucene_footer(vec);
         if let Some(offset) = find(vec, storage) {
-            let footer = match Envelope::parse(vec) {
-                Ok(env) => match env.footer.map(|f| f.verify(vec)) {
-                    Some(Ok(_)) => "its footer checksum verifies",
-                    Some(Err(_)) => "but its footer checksum does not verify",
-                    None => "it has no Lucene footer",
-                },
-                Err(_) => "its envelope did not parse",
+            let found = format!(
+                "{} vectors found byte for byte at offset {offset}",
+                parsed.index.index.storage.row_count()
+            );
+            let (status, detail) = match sound {
+                Ok(()) => (CrossCheck::Match, found),
+                Err(why) => (CrossCheck::Damaged, format!("{found}, but the .vec {why}")),
             };
             return LuceneVectors {
-                status: CrossCheck::Match,
+                status,
                 file: Some(candidate.display().to_string()),
                 offset: Some(offset),
-                detail: format!(
-                    "{} vectors found byte for byte at offset {offset}; {footer}",
-                    parsed.index.index.storage.row_count()
-                ),
+                detail,
             };
         }
-        tried.push(candidate.display().to_string());
+        match sound {
+            Ok(()) => tried.push(candidate.display().to_string()),
+            Err(why) => untrusted.push(format!("{} {why}", candidate.display())),
+        }
+    }
+    // Not found: a damaged .vec may be the reason, so it outranks a
+    // mismatch.
+    if !untrusted.is_empty() {
+        return LuceneVectors {
+            status: CrossCheck::Damaged,
+            file: candidates.first().map(|c| c.display().to_string()),
+            offset: None,
+            detail: format!(
+                "the stored vectors are in no sound .vec of the segment; {}",
+                untrusted.join("; ")
+            ),
+        };
     }
     LuceneVectors {
         status: CrossCheck::Mismatch,
@@ -601,7 +661,7 @@ fn text(out: &Output) -> String {
 fn cross_tag(status: CrossCheck) -> &'static str {
     match status {
         CrossCheck::Match => "pass",
-        CrossCheck::Mismatch => "FAIL",
+        CrossCheck::Mismatch | CrossCheck::Damaged => "FAIL",
         CrossCheck::Skipped => "skip",
     }
 }

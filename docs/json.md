@@ -2,10 +2,12 @@
 
 Every command takes `--json` and prints one object. The shape is stable:
 fields keep their names and meanings, and new ones are only added. A
-field marked *optional* is left out when it does not apply; a field
-marked *nullable* is present with `null`. Offsets are byte offsets from
-the start of the file. Node ids are Faiss node numbers (0-based storage
-rows); labels are the ID map's values, which k-NN sets to Lucene doc ids.
+field that takes one of a listed set of strings may gain new values;
+treat a value you do not know as a failure. A field marked *optional* is
+left out when it does not apply; a field marked *nullable* is present
+with `null`. Offsets are byte offsets from the start of the file. Node
+ids are Faiss node numbers (0-based storage rows); labels are the ID
+map's values, which k-NN sets to Lucene doc ids.
 
 ## `info`
 
@@ -115,26 +117,35 @@ Each entry of `files`:
 | `layout`, `dimension`, `count`, `metric` | optional | As for `info`; absent when the file did not parse |
 | `status` | string | `clean`, `warnings`, or `failed`, counting both Lucene cross-checks |
 | `failures`, `warnings`, `checks` | optional | As for `verify` |
-| `lucene_vectors.status` | string | `match`, `mismatch`, or `skipped` |
+| `lucene_vectors.status` | string | `match`, `mismatch`, `damaged`, or `skipped` (`damaged` since 0.3.0) |
 | `lucene_vectors.file` | string, optional | The segment's `.vec` file the vectors were found in, or the first one looked in |
 | `lucene_vectors.offset` | integer, optional | Where in that file the stored vectors begin |
-| `lucene_vectors.detail` | string | What was found, or why the check was skipped |
-| `lucene_docs.status` | string | `match`, `mismatch`, or `skipped` |
+| `lucene_vectors.detail` | string | What was found, what is wrong with the Lucene file, or why the check was skipped |
+| `lucene_docs.status` | string | `match`, `mismatch`, `damaged`, or `skipped` |
 | `lucene_docs.file` | string, optional | The segment's `.si` file that was read |
 | `lucene_docs.doc_count` | integer, optional | Documents in the segment, deleted ones included |
-| `lucene_docs.detail` | string | What was found, or why the check was skipped |
+| `lucene_docs.detail` | string | What was found, what is wrong with the Lucene file, or why the check was skipped |
 
 The two Lucene cross-checks compare the native file with files of the
-same segment, and a `mismatch` in either fails the file:
+same segment. `mismatch` means the Lucene file is sound and the native
+file contradicts it; `damaged` means the Lucene file exists but cannot be
+trusted (it could not be opened or read, has no footer, or fails its
+footer checksum), so the segment cannot be trusted as it stands. Either
+fails the file.
 
 - `lucene_vectors` looks for the native file's stored vectors, byte for
   byte, inside the segment's `.vec` (Lucene flat vectors) files, which
-  hold the same vectors in the same order. It is skipped when no loose
-  `.vec` lies beside the native file, as in a compound segment, where the
-  `.vec` is inside the `.cfs`.
+  hold the same vectors in the same order. When the vectors are found in a
+  `.vec` that is damaged, `offset` still says where. It is skipped when
+  no loose `.vec` lies beside the native file, as in a compound segment,
+  where the `.vec` is inside the `.cfs`. Before 0.3.0, a `.vec` that
+  could not be opened was reported as `mismatch`, and a failing checksum
+  was only mentioned in `detail`.
 - `lucene_docs` reads the document count from the segment's `.si` and
   checks that every label in the ID map, which k-NN sets to a doc id,
   lies in `0..doc_count`, with no more labels than documents. The `.si`
-  is never inside the `.cfs`, so compound segments are checked too. It is
-  skipped when there is no `.si` beside the native file or it cannot be
-  read.
+  is never inside the `.cfs`, so compound segments are checked too. When
+  a `.si` reads but fails its checksum, `doc_count` still gives the count
+  it holds. It is skipped when there is no `.si` beside the native file,
+  or when the `.si` is sound but in a format this tool does not read, as a
+  newer Lucene may write.

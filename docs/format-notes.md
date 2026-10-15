@@ -210,6 +210,11 @@ the footer; the reader stops after the compound byte. Every doc id in
 the segment is below the document count, which is what the ID map's
 labels are checked against.
 
+Any other codec name or version is not read. In a `.si` whose footer
+checksum verifies, `scan` reports it as a format this tool does not
+read and skips the check, since a newer Lucene may write one; without a
+verifying footer, the file is reported as damaged.
+
 ### Bytes
 
 Head of `nocfs/l2/_2_165_vec.faiss`:

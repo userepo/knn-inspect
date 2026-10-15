@@ -19,6 +19,9 @@ pub const CODEC: &str = "Lucene90SegmentInfo";
 /// The only codec version the format has written.
 pub const VERSION: i32 = 0;
 
+/// The codec and version this reader reads, as errors name them.
+const EXPECTED: &str = "Lucene90SegmentInfo version 0";
+
 /// What the segment info file says about the segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SegmentInfo {
@@ -47,14 +50,14 @@ impl SegmentInfo {
             return Err(Error::UnexpectedCodec {
                 offset: 0,
                 found: "no codec header".to_owned(),
-                expected: CODEC,
+                expected: EXPECTED,
             });
         };
         if header.codec != CODEC || header.version != VERSION {
             return Err(Error::UnexpectedCodec {
                 offset: 0,
                 found: format!("{} version {}", header.codec, header.version),
-                expected: CODEC,
+                expected: EXPECTED,
             });
         }
         let body = bytes.get(header.length..).unwrap_or_default();
