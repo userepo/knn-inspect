@@ -1,0 +1,5 @@
+{"recall": 0.97802, "queries": 10000, "ef_search": 100, "search_ms": 197, "ground_truth_ms": 10053, "threads": 16}
+{"recall": 0.97802, "queries": 10000, "ef_search": 100, "search_ms": 214, "ground_truth_ms": 10039, "threads": 16}
+{"recall": 0.97802, "queries": 10000, "ef_search": 100, "search_ms": 211, "ground_truth_ms": 10170, "threads": 16}
+{"recall": 0.97802, "queries": 10000, "ef_search": 100, "search_ms": 202, "ground_truth_ms": 10058, "threads": 16}
+{"recall": 0.97802, "queries": 10000, "ef_search": 100, "search_ms": 204, "ground_truth_ms": 10159, "threads": 16}

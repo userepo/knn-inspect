@@ -38,7 +38,9 @@ minute each on 32 threads); `run.sh` writes the raw results and a
 Markdown summary to `results/<timestamp>/` there. `THREADS` (default 16)
 sets both Faiss's OpenMP threads and `knn-inspect`'s rayon threads;
 `RUNS` (default 5) sets the runs per measurement, and the summary takes
-the median.
+the median. The published run, behind the main README's
+[Benchmarks](../README.md#benchmarks) section, is in
+[results/2026-10-15/](results/2026-10-15/README.md).
 
 ## What is measured, and what it means
 

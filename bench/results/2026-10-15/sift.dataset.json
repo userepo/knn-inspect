@@ -1,0 +1,14 @@
+{
+  "dataset": "sift-128-euclidean.hdf5",
+  "vectors": 1000000,
+  "dimension": 128,
+  "queries": 10000,
+  "metric": "l2",
+  "m": 16,
+  "ef_construction": 100,
+  "ef_search": 100,
+  "index_bytes": 664258407,
+  "build_seconds": 14.7,
+  "build_threads": 32,
+  "faiss_version": "1.15.1"
+}

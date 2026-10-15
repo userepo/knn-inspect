@@ -1,0 +1,14 @@
+{
+  "dataset": "glove-100-angular.hdf5",
+  "vectors": 1183514,
+  "dimension": 100,
+  "queries": 10000,
+  "metric": "inner_product",
+  "m": 16,
+  "ef_construction": 100,
+  "ef_search": 100,
+  "index_bytes": 653622031,
+  "build_seconds": 20.1,
+  "build_threads": 32,
+  "faiss_version": "1.15.1"
+}

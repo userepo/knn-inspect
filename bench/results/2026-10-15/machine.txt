@@ -1,0 +1,12 @@
+date_utc: 2026-10-15T00:39:48Z
+cpu: Intel(R) Core(TM) i9-14900HX
+logical_cpus: 32
+memory: 15Gi
+kernel: Linux 6.18.33.2-microsoft-standard-WSL2
+os: Ubuntu 24.04.4 LTS
+threads: 16
+runs: 5
+knn_inspect: knn-inspect 0.2.0, commit ca8fde0
+python: Python 3.12.3
+faiss: 1.15.1
+hyperfine: hyperfine 2.0.0

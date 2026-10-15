@@ -1,0 +1,5 @@
+{"recall": 0.97802, "queries": 10000, "ground_truth_ms": 51801, "search_ms": 533, "ef_search": 100}
+{"recall": 0.97802, "queries": 10000, "ground_truth_ms": 51379, "search_ms": 545, "ef_search": 100}
+{"recall": 0.97802, "queries": 10000, "ground_truth_ms": 52061, "search_ms": 516, "ef_search": 100}
+{"recall": 0.97802, "queries": 10000, "ground_truth_ms": 52420, "search_ms": 545, "ef_search": 100}
+{"recall": 0.97802, "queries": 10000, "ground_truth_ms": 51794, "search_ms": 525, "ef_search": 100}

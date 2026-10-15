@@ -110,6 +110,64 @@ directory mixes space types. Exit code 0 when every file is clean, 1 if
 any failed (or would not open, a subdirectory could not be read, or none
 was found), 2 if the worst verdict was a warning.
 
+## Benchmarks
+
+`knn-inspect` 0.2.0 against the equivalent Faiss Python (faiss-cpu
+1.15.1) on the same index files, on an Intel Core i9-14900HX (32 logical
+CPUs) under WSL2 (Ubuntu 24.04), both sides limited to 16 threads, warm
+page cache, median of 5 runs. Each index is Faiss HNSW with k-NN's
+defaults (M 16, efConstruction 100, efSearch 100); GloVe is normalized
+and inner product, as k-NN serves a cosine field.
+
+**SIFT-1M (1,000,000 vectors x 128, L2, 633 MiB index)**
+
+| Measurement | knn-inspect | Faiss Python |
+| --- | --- | --- |
+| Open and parse, end to end (ms) | 2.2 | 352 (Python and Faiss import alone: 106) |
+| Peak memory after open (MiB) | 7 | 674 (import alone: 40) |
+| Peak memory after touching every page (MiB) | 629 | 674 |
+| Recall@10, 10,000 queries | 0.97802 | 0.97802 |
+| HNSW search, in process (ms) | 533 | 204 |
+| Exact ground truth, in process (ms) | 51,801 | 10,058 |
+
+**GloVe-100 (1,183,514 vectors x 100, cosine as inner product, 623 MiB index)**
+
+| Measurement | knn-inspect | Faiss Python |
+| --- | --- | --- |
+| Open and parse, end to end (ms) | 2.4 | 346 (Python and Faiss import alone: 99) |
+| Peak memory after open (MiB) | 7 | 664 (import alone: 40) |
+| Peak memory after touching every page (MiB) | 617 | 664 |
+| Recall@10, 10,000 queries | 0.78727 | 0.78727 |
+| HNSW search, in process (ms) | 618 | 207 |
+| Exact ground truth, in process (ms) | 43,719 | 7,914 |
+
+How to read these:
+
+- **Open** and **memory after open** compare different amounts of work:
+  `knn-inspect` maps the file and reads only headers and small arrays,
+  while `read_index` copies the whole index into memory. That difference
+  is the point of a memory-mapped inspector, not a faster parser.
+- **Memory after touching every page** is after `verify`, which reads
+  every array. Mapped pages count toward the resident set while touched,
+  but they are page cache the kernel can drop, not private memory.
+- **Recall** is identical to every digit: the tool's HNSW search is a port
+  of Faiss's, and each side found the same number of true neighbors,
+  97,802 of 100,000 on SIFT and 78,727 on GloVe.
+- **Search** and **ground truth** are where Faiss is faster: about 2.6 to
+  3 times for the search and 5 times for the brute force, which Faiss
+  computes through BLAS while `knn-inspect` sums each distance as plain
+  scalar code. Neither is tuned here; the brute force is what `recall`
+  pays once per run.
+
+`stats` on the same files: the SIFT graph has 14 nodes on level 0 that no
+search can reach, the GloVe graph 609, so those vectors are never
+returned whatever the query. The counts are specific to these builds,
+since Faiss builds the graph with several threads.
+
+The scripts are in [bench/](bench/README.md); the raw results and dataset
+checksums of this run are in
+[bench/results/2026-10-15/](bench/results/2026-10-15/README.md).
+
 ## Scope (v1)
 
 - Faiss engine files: ID map wrapping HNSW with flat float32 storage
