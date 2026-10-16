@@ -18,7 +18,7 @@
 //! portable scalar-quantizer code computes fp16 and bf16 distances; its
 //! float32 code, and its SIMD builds' scalar-quantizer code, regroup the
 //! sums, so two neighbors a last bit apart can order differently here
-//! than in Faiss. Faiss from `c000190` on (faiss 1.15.1), running its
+//! than in Faiss. Faiss from `c000190` on (1.14.3), running its
 //! `AVX512_SPR` code, also rounds the query to bf16 for bf16 distances;
 //! this crate, like `5616caa`, the Faiss that k-NN 3.9.0 builds, keeps it
 //! float32.

@@ -318,7 +318,7 @@ paths only decode): it adds `0x8000` to the float32's bits and keeps the
 top 16. That rounds to the nearest bfloat16 and a tie away from zero,
 and turns a value from the midpoint above the largest finite bfloat16 on
 into infinity. Later Faiss adds a second, `encode_bf16_simd` (from
-`c000190`, which faiss 1.15.1 has), used by builds that run their
+`c000190`, released in 1.14.3), used by builds that run their
 `AVX512_SPR` code on a CPU with AVX512-BF16: `vcvtneps2bf16` on blocks
 of 16 components, which rounds a tie to even and reads a subnormal
 float32 as a zero of its sign. A check against Lucene's float32 copy

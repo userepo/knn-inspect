@@ -480,7 +480,7 @@ pub fn f32_to_bf16(x: f32) -> u16 {
 }
 
 /// Whether some Faiss build encodes `x` as `code`. The portable encoder
-/// gives [`f32_to_bf16`]'s code. From `c000190` on (faiss 1.15.1 has it),
+/// gives [`f32_to_bf16`]'s code. From `c000190` on (Faiss 1.14.3),
 /// a build running its `AVX512_SPR` code, on a CPU with AVX512-BF16,
 /// encodes with `vcvtneps2bf16` instead, which rounds a tie to even and
 /// reads a subnormal float32 as a zero of its sign; its codes are accepted
