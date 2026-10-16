@@ -14,9 +14,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use knn_format::faiss::{
-    FlatStorage, FourCc, HnswGraph, HnswIndex, IndexHeader, Storage, f16_to_f32,
-};
+use knn_format::faiss::{FlatStorage, FourCc, HnswGraph, HnswIndex, IndexHeader, Storage};
 use knn_format::{F32, F64, I32, U64};
 use knn_recall::{
     Error, Labels, Queries, Searcher, ground_truth, result_labels, score, search_all,
@@ -40,7 +38,7 @@ struct Baseline {
 
 fn baselines() -> Vec<PathBuf> {
     let mut out = Vec::new();
-    for synthetic in ["synthetic", "synthetic-fp16"] {
+    for synthetic in ["synthetic", "synthetic-fp16", "synthetic-bf16"] {
         for entry in fs::read_dir(fixtures().join(synthetic)).unwrap() {
             let p = entry.unwrap().path();
             if p.to_string_lossy().ends_with(".recall.json") {
@@ -53,6 +51,7 @@ fn baselines() -> Vec<PathBuf> {
         "opensearch-3.9.0/cfs",
         "opensearch-3.9.0-fp16/sq-fp16",
         "opensearch-3.9.0-fp16/half-float",
+        "opensearch-3.9.0-bf16/sq-bf16",
     ] {
         for entry in fs::read_dir(fixtures().join(set)).unwrap() {
             out.push(entry.unwrap().path().join("recall.json"));
@@ -125,13 +124,13 @@ fn own_search_matches_faiss() {
         }
         seen += 1;
     }
-    assert_eq!(seen, 20, "8 synthetic and 12 real baselines");
+    assert_eq!(seen, 26, "11 synthetic and 15 real baselines");
     // The search follows Faiss step for step, and on these fixtures every
-    // list comes out identical, fp16 ones included. A last-bit difference
-    // in a distance sum (this crate sums in order; Faiss's float32 code
-    // and its SIMD builds' fp16 code regroup) could legitimately change a
-    // list on other data; here, a mismatch means a changed search, so the
-    // check is exact.
+    // list comes out identical, fp16 and bf16 ones included. A last-bit
+    // difference in a distance sum (this crate sums in order; Faiss's
+    // float32 code and its SIMD builds' scalar-quantizer code regroup)
+    // could legitimately change a list on other data; here, a mismatch
+    // means a changed search, so the check is exact.
     assert_eq!(
         identical, lists,
         "{identical} of {lists} result lists identical to Faiss's"
@@ -464,25 +463,30 @@ fn search_checks_its_inputs() {
 }
 
 #[test]
-fn fp16_samples_are_the_decoded_rows() {
-    let bytes = fs::read(fixtures().join("synthetic-fp16/l2-1000x32-fp16.faiss")).unwrap();
-    let parsed = knn_format::parse(&bytes).unwrap();
-    let storage = &parsed.index.index.storage;
-    let Storage::Fp16(fp16) = storage else {
-        panic!("fp16 storage");
-    };
-    let (q, rows) = knn_recall::sample_queries(storage, 20, 7).unwrap();
-    // The draw depends only on the row count and the seed: the same rows
-    // as from the float file of the same shape.
-    assert_eq!(&rows[..8], &[487, 727, 212, 720, 842, 285, 158, 580]);
-    for (q, &row) in q.rows().zip(&rows) {
-        let v: Vec<f32> = fp16
-            .vector(row)
-            .unwrap()
-            .iter()
-            .map(|h| f16_to_f32(h.get()))
-            .collect();
-        assert_eq!(q, &v[..]);
+fn scalar_quantized_samples_are_the_decoded_rows() {
+    for file in [
+        "synthetic-fp16/l2-1000x32-fp16.faiss",
+        "synthetic-bf16/l2-1000x32-bf16.faiss",
+    ] {
+        let bytes = fs::read(fixtures().join(file)).unwrap();
+        let parsed = knn_format::parse(&bytes).unwrap();
+        let storage = &parsed.index.index.storage;
+        let Storage::Sq(sq) = storage else {
+            panic!("{file}: scalar-quantized storage");
+        };
+        let (q, rows) = knn_recall::sample_queries(storage, 20, 7).unwrap();
+        // The draw depends only on the row count and the seed: the same
+        // rows as from the float file of the same shape.
+        assert_eq!(&rows[..8], &[487, 727, 212, 720, 842, 285, 158, 580]);
+        for (q, &row) in q.rows().zip(&rows) {
+            let v: Vec<f32> = sq
+                .vector(row)
+                .unwrap()
+                .iter()
+                .map(|h| sq.format.decode(h.get()))
+                .collect();
+            assert_eq!(q, &v[..], "{file}");
+        }
     }
 }
 

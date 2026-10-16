@@ -272,7 +272,7 @@
   {
     "file": "fp16-unsupported-qtype.faiss",
     "source": "fixtures/synthetic-fp16/l2-100x4-fp16.faiss",
-    "mutation": "quantizer type set to 7 (QT_bf16)",
+    "mutation": "quantizer type set to 8 (QT_8bit_direct_signed)",
     "space": null,
     "expect": {
       "check": "structure",
@@ -333,6 +333,16 @@
     "file": "fp16-inf-code.faiss",
     "source": "fixtures/synthetic-fp16/l2-100x4-fp16.faiss",
     "mutation": "vector 1 component 0 set to half-float -inf",
+    "space": null,
+    "expect": {
+      "check": "vector_values",
+      "severity": "warning"
+    }
+  },
+  {
+    "file": "bf16-nan-code.faiss",
+    "source": "fixtures/synthetic-bf16/l2-100x4-bf16.faiss",
+    "mutation": "vector 0 component 2 set to a bfloat16 NaN",
     "space": null,
     "expect": {
       "check": "vector_values",

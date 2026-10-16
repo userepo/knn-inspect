@@ -38,9 +38,9 @@ pub enum Error {
     },
 
     /// A scalar quantizer type this crate does not decode: only `QT_fp16`
-    /// is read.
+    /// and `QT_bf16` are read.
     #[error(
-        "scalar quantizer type {qtype} ({}) at offset {offset} is not supported; expected 4 (QT_fp16)",
+        "scalar quantizer type {qtype} ({}) at offset {offset} is not supported; expected 4 (QT_fp16) or 7 (QT_bf16)",
         crate::faiss::quantizer_type_name(*.qtype).unwrap_or("not a Faiss type")
     )]
     UnsupportedQuantizer {

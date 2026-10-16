@@ -1220,17 +1220,17 @@ fn scan_reads_fp16_segments() {
         let how = if f["file"].as_str().unwrap().contains("half-float") {
             "byte for byte"
         } else {
-            "as float32 values that round to the stored half floats"
+            "as float32 values that round to the stored codes"
         };
         assert!(lv["detail"].as_str().unwrap().contains(how), "{f}");
         assert_eq!(f["lucene_docs"]["status"], "match", "{f}");
     }
 }
 
-/// A copy of a real fp16 segment's native file and `.vec`, with the
-/// offset of the native codes. The `.vec`'s vector data starts at 128 in
-/// these fixtures.
-struct Fp16Segment {
+/// A copy of a real fp16 or bf16 segment's native file and `.vec`, with
+/// the offset of the native codes. The `.vec`'s vector data starts at 128
+/// in these fixtures.
+struct SqSegment {
     scratch: Scratch,
     native: Vec<u8>,
     vec_name: &'static str,
@@ -1238,12 +1238,14 @@ struct Fp16Segment {
     codes: usize,
 }
 
-impl Fp16Segment {
+impl SqSegment {
     fn new(name: &str, encoding: &str) -> Self {
-        let dir = fixtures()
-            .join("opensearch-3.9.0-fp16")
-            .join(encoding)
-            .join("l2");
+        let set = if encoding == "sq-bf16" {
+            "opensearch-3.9.0-bf16"
+        } else {
+            "opensearch-3.9.0-fp16"
+        };
+        let dir = fixtures().join(set).join(encoding).join("l2");
         let native = std::fs::read(dir.join("_2_165_vec.faiss")).unwrap();
         let vec_name = if encoding == "half-float" {
             "_2_NativeEngines990HalfFloatKnnVectorsFormat_0.vec"
@@ -1295,7 +1297,7 @@ const SQ_VEC: &str = "_2_NativeEngines990KnnVectorsFormat_0.vec";
 #[test]
 fn scan_accepts_the_code_either_tie_rule_gives() {
     use knn_format::faiss::f16_to_f32;
-    let mut seg = Fp16Segment::new("fp16-tie", "sq-fp16");
+    let mut seg = SqSegment::new("fp16-tie", "sq-fp16");
     let components = 500 * 16;
 
     // An even code with its float32 source moved to exactly halfway up
@@ -1331,7 +1333,7 @@ fn scan_accepts_the_code_either_tie_rule_gives() {
 #[test]
 fn scan_flags_fp16_sources_that_round_elsewhere() {
     use knn_format::faiss::f16_to_f32;
-    let mut seg = Fp16Segment::new("fp16-off", "sq-fp16");
+    let mut seg = SqSegment::new("fp16-off", "sq-fp16");
     // Component 5's source moved one float32 step past the midpoint up to
     // the next half float, which it then rounds to under either rule. The
     // sound .vec contradicts the native file.
@@ -1353,7 +1355,7 @@ fn scan_flags_fp16_sources_that_round_elsewhere() {
 
 #[test]
 fn scan_compares_half_float_codes_byte_for_byte() {
-    let mut seg = Fp16Segment::new("fp16-half", "half-float");
+    let mut seg = SqSegment::new("fp16-half", "half-float");
     // One code in the .vec one half float off, the file resealed.
     let at = 128 + 2 * 7;
     let code = u16::from_le_bytes([seg.vec[at], seg.vec[at + 1]]);
@@ -1369,7 +1371,7 @@ fn scan_gives_up_on_repetitive_float32_data() {
     // all zeros: every aligned offset matches far into the codes. The
     // search must stop within its budget and say it could not tell,
     // rather than run in quadratic time or claim a mismatch.
-    let mut seg = Fp16Segment::new("fp16-zeros", "sq-fp16");
+    let mut seg = SqSegment::new("fp16-zeros", "sq-fp16");
     let codes = 500 * 16;
     let (start, end) = (seg.codes, seg.codes + 2 * codes);
     seg.native[start..end].fill(0);
@@ -1389,4 +1391,110 @@ fn scan_gives_up_on_repetitive_float32_data() {
         "took {:?}",
         started.elapsed()
     );
+}
+
+#[test]
+fn bf16_files_are_read() {
+    let dir = fixtures().join("opensearch-3.9.0-bf16/sq-bf16");
+    let real = dir.join("cosinesimil/_2_165_vec.faiss");
+    let path = real.to_str().unwrap();
+    let o = run(&["info", path]);
+    assert_eq!(o.status.code(), Some(0));
+    let text = stdout(&o);
+    assert!(text.contains("IxMp > IHNs > IxSQ"), "{text}");
+    assert!(
+        text.contains(
+            "quantizer       QT_bf16 (type 7), dimension 16, code size 32, trained values 0"
+        ),
+        "{text}"
+    );
+    let o = run(&["info", "--json", path]);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["quantizer"]["name"], "QT_bf16");
+    assert_eq!(v["quantizer"]["qtype"], 7);
+
+    let o = run(&["verify", path, "--space", "cosinesimil"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+    let o = run(&["stats", path]);
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+
+    // The tool's own search over bf16 codes reproduces Faiss's recall.
+    let synthetic = fixtures().join("synthetic-bf16");
+    let file = synthetic.join("l2-1000x32-bf16.faiss");
+    let queries = synthetic.join("l2-1000x32-bf16.queries.f32");
+    let o = run(&[
+        "recall",
+        file.to_str().unwrap(),
+        "--queries",
+        queries.to_str().unwrap(),
+        "--json",
+    ]);
+    assert_eq!(o.status.code(), Some(0));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["recall"], 0.901);
+
+    // scan finds every segment's float32 sources in its .vec.
+    let o = run(&["scan", dir.to_str().unwrap(), "--json"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(
+        v["summary"],
+        serde_json::json!({"files": 3, "clean": 3, "warnings": 0, "failed": 0})
+    );
+    for f in v["files"].as_array().unwrap() {
+        let lv = &f["lucene_vectors"];
+        assert_eq!(lv["status"], "match", "{f}");
+        assert_eq!(lv["offset"], 128, "{f}");
+        assert!(
+            lv["detail"]
+                .as_str()
+                .unwrap()
+                .contains("round to the stored codes"),
+            "{f}"
+        );
+    }
+}
+
+#[test]
+fn scan_accepts_the_bf16_code_either_faiss_encoder_gives() {
+    let mut seg = SqSegment::new("bf16-tie", "sq-bf16");
+    let components = 500 * 16;
+    let halfway_up = |code: u16| f32::from_bits((u32::from(code) << 16) | 0x8000);
+
+    // An even, nonzero code with its float32 source moved to exactly
+    // halfway up to the next bfloat16: rounding to even (Faiss's
+    // AVX512-BF16 encoder) keeps the code, rounding away from zero (its
+    // portable one) takes the next. Both match.
+    let i = (0..components)
+        .find(|&i| seg.code(i) & 1 == 0 && seg.code(i) & 0x7fff != 0)
+        .unwrap();
+    let even = seg.code(i);
+    seg.set_float(i, halfway_up(even));
+    reseal(&mut seg.vec);
+    let lv = seg.scan();
+    assert_eq!(lv["status"], "match", "even rule: {lv}");
+    assert_eq!(lv["offset"], 128, "{lv}");
+    seg.set_code(i, even + 1);
+    reseal(&mut seg.native);
+    assert_eq!(seg.scan()["status"], "match", "away rule");
+
+    // A subnormal source: the portable encoder rounds it, the AVX512-BF16
+    // one reads it as a zero of its sign. Both match; another code does
+    // not.
+    let j = (0..components).find(|&j| j != i).unwrap();
+    seg.set_float(j, f32::from_bits(0x0040_0000));
+    reseal(&mut seg.vec);
+    for (code, status) in [(0x0040, "match"), (0x0000, "match"), (0x8000, "mismatch")] {
+        seg.set_code(j, code);
+        reseal(&mut seg.native);
+        assert_eq!(seg.scan()["status"], status, "subnormal as {code:#06x}");
+    }
+
+    // An odd code below a tie: both rules round up, so a file that kept
+    // the odd code was not written by Faiss.
+    let mut seg = SqSegment::new("bf16-odd", "sq-bf16");
+    let k = (0..components).find(|&k| seg.code(k) & 1 == 1).unwrap();
+    seg.set_float(k, halfway_up(seg.code(k)));
+    reseal(&mut seg.vec);
+    assert_eq!(seg.scan()["status"], "mismatch");
 }

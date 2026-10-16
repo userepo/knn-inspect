@@ -6,27 +6,40 @@ field: an `IndexIDMap` wrapping `IndexHNSWFlat` with flat float32
 storage, added with explicit labels, in `fixtures/synthetic/`; and the
 same over `IndexHNSWSQ` with fp16 storage (`QT_fp16`, the native layout
 k-NN writes for its `sq` encoder with `type: fp16` and its `half_float`
-data type) in `fixtures/synthetic-fp16/`.
+data type) in `fixtures/synthetic-fp16/`, and with bf16 storage
+(`QT_bf16`, for the `sq` encoder with `type: bf16`) in
+`fixtures/synthetic-bf16/`.
 Next to every `.faiss` file an `.expected.json` records the values the
 Rust parser must report, read back from the same in-memory index. An
-fp16 case draws the same vectors as the float case of the same shape.
+fp16 or bf16 case draws the same vectors as the float case of the same
+shape.
 
 Faiss is pinned to one thread so the graph is reproducible run to run.
 
 Usage:
     python tools/make_synthetic.py [--out fixtures/synthetic]
-        [--fp16-out fixtures/synthetic-fp16]
+        [--fp16-out fixtures/synthetic-fp16] [--bf16-out fixtures/synthetic-bf16]
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import pathlib
 import zlib
 
-import faiss
-import numpy as np
+# Faiss's portable code on every CPU, as the committed fixtures were
+# written: a dynamic-dispatch build (the Linux and macOS wheels) picks its
+# SIMD level from FAISS_SIMD_LEVEL when it loads, and on a CPU with
+# AVX512-BF16 its AVX512_SPR code rounds bf16 ties to even and builds the
+# graph from bf16-rounded queries. The Windows wheels are portable
+# already. A build compiled for one SIMD level ignores the variable, so
+# main() checks the level Faiss reports.
+os.environ["FAISS_SIMD_LEVEL"] = "NONE"
+
+import faiss  # noqa: E402
+import numpy as np  # noqa: E402
 
 # name, vector count, dimension, metric
 CASES = [
@@ -42,6 +55,13 @@ FP16_CASES = [
     ("l2-100x4-fp16", 100, 4, "l2"),
     ("l2-1000x32-fp16", 1000, 32, "l2"),
     ("ip-1000x32-fp16", 1000, 32, "ip"),
+]
+
+# And with bf16 storage.
+BF16_CASES = [
+    ("l2-100x4-bf16", 100, 4, "l2"),
+    ("l2-1000x32-bf16", 1000, 32, "l2"),
+    ("ip-1000x32-bf16", 1000, 32, "ip"),
 ]
 
 # k-NN's defaults for the hnsw method.
@@ -153,12 +173,11 @@ def build_fp16(name: str, count: int, dim: int, metric: str, out: pathlib.Path) 
     # row: decoding them by hand gives what Faiss reconstructs.
     decoded = codes.view("<f2").astype(np.float32).reshape(count, dim)
     assert np.array_equal(decoded, storage.reconstruct_n(0, count))
-    # Faiss's portable float-to-half conversion, which the faiss-cpu 1.15.1
-    # wheel runs on Windows, where the fixtures were written, matches IEEE
-    # round-to-nearest except on exact ties, which it rounds away from zero
-    # where IEEE (and NumPy) round to even. Builds with Faiss's F16C or NEON
-    # encoder, such as the Linux wheel on an AVX2 CPU, round ties to even
-    # too. Check that ties are the only difference.
+    # On the portable level main() requires, Faiss's float-to-half
+    # conversion matches IEEE round-to-nearest except on exact ties, which
+    # it rounds away from zero where IEEE (and NumPy) round to even. (Its
+    # F16C and NEON encoders, which the pin keeps off, round ties to even
+    # too.) Check that ties are the only difference.
     ieee = vectors.astype(np.float16).astype(np.float32)
     differ = decoded != ieee
     x = vectors[differ].astype(np.float64)
@@ -217,17 +236,103 @@ def build_fp16(name: str, count: int, dim: int, metric: str, out: pathlib.Path) 
     return expected
 
 
+def build_bf16(name: str, count: int, dim: int, metric: str, out: pathlib.Path) -> dict:
+    rng = np.random.default_rng(SEED)
+    vectors = rng.standard_normal((count, dim), dtype=np.float32)
+    if metric == "ip":
+        vectors /= np.linalg.norm(vectors, axis=1, keepdims=True)
+
+    faiss_metric, metric_name = METRICS[metric]
+    hnsw = faiss.IndexHNSWSQ(dim, faiss.ScalarQuantizer.QT_bf16, M, faiss_metric)
+    hnsw.hnsw.efConstruction = EF_CONSTRUCTION
+    index = faiss.IndexIDMap(hnsw)
+    labels = np.arange(count, dtype=np.int64) + LABEL_OFFSET
+    index.add_with_ids(vectors, labels)
+
+    path = out / f"{name}.faiss"
+    faiss.write_index(index, str(path))
+
+    graph = hnsw.hnsw
+    levels = faiss.vector_to_array(graph.levels)
+    storage = faiss.downcast_index(hnsw.storage)
+    sq = storage.sq
+    codes = faiss.vector_to_array(storage.codes)
+    # Each code is the top half of a float32's bits: decoding shifts it
+    # back, and gives what Faiss reconstructs.
+    halves = codes.view("<u2")
+    decoded = (halves.astype(np.uint32) << 16).view(np.float32).reshape(count, dim)
+    assert np.array_equal(decoded, storage.reconstruct_n(0, count))
+    # On the portable level main() requires, Faiss encodes as the Faiss
+    # that k-NN 3.9.0 builds does (`encode_bf16`): add half of the dropped
+    # bits and keep the top 16, rounding a tie away from zero.
+    bits = vectors.view(np.uint32).astype(np.uint64)
+    assert np.array_equal(halves, ((bits + 0x8000) >> 16).astype(np.uint16).reshape(-1))
+    expected = {
+        "file": path.name,
+        "size": path.stat().st_size,
+        "faiss_version": faiss.__version__,
+        "seed": SEED,
+        "layout": ["IxMp", "IHNs", "IxSQ"],
+        "dimension": dim,
+        "count": count,
+        "metric": metric_name,
+        "faiss_metric_type": int(faiss_metric),
+        "hnsw": {
+            "m": M,
+            "ef_construction": graph.efConstruction,
+            "ef_search": graph.efSearch,
+            "max_level": graph.max_level,
+            "entry_point": graph.entry_point,
+            "level_counts": [int((levels > i).sum()) for i in range(graph.max_level + 1)],
+            "levels_len": int(graph.levels.size()),
+            "offsets_len": int(graph.offsets.size()),
+            "neighbors_len": int(graph.neighbors.size()),
+            "levels_crc32": crc32_of(levels),
+        },
+        "sq": {
+            "qtype": int(sq.qtype),
+            "qtype_name": "QT_bf16",
+            "rangestat": int(sq.rangestat),
+            "rangestat_arg": float(sq.rangestat_arg),
+            "d": int(sq.d),
+            "code_size": int(sq.code_size),
+            "trained_len": int(sq.trained.size()),
+        },
+        "ids": {
+            "len": int(count),
+            "first": int(labels[0]),
+            "last": int(labels[-1]),
+            "crc32": crc32_of(faiss.vector_to_array(index.id_map)),
+        },
+        "codes": {
+            "bytes": int(codes.size),
+            "crc32": crc32_of(codes),
+            "first_decoded": decoded[0].tolist(),
+        },
+    }
+    with open(out / f"{name}.expected.json", "w", encoding="utf-8", newline="\n") as f:
+        json.dump(expected, f, indent=2)
+        f.write("\n")
+    return expected
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument("--out", type=pathlib.Path, default=pathlib.Path("fixtures/synthetic"))
     parser.add_argument("--fp16-out", type=pathlib.Path, default=pathlib.Path("fixtures/synthetic-fp16"))
+    parser.add_argument("--bf16-out", type=pathlib.Path, default=pathlib.Path("fixtures/synthetic-bf16"))
     args = parser.parse_args()
 
+    level = faiss.SIMDConfig.get_level_name()
+    if level != "NONE":
+        raise SystemExit(f"Faiss runs its {level} code; use a portable build")
     faiss.omp_set_num_threads(1)
     args.out.mkdir(parents=True, exist_ok=True)
     args.fp16_out.mkdir(parents=True, exist_ok=True)
+    args.bf16_out.mkdir(parents=True, exist_ok=True)
     built = [build(n, c, d, m, args.out) for n, c, d, m in CASES]
     built += [build_fp16(n, c, d, m, args.fp16_out) for n, c, d, m in FP16_CASES]
+    built += [build_bf16(n, c, d, m, args.bf16_out) for n, c, d, m in BF16_CASES]
     for e in built:
         print(
             f"{e['file']:<22} {e['size']:>9} bytes  d={e['dimension']:<4} n={e['count']:<5} "

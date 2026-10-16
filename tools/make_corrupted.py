@@ -9,8 +9,8 @@ the manifest, so they need no Python.
 Bare synthetic files carry no footer, so a mutation there exercises just
 the structural check it targets; the real OpenSearch file carries a
 footer, so it is used for the envelope and checksum cases. The `fp16-`
-cases mutate the smallest synthetic fp16 file, for the checks that read
-the scalar quantizer and its half-float codes.
+and `bf16-` cases mutate the smallest synthetic fp16 and bf16 files, for
+the checks that read the scalar quantizer and its codes.
 
 Usage:
     python tools/make_corrupted.py [--out fixtures/corrupted]
@@ -31,6 +31,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 SYNTHETIC_L2 = ROOT / "fixtures/synthetic/l2-100x4.faiss"
 SYNTHETIC_IP = ROOT / "fixtures/synthetic/ip-100x4.faiss"
 SYNTHETIC_FP16 = ROOT / "fixtures/synthetic-fp16/l2-100x4-fp16.faiss"
+SYNTHETIC_BF16 = ROOT / "fixtures/synthetic-bf16/l2-100x4-bf16.faiss"
 REAL_L2 = ROOT / "fixtures/opensearch-3.9.0/nocfs/l2/_2_165_vec.faiss"
 
 
@@ -247,10 +248,10 @@ def build() -> Cases:
 
     # --- fp16: the scalar quantizer and its codes ---
     def fp16_qtype(d, f):
-        put(d, f["storage.sq.qtype"]["offset"], "<i", 7)
+        put(d, f["storage.sq.qtype"]["offset"], "<i", 8)
         return d
 
-    c.add("fp16-unsupported-qtype", SYNTHETIC_FP16, "quantizer type set to 7 (QT_bf16)", "structure", "failure", fp16_qtype)
+    c.add("fp16-unsupported-qtype", SYNTHETIC_FP16, "quantizer type set to 8 (QT_8bit_direct_signed)", "structure", "failure", fp16_qtype)
 
     def fp16_sq_dim(d, f):
         put(d, f["storage.sq.d"]["offset"], "<Q", 5)
@@ -290,6 +291,12 @@ def build() -> Cases:
         return d
 
     c.add("fp16-inf-code", SYNTHETIC_FP16, "vector 1 component 0 set to half-float -inf", "vector_values", "warning", fp16_inf)
+
+    def bf16_nan(d, f):
+        put(d, f["storage.codes.data"]["offset"] + 2 * 2, "<H", 0x7FC0)
+        return d
+
+    c.add("bf16-nan-code", SYNTHETIC_BF16, "vector 0 component 2 set to a bfloat16 NaN", "vector_values", "warning", bf16_nan)
 
     return c
 

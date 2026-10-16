@@ -17,21 +17,32 @@ Usage:
 Writes, next to each synthetic fixture, `<name>.queries.f32`,
 `<name>.results.jsonl`, and `<name>.recall.json`; next to each real
 fixture's manifest, `queries.f32`, `results.jsonl`, and `recall.json`;
-float and fp16 fixtures alike. For fp16 storage the brute force runs over
-the vectors Faiss decodes from the codes. Rewrite them whenever the
-fixtures are regenerated.
+float, fp16, and bf16 fixtures alike. For scalar-quantized storage the
+brute force runs over the vectors Faiss decodes from the codes. Rewrite
+them whenever the fixtures are regenerated.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import pathlib
 
-import faiss
-import numpy as np
+# Faiss's portable code on every CPU, as the committed baselines were
+# made: its scalar-quantizer distances are in-order sums over float32
+# queries, which the Rust search reproduces exactly. A dynamic-dispatch
+# build (the Linux and macOS wheels) picks its SIMD level from
+# FAISS_SIMD_LEVEL when it loads, and its SIMD code regroups those sums
+# and, on a CPU with AVX512-BF16, rounds bf16 queries. The Windows wheels
+# are portable already. A build compiled for one SIMD level ignores the
+# variable, so main() checks the level Faiss reports.
+os.environ["FAISS_SIMD_LEVEL"] = "NONE"
 
-from strip_envelope import parse_footer, parse_header
+import faiss  # noqa: E402
+import numpy as np  # noqa: E402
+
+from strip_envelope import parse_footer, parse_header  # noqa: E402
 
 QUERIES = 100
 K = 10
@@ -54,7 +65,7 @@ def baseline(path: pathlib.Path, out_dir: pathlib.Path, prefix: str) -> dict:
     d = storage.d
     metric = storage.metric_type
     # The stored vectors as Faiss reads them: a copy of float32 storage, or
-    # fp16 codes decoded (exactly) to float32.
+    # fp16 or bf16 codes decoded (exactly) to float32.
     vectors = storage.reconstruct_n(0, storage.ntotal)
     labels = faiss.vector_to_array(index.id_map)
 
@@ -116,12 +127,17 @@ def main() -> None:
     parser.add_argument("--fixtures", type=pathlib.Path, required=True)
     args = parser.parse_args()
 
+    level = faiss.SIMDConfig.get_level_name()
+    if level != "NONE":
+        raise SystemExit(f"Faiss runs its {level} code; use a portable build")
     faiss.omp_set_num_threads(1)
-    for synthetic in ("synthetic", "synthetic-fp16"):
+    for synthetic in ("synthetic", "synthetic-fp16", "synthetic-bf16"):
         for path in sorted((args.fixtures / synthetic).glob("*.faiss")):
             baseline(path, path.parent, f"{path.stem}.")
     for manifest in sorted(
-        m for real in ("opensearch-3.9.0", "opensearch-3.9.0-fp16") for m in (args.fixtures / real).glob("*/*/manifest.json")
+        m
+        for real in ("opensearch-3.9.0", "opensearch-3.9.0-fp16", "opensearch-3.9.0-bf16")
+        for m in (args.fixtures / real).glob("*/*/manifest.json")
     ):
         files = json.loads(manifest.read_text(encoding="utf-8"))["files"]
         native = next(f["name"] for f in files if f["name"].endswith((".faiss", ".faissc")))

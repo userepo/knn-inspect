@@ -86,8 +86,8 @@ pub enum Check {
     /// No bytes between the index and the footer.
     Trailing,
     /// The three Faiss headers agree and hold supported values; for fp16
-    /// storage, the quantizer's dimension and code size match them and
-    /// it holds no trained values.
+    /// and bf16 storage, the quantizer's dimension and code size match them
+    /// and it holds no trained values.
     Headers,
     /// `--space` matches the metric the file records.
     Metric,
@@ -103,7 +103,7 @@ pub enum Check {
     /// that steps to one that is not reads the wrong node's slots.
     NeighborLevels,
     /// The storage holds exactly `count x dimension` components: float32
-    /// elements, or two bytes each of fp16 codes.
+    /// elements, or two bytes each of fp16 or bf16 codes.
     VectorCount,
     /// The ID map holds one label per node.
     IdMapLength,

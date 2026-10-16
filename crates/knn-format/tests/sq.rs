@@ -1,6 +1,7 @@
-//! The parser against the fp16 fixtures (`IxMp` > `IHNs` > `IxSQ`): the
-//! synthetic ones judged by the values Faiss Python recorded beside each
-//! file, the real ones by Lucene's own copy of the same vectors.
+//! The parser against the scalar-quantized fixtures, fp16 and bf16
+//! (`IxMp` > `IHNs` > `IxSQ`): the synthetic ones judged by the values
+//! Faiss Python recorded beside each file, the real ones by Lucene's own
+//! copy of the same vectors.
 
 #![allow(
     clippy::unwrap_used,
@@ -17,7 +18,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use knn_format::faiss::{
-    FourCc, Fp16Storage, HalfRounding, Metric, QT_FP16, Storage, f16_to_f32, quantizer_type_name,
+    CodeFormat, FourCc, HalfRounding, Metric, QT_BF16, QT_FP16, SqStorage, Storage, bf16_rounds_to,
+    bf16_to_f32, f16_to_f32, f32_to_bf16, quantizer_type_name,
 };
 use knn_format::{Error, NativeFile};
 use serde::Deserialize;
@@ -89,44 +91,47 @@ struct Manifest {
     dimension: usize,
 }
 
-/// The fp16 storage of a parsed file, which must be what it holds.
-fn fp16<'a>(storage: &'a Storage<'_>, name: &str) -> &'a Fp16Storage<'a> {
+/// The scalar-quantized storage of a parsed file, which must be what it
+/// holds.
+fn sq<'a>(storage: &'a Storage<'_>, name: &str) -> &'a SqStorage<'a> {
     match storage {
-        Storage::Fp16(s) => s,
-        Storage::Flat(_) => panic!("{name}: expected fp16 storage"),
+        Storage::Sq(s) => s,
+        Storage::Flat(_) => panic!("{name}: expected scalar-quantized storage"),
     }
 }
 
 fn synthetic_cases() -> Vec<(PathBuf, Expected)> {
-    let dir = fixtures().join("synthetic-fp16");
-    let mut cases: Vec<_> = fs::read_dir(&dir)
-        .unwrap()
-        .map(|e| e.unwrap().path())
-        .filter(|p| p.to_string_lossy().ends_with(".expected.json"))
-        .map(|p| {
-            let expected: Expected = serde_json::from_slice(&fs::read(&p).unwrap()).unwrap();
-            (dir.join(&expected.file), expected)
-        })
-        .collect();
+    let mut cases = Vec::new();
+    for set in ["synthetic-fp16", "synthetic-bf16"] {
+        let dir = fixtures().join(set);
+        for entry in fs::read_dir(&dir).unwrap() {
+            let p = entry.unwrap().path();
+            if p.to_string_lossy().ends_with(".expected.json") {
+                let expected: Expected = serde_json::from_slice(&fs::read(&p).unwrap()).unwrap();
+                cases.push((dir.join(&expected.file), expected));
+            }
+        }
+    }
     cases.sort_by(|a, b| a.0.cmp(&b.0));
     assert_eq!(
         cases.len(),
-        3,
-        "three synthetic fp16 fixtures are committed"
+        6,
+        "three synthetic fixtures each, fp16 and bf16"
     );
     cases
 }
 
 /// One native file per space for each of the two ways k-NN stores fp16
-/// (the `sq` encoder and `half_float`).
+/// (the `sq` encoder and `half_float`) and for the `sq` encoder's bf16.
 fn real_cases() -> Vec<(PathBuf, Manifest)> {
     let mut cases = Vec::new();
-    for encoding in ["sq-fp16", "half-float"] {
+    for (set, encoding) in [
+        ("opensearch-3.9.0-fp16", "sq-fp16"),
+        ("opensearch-3.9.0-fp16", "half-float"),
+        ("opensearch-3.9.0-bf16", "sq-bf16"),
+    ] {
         for space in ["l2", "innerproduct", "cosinesimil"] {
-            let dir = fixtures()
-                .join("opensearch-3.9.0-fp16")
-                .join(encoding)
-                .join(space);
+            let dir = fixtures().join(set).join(encoding).join(space);
             let manifest: Manifest =
                 serde_json::from_slice(&fs::read(dir.join("manifest.json")).unwrap()).unwrap();
             assert_eq!(manifest.encoding, encoding);
@@ -151,7 +156,7 @@ fn synthetic_fixtures_match_faiss_python() {
         let idx = &parsed.index;
         let layout: Vec<String> = idx.layout().iter().map(ToString::to_string).collect();
         assert_eq!(layout, e.layout, "{name}: layout");
-        let storage = fp16(&idx.index.storage, name);
+        let storage = sq(&idx.index.storage, name);
         for (what, header) in [
             ("idmap", &idx.header),
             ("hnsw", &idx.index.header),
@@ -184,6 +189,7 @@ fn synthetic_fixtures_match_faiss_python() {
 
         let q = &storage.quantizer;
         assert_eq!(q.qtype, e.sq.qtype, "{name}: qtype");
+        assert_eq!(storage.format.qtype(), e.sq.qtype, "{name}: format");
         assert_eq!(quantizer_type_name(q.qtype), Some(e.sq.qtype_name.as_str()));
         assert_eq!(q.rangestat, e.sq.rangestat, "{name}");
         assert_eq!(q.rangestat_arg, e.sq.rangestat_arg, "{name}");
@@ -210,13 +216,13 @@ fn synthetic_fixtures_match_faiss_python() {
             .vector(0)
             .unwrap()
             .iter()
-            .map(|h| f16_to_f32(h.get()))
+            .map(|h| storage.format.decode(h.get()))
             .collect();
         assert_eq!(first, e.codes.first_decoded, "{name}: first vector");
         assert_eq!(storage.row_count(), e.count as usize, "{name}");
         assert!(storage.vector(e.count as usize).is_none(), "{name}");
 
-        // The storage-agnostic accessors agree with the fp16 view.
+        // The storage-agnostic accessors agree with the codes' view.
         let all = &idx.index.storage;
         assert_eq!(all.fourcc(), FourCc::SCALAR_QUANTIZER);
         assert_eq!(all.component_size(), 2);
@@ -278,11 +284,17 @@ fn real_fixtures_parse_and_match_lucene() {
             "innerproduct" | "cosinesimil" => Metric::InnerProduct,
             other => panic!("unexpected space {other}"),
         };
-        let storage = fp16(&idx.index.storage, &name);
+        let storage = sq(&idx.index.storage, &name);
         assert_eq!(storage.header.metric(), expected_metric, "{name}");
         assert_eq!(idx.header.d as usize, m.dimension, "{name}");
         assert_eq!(idx.header.ntotal as usize, m.count, "{name}");
-        assert_eq!(storage.quantizer.qtype, QT_FP16, "{name}");
+        let (qtype, format) = if m.encoding == "sq-bf16" {
+            (QT_BF16, CodeFormat::Bf16)
+        } else {
+            (QT_FP16, CodeFormat::Fp16)
+        };
+        assert_eq!(storage.quantizer.qtype, qtype, "{name}");
+        assert_eq!(storage.format, format, "{name}");
         assert_eq!(storage.quantizer.d as usize, m.dimension, "{name}");
         assert_eq!(
             storage.quantizer.code_size as usize,
@@ -300,7 +312,10 @@ fn real_fixtures_parse_and_match_lucene() {
 
         // Lucene's .vec of the segment holds the same vectors from offset
         // 128: the codes themselves for half_float, and for the sq
-        // encoder the float32 vectors the codes were rounded from.
+        // encoder the float32 vectors the codes were rounded from, by
+        // whichever of Faiss's fp16 tie rules the build used. For bf16,
+        // `5616caa`, the Faiss that k-NN 3.9.0 builds, has only the portable
+        // encoder, so these files must follow its rule exactly.
         let dir = path.parent().unwrap();
         let data = 128;
         if m.encoding == "half-float" {
@@ -325,10 +340,14 @@ fn real_fixtures_parse_and_match_lucene() {
                 .iter()
                 .map(|c| u16::from_le_bytes(*c));
             for (i, (x, code)) in floats.zip(codes).enumerate() {
+                let rounds = match format {
+                    CodeFormat::Fp16 => is_nearest_half(x, code),
+                    CodeFormat::Bf16 => nearest_bf16_away(x) == code,
+                };
                 assert!(
-                    is_nearest_half(x, code),
+                    rounds,
                     "{name}: component {i}: {x} stored as {}",
-                    f16_to_f32(code)
+                    format.decode(code)
                 );
             }
         }
@@ -374,7 +393,7 @@ fn small() -> Vec<u8> {
 fn offsets_agree_with_the_walker() {
     let bytes = small();
     let parsed = knn_format::parse(&bytes).unwrap();
-    let storage = fp16(&parsed.index.index.storage, "l2-100x4-fp16");
+    let storage = sq(&parsed.index.index.storage, "l2-100x4-fp16");
     assert_eq!(storage.header.offset, SQ_TAG);
     assert_eq!(storage.quantizer.offset, QTYPE);
     // The codes' byte count (800) at 14,699 and the codes at 14,707.
@@ -384,19 +403,29 @@ fn offsets_agree_with_the_walker() {
 #[test]
 fn other_quantizer_types_are_unsupported() {
     let mut bytes = small();
-    bytes[QTYPE..QTYPE + 4].copy_from_slice(&7_i32.to_le_bytes());
+    // QT_8bit_direct_signed: what k-NN writes for byte vectors.
+    bytes[QTYPE..QTYPE + 4].copy_from_slice(&8_i32.to_le_bytes());
     let err = knn_format::parse(&bytes).unwrap_err();
     assert!(
         matches!(
             err,
             Error::UnsupportedQuantizer {
                 offset: QTYPE,
-                qtype: 7
+                qtype: 8
             }
         ),
         "{err:?}"
     );
-    assert!(err.to_string().contains("QT_bf16"), "{err}");
+    assert!(err.to_string().contains("QT_8bit_direct_signed"), "{err}");
+    assert!(err.to_string().contains("7 (QT_bf16)"), "{err}");
+
+    // QT_bf16 in the same place reads, as bf16 codes.
+    bytes[QTYPE..QTYPE + 4].copy_from_slice(&7_i32.to_le_bytes());
+    let parsed = knn_format::parse(&bytes).unwrap();
+    assert_eq!(
+        sq(&parsed.index.index.storage, "bf16").format,
+        CodeFormat::Bf16
+    );
 
     bytes[QTYPE..QTYPE + 4].copy_from_slice(&99_i32.to_le_bytes());
     let err = knn_format::parse(&bytes).unwrap_err();
@@ -467,7 +496,7 @@ fn an_odd_code_length_parses_and_keeps_whole_rows_only() {
     // fewer whole row.
     let bytes = small();
     let parsed = knn_format::parse(&bytes).unwrap();
-    let codes = fp16(&parsed.index.index.storage, "l2-100x4-fp16").codes;
+    let codes = sq(&parsed.index.index.storage, "l2-100x4-fp16").codes;
     let start = knn_format::view_offset(&bytes, codes).unwrap();
     let end = start + codes.len();
     let mut cut = bytes[..end - 1].to_vec();
@@ -476,7 +505,7 @@ fn an_odd_code_length_parses_and_keeps_whole_rows_only() {
 
     let parsed = knn_format::parse(&cut).unwrap();
     let storage = &parsed.index.index.storage;
-    let s = fp16(storage, "cut");
+    let s = sq(storage, "cut");
     assert_eq!(s.codes.len(), 799);
     assert_eq!(s.row_count(), 99);
     assert!(s.vector(99).is_none());
@@ -580,4 +609,155 @@ fn random_floats_round_to_the_codes_the_oracle_picks() {
         assert!(matches!(ours.len(), 1 | 2), "{x}: {ours:?}");
         seen += 1;
     }
+}
+
+/// The bfloat16 codes either side of `x`, truncated and one up, with
+/// their distances from it, worked out from the codes' values apart from
+/// the library's bit arithmetic. Past the largest finite bfloat16 the
+/// upper candidate is infinity, which counts as 2^128 here, where its bits
+/// would put it.
+fn bf16_candidates(x: f32) -> [(u16, f64); 2] {
+    let truncated = (x.to_bits() >> 16) as u16;
+    let up = truncated + 1;
+    let value = |code: u16| {
+        if code & 0x7fff == 0x7f80 {
+            2_f64.powi(128).copysign(f64::from(x))
+        } else {
+            f64::from(bf16_to_f32(code))
+        }
+    };
+    let x = f64::from(x);
+    [
+        (truncated, (value(truncated) - x).abs()),
+        (up, (value(up) - x).abs()),
+    ]
+}
+
+/// `x` rounded to bfloat16 to the nearest, a tie away from zero: the rule
+/// of Faiss's portable encoder.
+fn nearest_bf16_away(x: f32) -> u16 {
+    let [(down, below), (up, above)] = bf16_candidates(x);
+    if above <= below { up } else { down }
+}
+
+/// `x` rounded to bfloat16 to the nearest, a tie to the even code, and a
+/// subnormal to a zero of its sign: the rule of Faiss's AVX512-BF16
+/// encoder.
+fn nearest_bf16_even(x: f32) -> u16 {
+    if x.is_subnormal() {
+        return if x.is_sign_negative() { 0x8000 } else { 0 };
+    }
+    let [(down, below), (up, above)] = bf16_candidates(x);
+    let nearer = above.total_cmp(&below);
+    if nearer.is_lt() || (nearer.is_eq() && up & 1 == 0) {
+        up
+    } else {
+        down
+    }
+}
+
+/// Every high half with its low half at zero, just below a tie, on the
+/// tie, and just above, for every finite bfloat16; then a fixed xorshift
+/// sample of finite float32 values.
+fn bf16_samples() -> Vec<f32> {
+    let mut samples = Vec::new();
+    for high in 0..=u16::MAX {
+        if high & 0x7fff >= 0x7f80 {
+            continue;
+        }
+        for low in [0_u32, 0x7fff, 0x8000, 0x8001, 0xffff] {
+            samples.push(f32::from_bits((u32::from(high) << 16) | low));
+        }
+    }
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    for _ in 0..100_000 {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let x = f32::from_bits((state >> 32) as u32);
+        if x.is_finite() {
+            samples.push(x);
+        }
+    }
+    assert!(samples.len() > 400_000, "{} values", samples.len());
+    samples
+}
+
+#[test]
+fn bfloat16s_decode_exactly() {
+    for bits in 0..=u16::MAX {
+        let got = bf16_to_f32(bits);
+        let negative = bits & 0x8000 != 0;
+        let exponent = i32::from((bits >> 7) & 0xff);
+        let mantissa = f64::from(bits & 0x7f);
+        if exponent == 0xff {
+            // Infinity, or NaN with the payload kept.
+            assert_eq!(got.to_bits(), u32::from(bits) << 16, "{bits:#06x}");
+            continue;
+        }
+        let magnitude = if exponent == 0 {
+            mantissa * 2_f64.powi(-133)
+        } else {
+            (128.0 + mantissa) * 2_f64.powi(exponent - 134)
+        };
+        let expected = if negative { -magnitude } else { magnitude };
+        assert_eq!(f64::from(got), expected, "{bits:#06x}");
+        assert_eq!(got.is_sign_negative(), negative, "{bits:#06x}: sign");
+    }
+}
+
+#[test]
+fn bf16_encoding_rounds_to_nearest_and_ties_away() {
+    for x in bf16_samples() {
+        assert_eq!(
+            f32_to_bf16(x),
+            nearest_bf16_away(x),
+            "{x} ({:#010x})",
+            x.to_bits()
+        );
+    }
+    // A tie goes away from zero whichever way the even code lies.
+    assert_eq!(f32_to_bf16(f32::from_bits(0x3f80_8000)), 0x3f81);
+    assert_eq!(f32_to_bf16(f32::from_bits(0x3f81_8000)), 0x3f82);
+    assert_eq!(f32_to_bf16(f32::from_bits(0xbf80_8000)), 0xbf81);
+    // From the midpoint above the largest finite bfloat16, infinity.
+    assert_eq!(f32_to_bf16(f32::from_bits(0x7f7f_8000)), 0x7f80);
+    assert_eq!(f32_to_bf16(f32::MAX), 0x7f80);
+}
+
+#[test]
+fn bf16_codes_of_either_faiss_encoder_are_accepted() {
+    // Each value is accepted with the code each rule gives and with none
+    // of their neighbors or the zeros, unless one rule gives that code.
+    let mut split = 0;
+    for x in bf16_samples() {
+        let rules = [nearest_bf16_away(x), nearest_bf16_even(x)];
+        if rules[0] != rules[1] {
+            split += 1;
+        }
+        for code in rules {
+            for c in [code.wrapping_sub(1), code, code.wrapping_add(1), 0, 0x8000] {
+                assert_eq!(
+                    bf16_rounds_to(x, c),
+                    rules.contains(&c),
+                    "{x} ({:#010x}) as {c:#06x}",
+                    x.to_bits()
+                );
+            }
+        }
+    }
+    assert!(split > 30_000, "{split} values the rules split");
+    // A tie above an even code: rounding to even keeps it, away from zero
+    // takes the odd code above.
+    assert!(bf16_rounds_to(f32::from_bits(0x3f80_8000), 0x3f80));
+    assert!(bf16_rounds_to(f32::from_bits(0x3f80_8000), 0x3f81));
+    // Above an odd code, both rules round up.
+    assert!(!bf16_rounds_to(f32::from_bits(0x3f81_8000), 0x3f81));
+    assert!(bf16_rounds_to(f32::from_bits(0x3f81_8000), 0x3f82));
+    // A subnormal rounds, or reads as a zero of its sign.
+    assert!(bf16_rounds_to(f32::from_bits(0x0040_0000), 0x0040));
+    assert!(bf16_rounds_to(f32::from_bits(0x0040_0000), 0x0000));
+    assert!(!bf16_rounds_to(f32::from_bits(0x0040_0000), 0x8000));
+    assert!(bf16_rounds_to(f32::from_bits(0x8040_0000), 0x8000));
+    assert!(!bf16_rounds_to(f32::from_bits(0x8040_0000), 0x0000));
 }

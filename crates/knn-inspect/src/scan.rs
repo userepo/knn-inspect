@@ -12,7 +12,7 @@ use clap::Args;
 use knn_check::{Options, Severity, Space, Status};
 use knn_format::U16;
 use knn_format::envelope::Envelope;
-use knn_format::faiss::{HalfRounding, Storage};
+use knn_format::faiss::{CodeFormat, HalfRounding, Storage, bf16_rounds_to};
 use knn_format::segment_info::SegmentInfo;
 use knn_format::{NativeFile, view_offset};
 use serde::Serialize;
@@ -147,8 +147,8 @@ enum CrossCheck {
     /// Not compared: the Lucene file is not beside the native file (a
     /// compound segment keeps its `.vec` inside the `.cfs`), is a sound
     /// file in a format this tool does not read, repeats its values too
-    /// much to search for fp16 codes' float32 sources in bounded time, or
-    /// there was nothing to compare. `detail` says which.
+    /// much to search for scalar-quantized codes' float32 sources in
+    /// bounded time, or there was nothing to compare. `detail` says which.
     Skipped,
 }
 
@@ -471,11 +471,11 @@ fn lucene_vectors(path: &Path, bytes: &[u8], parsed: &knn_format::Parsed<'_>) ->
         ));
     }
     // The bytes to look for: float32 storage as it lies in the file, or
-    // every whole fp16 code, which a half_float field's .vec holds byte for
-    // byte. An sq fp16 field's .vec holds the float32 vectors the codes
-    // were rounded from instead, so fp16 codes are also looked for that
-    // way.
-    let (storage, halves) = match &parsed.index.index.storage {
+    // every whole code, which a half_float field's .vec holds byte for
+    // byte. The .vec of an sq fp16 or bf16 field holds the float32 vectors
+    // the codes were rounded from instead, so codes are also looked for
+    // that way.
+    let (storage, sources) = match &parsed.index.index.storage {
         Storage::Flat(flat) => {
             let codes = flat.codes;
             let Some(storage) = view_offset(bytes, codes).and_then(|start| {
@@ -485,9 +485,9 @@ fn lucene_vectors(path: &Path, bytes: &[u8], parsed: &knn_format::Parsed<'_>) ->
             };
             (storage, None)
         }
-        Storage::Fp16(fp16) => (
-            fp16.codes.get(..fp16.codes.len() & !1).unwrap_or_default(),
-            Some(fp16.components()),
+        Storage::Sq(sq) => (
+            sq.codes.get(..sq.codes.len() & !1).unwrap_or_default(),
+            Some((sq.components(), sq.format)),
         ),
     };
     if storage.is_empty() {
@@ -512,7 +512,7 @@ fn lucene_vectors(path: &Path, bytes: &[u8], parsed: &knn_format::Parsed<'_>) ->
         };
         let vec = mapped.bytes();
         let sound = lucene_footer(vec);
-        let located = locate(vec, storage, halves);
+        let located = locate(vec, storage, sources);
         if let Located::At(offset, how) = located {
             let found = format!("{rows} vectors found {how} at offset {offset}");
             let (status, detail) = match sound {
@@ -550,7 +550,7 @@ fn lucene_vectors(path: &Path, bytes: &[u8], parsed: &knn_format::Parsed<'_>) ->
     // A search that gave up cannot say the vectors are not there.
     if !repetitive.is_empty() {
         return skipped(format!(
-            "the float32 values of {} repeat too much to search for the fp16 codes' sources in bounded time",
+            "the float32 values of {} repeat too much to search for the codes' sources in bounded time",
             repetitive.join(", ")
         ));
     }
@@ -616,27 +616,54 @@ enum Located {
     At(usize, &'static str),
     /// Not in the file.
     Absent,
-    /// The search for fp16 codes' float32 sources gave up.
+    /// The search for the codes' float32 sources gave up.
     GaveUp,
 }
 
-/// Looks for `storage` byte for byte, then, for fp16 codes (`halves`),
-/// for the float32 values they were rounded from.
-fn locate(vec: &[u8], storage: &[u8], halves: Option<&[U16]>) -> Located {
+/// Looks for `storage` byte for byte, then, for scalar-quantized codes
+/// (`sources`), for the float32 values they were rounded from.
+fn locate(vec: &[u8], storage: &[u8], sources: Option<(&[U16], CodeFormat)>) -> Located {
     if let Some(offset) = find(vec, storage) {
         return Located::At(offset, "byte for byte");
     }
-    match halves.map(|h| find_rounded(vec, h)) {
-        Some(Rounded::Found(offset)) => Located::At(
-            offset,
-            "as float32 values that round to the stored half floats",
-        ),
+    match sources.map(|(codes, format)| find_rounded(vec, codes, format)) {
+        Some(Rounded::Found(offset)) => {
+            Located::At(offset, "as float32 values that round to the stored codes")
+        }
         Some(Rounded::GaveUp) => Located::GaveUp,
         Some(Rounded::Missing) | None => Located::Absent,
     }
 }
 
-/// How a search for fp16 codes' float32 sources ended.
+/// What a float32 value must round to: a code, by its format's rule.
+#[derive(Debug, Clone, Copy)]
+enum Target {
+    /// Into this range, which allows for either of Faiss's fp16 tie rules.
+    Fp16(HalfRounding),
+    /// To this code, by either of Faiss's bf16 encoders.
+    Bf16(u16),
+}
+
+impl Target {
+    /// The target of `code`, or `None` for an fp16 infinity or NaN, which
+    /// `HalfRounding` does not match: k-NN rejects fp16 values beyond
+    /// ±65504, so it stores neither.
+    fn of(format: CodeFormat, code: u16) -> Option<Self> {
+        match format {
+            CodeFormat::Fp16 => HalfRounding::of(code).map(Self::Fp16),
+            CodeFormat::Bf16 => Some(Self::Bf16(code)),
+        }
+    }
+
+    fn hit(&self, x: f32) -> bool {
+        match self {
+            Self::Fp16(range) => range.contains(x),
+            Self::Bf16(code) => bf16_rounds_to(x, *code),
+        }
+    }
+}
+
+/// How a search for scalar-quantized codes' float32 sources ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Rounded {
     /// The sources start at this offset.
@@ -647,16 +674,16 @@ enum Rounded {
     GaveUp,
 }
 
-/// Looks in `vec` for float32 values that round, one by one, to `codes`.
-/// Lucene starts float32 vector data at a multiple of 4 bytes (Lucene
-/// 10.5.1 at a multiple of 64), so only those offsets are tried. Each
-/// offset whose first value rounds to the first code is followed until a
-/// value does not. On data that repeats long runs, following every such
-/// offset would take quadratic time, so the follow-up work is capped at
-/// about four passes over the file; past that the search gives up.
-/// Nothing is allocated.
-fn find_rounded(vec: &[u8], codes: &[U16]) -> Rounded {
-    let Some(first) = codes.first().and_then(|c| HalfRounding::of(c.get())) else {
+/// Looks in `vec` for float32 values that round, one by one, to `codes`
+/// in `format`. Lucene starts float32 vector data at a multiple of 4
+/// bytes (Lucene 10.5.1 at a multiple of 64), so only those offsets are
+/// tried. Each offset whose first value rounds to the first code is
+/// followed until a value does not. On data that repeats long runs,
+/// following every such offset would take quadratic time, so the
+/// follow-up work is capped at about four passes over the file; past that
+/// the search gives up. Nothing is allocated.
+fn find_rounded(vec: &[u8], codes: &[U16], format: CodeFormat) -> Rounded {
+    let Some(first) = codes.first().and_then(|c| Target::of(format, c.get())) else {
         return Rounded::Missing;
     };
     let (words, _) = vec.as_chunks::<4>();
@@ -667,7 +694,7 @@ fn find_rounded(vec: &[u8], codes: &[U16]) -> Rounded {
     for (index, window) in words.windows(codes.len()).enumerate() {
         if !window
             .first()
-            .is_some_and(|w| first.contains(f32::from_le_bytes(*w)))
+            .is_some_and(|w| first.hit(f32::from_le_bytes(*w)))
         {
             continue;
         }
@@ -677,7 +704,7 @@ fn find_rounded(vec: &[u8], codes: &[U16]) -> Rounded {
                 return Rounded::GaveUp;
             };
             budget = left;
-            if !HalfRounding::of(code.get()).is_some_and(|r| r.contains(f32::from_le_bytes(*w))) {
+            if !Target::of(format, code.get()).is_some_and(|t| t.hit(f32::from_le_bytes(*w))) {
                 all = false;
                 break;
             }

@@ -1,7 +1,7 @@
 # Native file format notes
 
-What a k-NN native file for a float or fp16 HNSW field looks like on
-disk, confirmed byte by byte against the pinned sources and fixture
+What a k-NN native file for a float, fp16, or bf16 HNSW field looks like
+on disk, confirmed byte by byte against the pinned sources and fixture
 files. The Rust parser in `knn-format` is checked against this document
 and the Python walker in `tools/walk_faiss.py`, which is a direct
 transcription of the Faiss read path.
@@ -166,7 +166,8 @@ walker's dimension, count, metric, level counts, entry point, and
 ## Scalar-quantized storage (fp16)
 
 `knn-inspect` reads these files with every command. Any quantizer type
-other than `QT_fp16` is reported as unsupported.
+other than `QT_fp16` and `QT_bf16` (see the next section) is reported as
+unsupported.
 
 k-NN stores fp16 vectors through Faiss's scalar quantizer with `QT_fp16`
 in two ways: the `sq` encoder with `type: fp16` (and `bits: 16`, which
@@ -295,6 +296,58 @@ use Lucene's stored copy, not a recomputed one. The `.vec` of the `sq`
 fp16 cosine segment holds the same float32 vectors as the float cosine
 fixture's; the two files differ only in the header's segment ID and the
 checksum.
+
+## Scalar-quantized storage (bf16)
+
+k-NN's `sq` encoder with `type: bf16` (and `bits: 16`) stores vectors
+through Faiss's scalar quantizer with `QT_bf16`, type 7. The native
+layout is the fp16 one above with that type: `IxMp` > `IHNs` > `IxSQ`,
+two bytes per component, a `code_size` of 2 x d, no trained values.
+Before indexing, k-NN only checks that each component is finite
+(`FaissBF16Util` at tag 3.9.0.0), and it refuses the encoder's `clip`.
+bf16 has float32's exponent range, but rounding can still overflow it: a
+component of 3.3962e38 or more (float32 bits `0x7f7f8000` and up, the
+midpoint above the largest finite bfloat16) is stored as infinity. A
+bf16 file k-NN wrote can therefore hold infinite codes, which `verify`
+warns on without their proving damage.
+
+A bfloat16 is the top half of a float32's bits, so decoding shifts it
+left by 16, exactly (`decode_bf16`). At `5616caa` Faiss has one encoder,
+the same in every build (`encode_bf16` in `faiss/utils/bf16.h`; the SIMD
+paths only decode): it adds `0x8000` to the float32's bits and keeps the
+top 16. That rounds to the nearest bfloat16 and a tie away from zero,
+and turns a value from the midpoint above the largest finite bfloat16 on
+into infinity. Later Faiss adds a second, `encode_bf16_simd` (from
+`c000190`, which faiss 1.15.1 has), used by builds that run their
+`AVX512_SPR` code on a CPU with AVX512-BF16: `vcvtneps2bf16` on blocks
+of 16 components, which rounds a tie to even and reads a subnormal
+float32 as a zero of its sign. A check against Lucene's float32 copy
+therefore accepts the code either encoder gives, as it does for fp16's
+two tie rules. Those builds also round the query to bfloat16 for bf16
+distances, where `5616caa` keeps it float32.
+
+### Real bf16 files from OpenSearch 3.9.0
+
+`tools/extract_opensearch.py --encoding sq-bf16` indexes the same 500
+16-dimensional vectors as the other real fixtures, one index per space
+type, compound files off, into
+`fixtures/opensearch-3.9.0-bf16/sq-bf16/`. Each native file is
+`_2_165_vec.faiss`, 91,947 bytes like the fp16 ones, and walks to the
+end with a verifying footer: `IxMp` > `IHNs` > `IxSQ`, `qtype` 7,
+`code_size` 32, a codes count of 16,000 bytes. Lucene's copy is
+`_2_NativeEngines990KnnVectorsFormat_0.vec`
+(`Lucene99FlatVectorsFormatData`), float32 from offset 128 as for the
+`sq` fp16 encoder: the indexed vectors for `l2` and `innerproduct`,
+k-NN's normalized ones for `cosinesimil`. In all three, every code is
+`encode_bf16` of its float32 value. The cosine segment holds one exact
+tie, a value whose low 16 bits are `0x8000`; rounding to even would give
+the same code there, so the files do not tell the rules apart. The Faiss
+that k-NN 3.9.0 builds, at `5616caa`, has only `encode_bf16`.
+
+`tools/make_synthetic.py` writes three bf16 files to
+`fixtures/synthetic-bf16/`, the shapes of the fp16 ones, and asserts
+that every code is `encode_bf16` of its vector and decodes to Faiss's
+own reconstruction.
 
 ## Real files from OpenSearch 3.9.0
 

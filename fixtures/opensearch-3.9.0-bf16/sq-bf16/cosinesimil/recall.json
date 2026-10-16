@@ -1,0 +1,24 @@
+{
+  "file": "_2_165_vec.faiss",
+  "faiss_version": "1.15.1",
+  "queries_file": "queries.f32",
+  "results_file": "results.jsonl",
+  "queries": 100,
+  "dimension": 16,
+  "k": 10,
+  "ef_search": 100,
+  "recall": 1.0,
+  "matches_histogram": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    100
+  ]
+}

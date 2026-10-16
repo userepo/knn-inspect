@@ -125,7 +125,7 @@ pub fn run(path: &Path, json: bool) -> anyhow::Result<ExitCode> {
         metric: storage.header().metric().name(),
         quantizer: match storage {
             Storage::Flat(_) => None,
-            Storage::Fp16(s) => Some(QuantizerReport {
+            Storage::Sq(s) => Some(QuantizerReport {
                 qtype: s.quantizer.qtype,
                 name: quantizer_type_name(s.quantizer.qtype)
                     .unwrap_or("unknown")

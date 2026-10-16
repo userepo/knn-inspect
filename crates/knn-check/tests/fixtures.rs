@@ -63,7 +63,7 @@ fn options(space: Option<Space>) -> Options {
 #[test]
 fn synthetic_fixtures_are_clean() {
     let mut seen = 0;
-    let entries = ["synthetic", "synthetic-fp16"]
+    let entries = ["synthetic", "synthetic-fp16", "synthetic-bf16"]
         .into_iter()
         .flat_map(|d| fs::read_dir(fixtures().join(d)).unwrap());
     for entry in entries {
@@ -93,7 +93,10 @@ fn synthetic_fixtures_are_clean() {
         );
         seen += 1;
     }
-    assert_eq!(seen, 8, "five float and three fp16 synthetic fixtures");
+    assert_eq!(
+        seen, 11,
+        "five float, three fp16, and three bf16 synthetic fixtures"
+    );
 }
 
 #[test]
@@ -104,6 +107,7 @@ fn real_fixtures_are_clean_with_their_space() {
         "opensearch-3.9.0/cfs",
         "opensearch-3.9.0-fp16/sq-fp16",
         "opensearch-3.9.0-fp16/half-float",
+        "opensearch-3.9.0-bf16/sq-bf16",
     ] {
         for entry in fs::read_dir(fixtures().join(set)).unwrap() {
             let dir = entry.unwrap().path();
@@ -129,7 +133,10 @@ fn real_fixtures_are_clean_with_their_space() {
             seen += 1;
         }
     }
-    assert_eq!(seen, 12, "six float and six fp16 real fixtures");
+    assert_eq!(
+        seen, 15,
+        "six float, six fp16, and three bf16 real fixtures"
+    );
 }
 
 #[test]
@@ -280,50 +287,64 @@ fn example_cap_keeps_the_exact_count() {
     assert!(report.result(Check::VectorCount).unwrap().failed());
 }
 
-/// A half float times two: one more in the exponent field, or for a
-/// subnormal, where the encoding is linear, the magnitude bits doubled.
-fn doubled(h: u16) -> u16 {
+/// A 16-bit float code times two: one more in the exponent field, or for
+/// a subnormal, where the encoding is linear, the magnitude bits doubled.
+/// `unit` is the code's lowest exponent bit: `0x0400` for fp16, `0x0080`
+/// for bf16.
+fn doubled(h: u16, unit: u16) -> u16 {
     let (sign, magnitude) = (h & 0x8000, h & 0x7fff);
-    if magnitude < 0x0400 {
+    let infinity = 0x7fff & !(unit - 1);
+    if magnitude < unit {
         sign | (magnitude << 1)
     } else {
-        assert!(magnitude + 0x0400 < 0x7c00, "{h:#06x} would overflow");
-        sign | (magnitude + 0x0400)
+        assert!(magnitude + unit < infinity, "{h:#06x} would overflow");
+        sign | (magnitude + unit)
     }
 }
 
 #[test]
-fn fp16_norms_are_checked_on_the_decoded_codes() {
-    let bytes = fs::read(fixtures().join("synthetic-fp16/ip-1000x32-fp16.faiss")).unwrap();
-    let parsed = knn_format::parse(&bytes).unwrap();
-    let codes = knn_format::view_offset(&bytes, parsed.index.index.storage.code_bytes()).unwrap();
-    let row_bytes = 2 * usize::try_from(parsed.index.header.d).unwrap();
+fn scalar_quantized_norms_are_checked_on_the_decoded_codes() {
+    for (file, unit) in [
+        ("synthetic-fp16/ip-1000x32-fp16.faiss", 0x0400),
+        ("synthetic-bf16/ip-1000x32-bf16.faiss", 0x0080),
+    ] {
+        let bytes = fs::read(fixtures().join(file)).unwrap();
+        let parsed = knn_format::parse(&bytes).unwrap();
+        let codes =
+            knn_format::view_offset(&bytes, parsed.index.index.storage.code_bytes()).unwrap();
+        let row_bytes = 2 * usize::try_from(parsed.index.header.d).unwrap();
 
-    let mut scaled = bytes.clone();
-    let row = codes + 7 * row_bytes;
-    for c in scaled[row..row + row_bytes].as_chunks_mut::<2>().0 {
-        *c = doubled(u16::from_le_bytes(*c)).to_le_bytes();
+        let mut scaled = bytes.clone();
+        let row = codes + 7 * row_bytes;
+        for c in scaled[row..row + row_bytes].as_chunks_mut::<2>().0 {
+            *c = doubled(u16::from_le_bytes(*c), unit).to_le_bytes();
+        }
+        let report = knn_check::verify(&scaled, &options(Some(Space::Cosine)));
+        assert_eq!(report.status, Status::Warnings, "{file}: {report:#?}");
+        let norms = report.result(Check::Norms).unwrap();
+        assert_eq!(norms.count, 1, "{file}: {norms:#?}");
+        assert_eq!(norms.findings[0].node, Some(7), "{file}");
+        assert_eq!(norms.findings[0].offset, Some(row), "{file}");
+        // About 2, give or take what rounding the codes left.
+        let message = &norms.findings[0].message;
+        let length: f64 = message
+            .split("length ")
+            .nth(1)
+            .and_then(|rest| rest.split(',').next())
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!((length - 2.0).abs() < 0.01, "{file}: {message}");
+
+        let mut zeroed = bytes.clone();
+        let row = codes + 2 * row_bytes;
+        zeroed[row..row + row_bytes].fill(0);
+        let report = knn_check::verify(&zeroed, &options(Some(Space::Cosine)));
+        let norms = report.result(Check::Norms).unwrap();
+        assert_eq!(norms.count, 1, "{file}: {norms:#?}");
+        assert_eq!(norms.findings[0].node, Some(2), "{file}");
+        assert!(norms.findings[0].message.contains("all zeros"), "{file}");
     }
-    let report = knn_check::verify(&scaled, &options(Some(Space::Cosine)));
-    assert_eq!(report.status, Status::Warnings, "{report:#?}");
-    let norms = report.result(Check::Norms).unwrap();
-    assert_eq!(norms.count, 1, "{norms:#?}");
-    assert_eq!(norms.findings[0].node, Some(7));
-    assert_eq!(norms.findings[0].offset, Some(row));
-    assert!(
-        norms.findings[0].message.contains("length 2.00"),
-        "{}",
-        norms.findings[0].message
-    );
-
-    let mut zeroed = bytes.clone();
-    let row = codes + 2 * row_bytes;
-    zeroed[row..row + row_bytes].fill(0);
-    let report = knn_check::verify(&zeroed, &options(Some(Space::Cosine)));
-    let norms = report.result(Check::Norms).unwrap();
-    assert_eq!(norms.count, 1, "{norms:#?}");
-    assert_eq!(norms.findings[0].node, Some(2));
-    assert!(norms.findings[0].message.contains("all zeros"));
 }
 
 #[test]

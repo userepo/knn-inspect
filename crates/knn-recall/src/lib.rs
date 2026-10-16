@@ -2,8 +2,8 @@
 //!
 //! [`ground_truth`] finds, for every query, how far away its k-th nearest
 //! stored vector is, by exhaustive search in parallel over the queries.
-//! Storage is float32, or fp16 decoded exactly to float32 as Faiss
-//! decodes it. [`score`] then counts, per query, how many labels of
+//! Storage is float32, or fp16 or bf16 decoded exactly to float32 as
+//! Faiss decodes it. [`score`] then counts, per query, how many labels of
 //! an externally produced result list are at least that close. A tie with
 //! the k-th neighbor counts, so a result list that is exactly right scores
 //! 1.0 even when the top k is not unique.
@@ -15,9 +15,13 @@
 //! Faiss's; [`sample_queries`] draws queries from the file's vectors.
 //!
 //! Distances are float32 sums in element order. That is how Faiss's
-//! portable scalar-quantizer code computes fp16 distances; its float32
-//! code, and its SIMD builds' fp16 code, regroup the sums, so two
-//! neighbors a last bit apart can order differently here than in Faiss.
+//! portable scalar-quantizer code computes fp16 and bf16 distances; its
+//! float32 code, and its SIMD builds' scalar-quantizer code, regroup the
+//! sums, so two neighbors a last bit apart can order differently here
+//! than in Faiss. Faiss from `c000190` on (faiss 1.15.1), running its
+//! `AVX512_SPR` code, also rounds the query to bf16 for bf16 distances;
+//! this crate, like `5616caa`, the Faiss that k-NN 3.9.0 builds, keeps it
+//! float32.
 
 mod hnsw;
 
@@ -27,7 +31,7 @@ use std::sync::LazyLock;
 
 pub use hnsw::{Hit, Searcher, result_labels, search_all};
 
-use knn_format::faiss::{Metric, Storage, f16_to_f32};
+use knn_format::faiss::{CodeFormat, Metric, Storage, bf16_to_f32, f16_to_f32};
 use knn_format::{F32, I64, U16};
 use rayon::prelude::*;
 use serde::Serialize;
@@ -246,8 +250,8 @@ impl Labels {
 }
 
 /// `count` distinct rows of `storage` as queries, chosen by a fixed
-/// generator from `seed`, with the rows they came from; fp16 rows are
-/// decoded. The same seed and file give the same queries on every
+/// generator from `seed`, with the rows they came from; fp16 and bf16
+/// rows are decoded. The same seed and file give the same queries on every
 /// platform.
 ///
 /// # Errors
@@ -313,29 +317,49 @@ impl Distance {
         }
     }
 
-    fn between<T: Component>(self, v: &[T], q: &[f32]) -> f32 {
+    fn between<D: Decode>(self, v: &[D::Code], q: &[f32]) -> f32 {
         match self {
             Self::L2 => v
                 .iter()
                 .zip(q)
-                .map(|(x, y)| {
-                    let d = x.value() - y;
+                .map(|(&x, y)| {
+                    let d = D::value(x) - y;
                     d * d
                 })
                 .sum(),
-            Self::NegatedInnerProduct => -v.iter().zip(q).map(|(x, y)| x.value() * y).sum::<f32>(),
+            Self::NegatedInnerProduct => {
+                -v.iter().zip(q).map(|(&x, y)| D::value(x) * y).sum::<f32>()
+            }
         }
     }
 }
 
-/// A stored vector component, as float32.
-trait Component: Copy {
-    fn value(self) -> f32;
+/// How one kind of storage decodes a stored component to float32.
+trait Decode {
+    type Code: Copy;
+    fn value(code: Self::Code) -> f32;
 }
 
-impl Component for F32 {
-    fn value(self) -> f32 {
-        self.get()
+/// Float32 storage, read as it is.
+struct Float32;
+
+impl Decode for Float32 {
+    type Code = F32;
+    fn value(code: F32) -> f32 {
+        code.get()
+    }
+}
+
+/// fp16 codes, through [`HALVES`].
+struct Fp16;
+
+/// bf16 codes, shifted into place.
+struct Bf16;
+
+impl Decode for Bf16 {
+    type Code = U16;
+    fn value(code: U16) -> f32 {
+        bf16_to_f32(code.get())
     }
 }
 
@@ -352,11 +376,12 @@ static HALVES: LazyLock<Box<[f32; 1 << 16]>> = LazyLock::new(|| {
         .expect("one entry per u16 bit pattern")
 });
 
-impl Component for U16 {
-    fn value(self) -> f32 {
+impl Decode for Fp16 {
+    type Code = U16;
+    fn value(code: U16) -> f32 {
         // A u16 always indexes the table, so the fallback never runs.
         HALVES
-            .get(usize::from(self.get()))
+            .get(usize::from(code.get()))
             .copied()
             .unwrap_or(f32::NAN)
     }
@@ -373,7 +398,8 @@ pub(crate) struct Vectors<'a> {
 #[derive(Debug, Clone, Copy)]
 enum Codes<'a> {
     F32(&'a [F32]),
-    F16(&'a [U16]),
+    Fp16(&'a [U16]),
+    Bf16(&'a [U16]),
 }
 
 impl<'a> Vectors<'a> {
@@ -386,7 +412,10 @@ impl<'a> Vectors<'a> {
             .ok_or(Error::Dimension { d: header.d })?;
         let codes = match storage {
             Storage::Flat(s) => Codes::F32(s.codes),
-            Storage::Fp16(s) => Codes::F16(s.components()),
+            Storage::Sq(s) => match s.format {
+                CodeFormat::Fp16 => Codes::Fp16(s.components()),
+                CodeFormat::Bf16 => Codes::Bf16(s.components()),
+            },
         };
         Ok(Self { d, codes })
     }
@@ -395,7 +424,7 @@ impl<'a> Vectors<'a> {
     fn rows(&self) -> usize {
         match self.codes {
             Codes::F32(c) => c.len() / self.d,
-            Codes::F16(c) => c.len() / self.d,
+            Codes::Fp16(c) | Codes::Bf16(c) => c.len() / self.d,
         }
     }
 
@@ -405,8 +434,9 @@ impl<'a> Vectors<'a> {
         let start = row.checked_mul(self.d)?;
         let range = start..start.checked_add(self.d)?;
         Some(match self.codes {
-            Codes::F32(c) => distance.between(c.get(range)?, q),
-            Codes::F16(c) => distance.between(c.get(range)?, q),
+            Codes::F32(c) => distance.between::<Float32>(c.get(range)?, q),
+            Codes::Fp16(c) => distance.between::<Fp16>(c.get(range)?, q),
+            Codes::Bf16(c) => distance.between::<Bf16>(c.get(range)?, q),
         })
     }
 
@@ -419,21 +449,18 @@ impl<'a> Vectors<'a> {
         let Some(end) = start.checked_add(self.d) else {
             return;
         };
+        let range = start..end;
         match self.codes {
-            Codes::F32(c) => out.extend(
-                c.get(start..end)
-                    .unwrap_or_default()
-                    .iter()
-                    .map(|v| v.value()),
-            ),
-            Codes::F16(c) => out.extend(
-                c.get(start..end)
-                    .unwrap_or_default()
-                    .iter()
-                    .map(|v| v.value()),
-            ),
+            Codes::F32(c) => out.extend(decoded::<Float32>(c.get(range))),
+            Codes::Fp16(c) => out.extend(decoded::<Fp16>(c.get(range))),
+            Codes::Bf16(c) => out.extend(decoded::<Bf16>(c.get(range))),
         }
     }
+}
+
+/// A row's components decoded, or none when it is missing.
+fn decoded<D: Decode>(row: Option<&[D::Code]>) -> impl Iterator<Item = f32> + '_ {
+    row.unwrap_or_default().iter().map(|&c| D::value(c))
 }
 
 /// A finite distance ordered for a max-heap.
@@ -525,8 +552,9 @@ pub fn ground_truth(storage: &Storage<'_>, queries: &Queries, k: usize) -> Resul
         .collect::<Vec<_>>()
         .into_par_iter()
         .map(|q| match vectors.codes {
-            Codes::F32(c) => nearest(c, vectors.d, distance, q, k),
-            Codes::F16(c) => nearest(c, vectors.d, distance, q, k),
+            Codes::F32(c) => nearest::<Float32>(c, vectors.d, distance, q, k),
+            Codes::Fp16(c) => nearest::<Fp16>(c, vectors.d, distance, q, k),
+            Codes::Bf16(c) => nearest::<Bf16>(c, vectors.d, distance, q, k),
         })
         .collect();
     Ok(GroundTruth {
@@ -536,8 +564,8 @@ pub fn ground_truth(storage: &Storage<'_>, queries: &Queries, k: usize) -> Resul
 }
 
 /// One query's exhaustive pass over every whole row of `codes`.
-fn nearest<T: Component>(
-    codes: &[T],
+fn nearest<D: Decode>(
+    codes: &[D::Code],
     d: usize,
     distance: Distance,
     q: &[f32],
@@ -549,7 +577,7 @@ fn nearest<T: Component>(
     // caller asked for.
     let mut nearest = BinaryHeap::with_capacity(k.min(rows.len()).saturating_add(1));
     for v in rows {
-        let dist = distance.between(v, q);
+        let dist = distance.between::<D>(v, q);
         if !dist.is_finite() {
             continue;
         }

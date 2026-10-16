@@ -3,7 +3,9 @@
 use std::collections::BTreeMap;
 
 use knn_format::envelope::Envelope;
-use knn_format::faiss::{Fp16Storage, HnswGraph, IdMapIndex, IndexHeader, Metric, Storage};
+use knn_format::faiss::{
+    CodeFormat, HnswGraph, IdMapIndex, IndexHeader, Metric, SqStorage, Storage,
+};
 use knn_format::{Parsed, view_offset};
 
 use crate::{Check, CheckResult, Finding, Options, Report, Severity, Space, Status};
@@ -16,6 +18,11 @@ const UNIT_NORM_TOLERANCE: f64 = 1e-4;
 /// moves it by at most 2^-11 of its value (plus 2^-25 for a subnormal),
 /// so a unit vector's stored length is within about 4.9e-4 of 1.
 const FP16_UNIT_NORM_TOLERANCE: f64 = 1e-3;
+
+/// The same for bf16 storage, which keeps 8 significant bits: rounding
+/// moves a component by at most 2^-8 of its value, so a unit vector's
+/// stored length is within about 3.9e-3 of 1.
+const BF16_UNIT_NORM_TOLERANCE: f64 = 8e-3;
 
 /// Runs every check over `bytes`.
 #[must_use]
@@ -186,14 +193,14 @@ fn check_headers(col: &mut Collector, bytes: &[u8], idx: &IdMapIndex<'_>) {
             None,
         );
     }
-    if let Storage::Fp16(storage) = &idx.index.storage {
+    if let Storage::Sq(storage) = &idx.index.storage {
         check_quantizer(col, bytes, storage, first.d);
     }
 }
 
-/// The fp16 quantizer's own fields: its dimension and code size must
-/// match the index, and it has nothing to train.
-fn check_quantizer(col: &mut Collector, bytes: &[u8], storage: &Fp16Storage<'_>, d: i32) {
+/// The fp16 or bf16 quantizer's own fields: its dimension and code size
+/// must match the index, and it has nothing to train.
+fn check_quantizer(col: &mut Collector, bytes: &[u8], storage: &SqStorage<'_>, d: i32) {
     let q = &storage.quantizer;
     // qtype, rangestat, and rangestat_arg take 4 bytes each.
     let d_at = q.offset.checked_add(12);
@@ -223,9 +230,10 @@ fn check_quantizer(col: &mut Collector, bytes: &[u8], storage: &Fp16Storage<'_>,
         col.warn(
             Check::Headers,
             format!(
-                "quantizer holds {} trained value{}; fp16 uses none",
+                "quantizer holds {} trained value{}; {} uses none",
                 q.trained.len(),
-                if q.trained.len() == 1 { "" } else { "s" }
+                if q.trained.len() == 1 { "" } else { "s" },
+                storage.format.name()
             ),
             view_offset(bytes, q.trained),
             None,
@@ -515,10 +523,15 @@ fn node_of_slot(graph: &HnswGraph<'_>, slot: usize) -> Option<usize> {
 
 fn check_vector_count(col: &mut Collector, idx: &IdMapIndex<'_>) {
     let storage = &idx.index.storage;
-    // Counted as the file counts them: float32 elements, or fp16 bytes.
+    // Counted as the file counts them: float32 elements, or bytes of
+    // two-byte codes.
     let (held, per_component, unit) = match storage {
-        Storage::Flat(s) => (s.codes.len(), 1, "floats"),
-        Storage::Fp16(s) => (s.codes.len(), 2, "bytes of fp16 codes"),
+        Storage::Flat(s) => (s.codes.len(), 1, "floats".to_owned()),
+        Storage::Sq(s) => (
+            s.codes.len(),
+            2,
+            format!("bytes of {} codes", s.format.name()),
+        ),
     };
     let expected = usize::try_from(idx.header.ntotal)
         .ok()
@@ -643,7 +656,10 @@ fn check_norms(col: &mut Collector, bytes: &[u8], idx: &IdMapIndex<'_>, space: O
     let size = storage.component_size();
     let tolerance = match storage {
         Storage::Flat(_) => UNIT_NORM_TOLERANCE,
-        Storage::Fp16(_) => FP16_UNIT_NORM_TOLERANCE,
+        Storage::Sq(s) => match s.format {
+            CodeFormat::Fp16 => FP16_UNIT_NORM_TOLERANCE,
+            CodeFormat::Bf16 => BF16_UNIT_NORM_TOLERANCE,
+        },
     };
     // Rows as the storage counts them, by its own header's dimension.
     let d = usize::try_from(storage.header().d).unwrap_or(0);

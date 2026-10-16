@@ -14,8 +14,9 @@ the file list, and `pos_of_doc`, the insertion position of each doc).
 
 `--encoding` picks how the field stores its vectors: `float` (the
 default), `sq-fp16` (the `sq` encoder with `type: fp16`, `bits: 16`),
-or `half-float` (the `half_float` data type). The vectors indexed are
-the same for every encoding.
+`sq-bf16` (the same with `type: bf16`), or `half-float` (the
+`half_float` data type). The vectors indexed are the same for every
+encoding.
 
 Usage:
     docker compose -f tools/docker-compose.yml up -d
@@ -23,6 +24,7 @@ Usage:
     python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0/cfs --compound
     python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-fp16/sq-fp16 --encoding sq-fp16
     python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-fp16/half-float --encoding half-float
+    python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-bf16/sq-bf16 --encoding sq-bf16
 """
 
 from __future__ import annotations
@@ -40,7 +42,7 @@ import numpy as np
 import requests
 
 SPACES = ["l2", "innerproduct", "cosinesimil"]
-ENCODINGS = ["float", "sq-fp16", "half-float"]
+ENCODINGS = ["float", "sq-fp16", "sq-bf16", "half-float"]
 M = 16
 EF_CONSTRUCTION = 100
 SEED = 20261013
@@ -74,10 +76,11 @@ def plugin_version(host: str, name: str) -> str | None:
 
 def create_index(host: str, index: str, space: str, dim: int, compound: bool, encoding: str) -> dict:
     parameters: dict = {"m": M, "ef_construction": EF_CONSTRUCTION}
-    if encoding == "sq-fp16":
+    if encoding in ("sq-fp16", "sq-bf16"):
         # Indexes created by 3.6.0 or later must give the encoder's bits;
-        # 16 is fp16.
-        parameters["encoder"] = {"name": "sq", "parameters": {"type": "fp16", "bits": 16}}
+        # 16 with a type picks fp16 or bf16.
+        sq_type = encoding.removeprefix("sq-")
+        parameters["encoder"] = {"name": "sq", "parameters": {"type": sq_type, "bits": 16}}
     field: dict = {"type": "knn_vector", "dimension": dim}
     if encoding == "half-float":
         field["data_type"] = "half_float"

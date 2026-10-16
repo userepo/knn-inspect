@@ -1,0 +1,72 @@
+{
+  "file": "l2-100x4-bf16.faiss",
+  "faiss_version": "1.15.1",
+  "nodes": 100,
+  "entry_point": 12,
+  "max_level": 1,
+  "layers": [
+    {
+      "level": 0,
+      "nodes": 100,
+      "slots": 32,
+      "edges": 642,
+      "degree_min": 1,
+      "degree_max": 32,
+      "degree_histogram": [
+        0,
+        1,
+        2,
+        8,
+        19,
+        21,
+        17,
+        13,
+        7,
+        5,
+        2,
+        2,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        3
+      ],
+      "unreachable": 0,
+      "unreachable_nodes": []
+    },
+    {
+      "level": 1,
+      "nodes": 6,
+      "slots": 16,
+      "edges": 26,
+      "degree_min": 4,
+      "degree_max": 5,
+      "degree_histogram": [
+        0,
+        0,
+        0,
+        0,
+        4,
+        2
+      ],
+      "unreachable": 0,
+      "unreachable_nodes": []
+    }
+  ]
+}

@@ -18,7 +18,8 @@ Usage:
     python tools/graph_stats.py --fixtures fixtures   rewrite the baselines
 
 The baselines are `<name>.stats.json` next to each synthetic fixture and
-`stats.json` next to each real fixture's manifest, float and fp16 alike.
+`stats.json` next to each real fixture's manifest, float, fp16, and bf16
+alike.
 Rewrite them whenever the fixtures are regenerated: real fixtures get new
 neighbor arrays on every extraction.
 """
@@ -136,11 +137,13 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.fixtures:
-        for synthetic in ("synthetic", "synthetic-fp16"):
+        for synthetic in ("synthetic", "synthetic-fp16", "synthetic-bf16"):
             for path in sorted((args.fixtures / synthetic).glob("*.faiss")):
                 write(graph_stats(path), path.with_suffix(".stats.json"))
         for manifest in sorted(
-            m for real in ("opensearch-3.9.0", "opensearch-3.9.0-fp16") for m in (args.fixtures / real).glob("*/*/manifest.json")
+            m
+            for real in ("opensearch-3.9.0", "opensearch-3.9.0-fp16", "opensearch-3.9.0-bf16")
+            for m in (args.fixtures / real).glob("*/*/manifest.json")
         ):
             files = json.loads(manifest.read_text(encoding="utf-8"))["files"]
             native = next(f["name"] for f in files if f["name"].endswith((".faiss", ".faissc")))
