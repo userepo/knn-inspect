@@ -101,7 +101,7 @@ Each entry of `layers`:
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `directory` | string | The path as given |
+| `directory` | string | The path as given, with `/` shown as `\` on Windows wherever that names the same path; every path below is shown the same way (since 0.5.1) |
 | `space` | string, nullable | The `--space` given, as for `verify` |
 | `status` | string | The worst verdict over the files: `failed` also when a file would not open, a subdirectory could not be read, or no file was found |
 | `files` | array | One entry per `.faiss` or `.faissc` file, in path order (see below) |

@@ -694,6 +694,90 @@ fn scan_walks_a_directory_and_cross_checks_lucene_vectors() {
 }
 
 #[test]
+fn scan_shows_every_path_with_one_separator() {
+    // Given with `/`, which Windows reads as a separator too, while the
+    // walk joins what it finds with `\` there. Elsewhere `/` is the only
+    // separator, and the test holds trivially.
+    let dir = format!("{}/opensearch-3.9.0/nocfs", fixtures().display());
+    let (sep, other) = if cfg!(windows) {
+        ('\\', '/')
+    } else {
+        ('/', '\\')
+    };
+    let o = run(&["scan", &dir, "--json"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    let mut paths = vec![v["directory"].as_str().unwrap()];
+    for f in v["files"].as_array().unwrap() {
+        paths.push(f["file"].as_str().unwrap());
+        paths.push(f["lucene_vectors"]["file"].as_str().unwrap());
+        paths.push(f["lucene_docs"]["file"].as_str().unwrap());
+    }
+    assert_eq!(paths.len(), 10);
+    for p in paths {
+        assert!(p.contains(sep) && !p.contains(other), "{p}");
+        assert!(Path::new(p).exists(), "{p} names nothing");
+    }
+
+    let text = stdout(&run(&["scan", &dir]));
+    let shown: Vec<&str> = text.lines().filter(|l| l.contains("nocfs")).collect();
+    assert_eq!(shown.len(), 4, "{text}");
+    for line in shown {
+        assert!(!line.contains(other), "{line}");
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn scan_shows_device_paths_as_given() {
+    let canonical = std::fs::canonicalize(fixtures()).unwrap();
+    let plain = canonical
+        .to_str()
+        .unwrap()
+        .strip_prefix(r"\\?\")
+        .unwrap()
+        .to_owned();
+
+    // Windows takes a path that starts with exactly `\\?\` or `\??\` as it
+    // stands, so a `/` in it is no separator and these cannot be read. The
+    // error names each as given, not as a path that would read.
+    for dir in [
+        format!(r"\\?\{plain}/opensearch-3.9.0"),
+        format!(r"\??\{plain}/opensearch-3.9.0"),
+    ] {
+        let o = run(&["scan", &dir]);
+        assert_eq!(o.status.code(), Some(1), "{dir}");
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(
+            err.starts_with(&format!("error: reading directory {dir}:")),
+            "{err}"
+        );
+    }
+
+    // With a `/` in its start, Windows normalizes such a path, resolving
+    // the `x/..` in it. Turning those slashes would make it one taken as
+    // it stands, naming no directory, so every path is shown as given and
+    // names what was scanned.
+    let slashed = plain.replace('\\', "/");
+    for dir in [
+        format!("//?/{slashed}/opensearch-3.9.0/x/../nocfs"),
+        format!(r"\\?/{slashed}/opensearch-3.9.0/x/../nocfs"),
+    ] {
+        let o = run(&["scan", &dir, "--json"]);
+        assert_eq!(o.status.code(), Some(0), "{dir}: {}", stdout(&o));
+        let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+        assert_eq!(v["directory"], dir.as_str());
+        let files = v["files"].as_array().unwrap();
+        assert_eq!(files.len(), 3, "{v}");
+        for f in files {
+            let file = f["file"].as_str().unwrap();
+            assert!(file.starts_with(&dir), "{file}");
+            assert!(Path::new(file).is_file(), "{file} names no file");
+        }
+    }
+}
+
+#[test]
 fn scan_reports_every_corrupted_file() {
     let dir = fixtures().join("corrupted");
     let o = run(&["scan", dir.to_str().unwrap(), "--json"]);

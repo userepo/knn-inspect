@@ -194,7 +194,7 @@ pub fn run(args: &ScanArgs) -> anyhow::Result<ExitCode> {
         Status::Clean
     };
     let out = Output {
-        directory: args.dir.display().to_string(),
+        directory: shown(&args.dir),
         space: options.space,
         status,
         files: reports,
@@ -228,7 +228,7 @@ fn native_files(dir: &Path) -> anyhow::Result<(Vec<PathBuf>, Vec<Unreadable>)> {
         let entries = match fs::read_dir(&d) {
             Ok(entries) => entries,
             Err(e) if d == dir => {
-                return Err(e).with_context(|| format!("reading directory {}", d.display()));
+                return Err(e).with_context(|| format!("reading directory {}", shown(&d)));
             }
             Err(e) => {
                 unreadable.push(Unreadable::new(&d, &e));
@@ -268,9 +268,31 @@ struct Unreadable {
 impl Unreadable {
     fn new(path: &Path, error: &std::io::Error) -> Self {
         Self {
-            path: path.display().to_string(),
+            path: shown(path),
             error: error.to_string(),
         }
+    }
+}
+
+/// How `scan` shows a path. The walk joins what it finds with the
+/// platform's separator, so on Windows a directory given with `/` would
+/// give paths that mix `/` and `\`. There every `/` is shown as `\`, which
+/// names the same path, except in a path that starts with `\\?\` or `\??\`
+/// in any mix of separators. Windows takes such a path as it stands when
+/// its start has no `/`, so a later `/` is no separator, and normalizes it
+/// otherwise, which turning the start's slashes would stop. It is shown as
+/// given.
+fn shown(path: &Path) -> String {
+    let text = path.display().to_string();
+    let start: String = text
+        .chars()
+        .take(4)
+        .map(|c| if c == '/' { '\\' } else { c })
+        .collect();
+    if cfg!(windows) && start != r"\\?\" && start != r"\??\" {
+        text.replace('/', "\\")
+    } else {
+        text
     }
 }
 
@@ -285,9 +307,9 @@ fn scan_file(path: &Path, options: &Options) -> FileReport {
         Ok(file) => file,
         Err(e) => {
             return FileReport {
-                file: path.display().to_string(),
+                file: shown(path),
                 size: None,
-                error: Some(format!("opening {}: {e}", path.display())),
+                error: Some(format!("opening {}: {e}", shown(path))),
                 layout: None,
                 dimension: None,
                 count: None,
@@ -322,7 +344,7 @@ fn scan_file(path: &Path, options: &Options) -> FileReport {
         report.status
     };
     FileReport {
-        file: path.display().to_string(),
+        file: shown(path),
         size: Some(bytes.len()),
         error: None,
         layout: idx.map(|i| i.layout().iter().map(ToString::to_string).collect()),
@@ -355,7 +377,7 @@ fn lucene_docs(path: &Path, parsed: &knn_format::Parsed<'_>) -> LuceneDocs {
     }
     let damaged = |doc_count: Option<u32>, detail: String| LuceneDocs {
         status: CrossCheck::Damaged,
-        file: Some(si_path.display().to_string()),
+        file: Some(shown(&si_path)),
         doc_count,
         detail,
     };
@@ -374,7 +396,7 @@ fn lucene_docs(path: &Path, parsed: &knn_format::Parsed<'_>) -> LuceneDocs {
         {
             return LuceneDocs {
                 status: CrossCheck::Skipped,
-                file: Some(si_path.display().to_string()),
+                file: Some(shown(&si_path)),
                 doc_count: None,
                 detail: format!("the .si is in a format this tool does not read ({found})"),
             };
@@ -428,7 +450,7 @@ fn lucene_docs(path: &Path, parsed: &knn_format::Parsed<'_>) -> LuceneDocs {
     };
     LuceneDocs {
         status,
-        file: Some(si_path.display().to_string()),
+        file: Some(shown(&si_path)),
         doc_count: Some(info.doc_count),
         detail,
     }
@@ -506,7 +528,7 @@ fn lucene_vectors(path: &Path, bytes: &[u8], parsed: &knn_format::Parsed<'_>) ->
         let mapped = match NativeFile::open(candidate) {
             Ok(m) => m,
             Err(e) => {
-                untrusted.push(format!("{} could not be opened: {e}", candidate.display()));
+                untrusted.push(format!("{} could not be opened: {e}", shown(candidate)));
                 continue;
             }
         };
@@ -521,17 +543,17 @@ fn lucene_vectors(path: &Path, bytes: &[u8], parsed: &knn_format::Parsed<'_>) ->
             };
             return LuceneVectors {
                 status,
-                file: Some(candidate.display().to_string()),
+                file: Some(shown(candidate)),
                 offset: Some(offset),
                 detail,
             };
         }
         match sound {
             Ok(()) if located == Located::GaveUp => {
-                repetitive.push(candidate.display().to_string());
+                repetitive.push(shown(candidate));
             }
-            Ok(()) => tried.push(candidate.display().to_string()),
-            Err(why) => untrusted.push(format!("{} {why}", candidate.display())),
+            Ok(()) => tried.push(shown(candidate)),
+            Err(why) => untrusted.push(format!("{} {why}", shown(candidate))),
         }
     }
     // Not found: a damaged .vec may be the reason, so it outranks a
@@ -539,7 +561,7 @@ fn lucene_vectors(path: &Path, bytes: &[u8], parsed: &knn_format::Parsed<'_>) ->
     if !untrusted.is_empty() {
         return LuceneVectors {
             status: CrossCheck::Damaged,
-            file: candidates.first().map(|c| c.display().to_string()),
+            file: candidates.first().map(|c| shown(c)),
             offset: None,
             detail: format!(
                 "the stored vectors are in no sound .vec of the segment; {}",
@@ -556,7 +578,7 @@ fn lucene_vectors(path: &Path, bytes: &[u8], parsed: &knn_format::Parsed<'_>) ->
     }
     LuceneVectors {
         status: CrossCheck::Mismatch,
-        file: candidates.first().map(|c| c.display().to_string()),
+        file: candidates.first().map(|c| shown(c)),
         offset: None,
         detail: format!(
             "the stored vectors appear in none of the segment's .vec files: {}",
