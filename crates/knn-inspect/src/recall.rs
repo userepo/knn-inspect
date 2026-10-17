@@ -19,7 +19,9 @@ use serde::Serialize;
 pub struct RecallArgs {
     /// A `.faiss` or `.faissc` file.
     pub file: PathBuf,
-    /// Query vectors: row-major little-endian float32, the file's dimension.
+    /// Query vectors: row-major little-endian float32, the file's
+    /// dimension; for a binary file, packed bits, a row the bytes of its
+    /// code size (its dimension / 8).
     #[arg(long, required_unless_present = "sample", conflicts_with = "sample")]
     pub queries: Option<PathBuf>,
     /// Instead of --queries: this many of the file's own vectors, chosen by
@@ -104,16 +106,10 @@ pub fn run(args: &RecallArgs) -> anyhow::Result<ExitCode> {
         .with_context(|| format!("parsing {}", path.display()))?;
     let index = &parsed.index;
     let storage = &index.index.storage;
-    let dimension = usize::try_from(storage.header().d)
-        .ok()
-        .filter(|&d| d > 0)
-        .with_context(|| {
-            format!(
-                "{}: dimension {} is not usable",
-                path.display(),
-                storage.header().d
-            )
-        })?;
+    // The dimension queries must have: the file's, or for binary storage
+    // the bits of its code size, which Faiss reads every vector by.
+    let dimension = knn_recall::query_dimension(storage)
+        .with_context(|| format!("{}: no query can match it", path.display()))?;
 
     let (queries, sample) = load_queries(args, storage, dimension)?;
     let (results, search) = results_for(args, index, &queries)?;
@@ -153,8 +149,12 @@ fn load_queries(
 ) -> anyhow::Result<(Queries, Option<Sample>)> {
     if let Some(p) = &args.queries {
         let bytes = fs::read(p).with_context(|| format!("reading {}", p.display()))?;
-        let queries = Queries::from_bytes(&bytes, dimension)
-            .with_context(|| format!("reading {}", p.display()))?;
+        let queries = if matches!(storage, Storage::Binary(_)) {
+            Queries::from_bits(&bytes, dimension)
+        } else {
+            Queries::from_bytes(&bytes, dimension)
+        }
+        .with_context(|| format!("reading {}", p.display()))?;
         return Ok((queries, None));
     }
     let Some(count) = args.sample else {

@@ -39,14 +39,18 @@ fuzz_target!(|data: &[u8]| {
         assert_eq!(stats.nodes, graph.node_count());
         assert_eq!(stats.layers.len(), graph.level_counts().len());
         // The HNSW search over an arbitrary graph and any storage, with the
-        // first stored vector, decoded, as the query so the query's size is
-        // bounded by the file.
+        // first stored vector, decoded, or for binary storage its bytes, as
+        // the query so the query's size is bounded by the file.
         let storage = &parsed.index.index.storage;
         let d = usize::try_from(storage.header().d).unwrap_or(0);
-        let query: Vec<f32> = (0..d).map_while(|i| storage.component(i)).collect();
-        if d > 0 && query.len() == d {
+        let floats: Vec<f32> = (0..d).map_while(|i| storage.component(i)).collect();
+        let query = match storage {
+            knn_format::faiss::Storage::Binary(s) => s.row(0).map(knn_recall::Query::Bits),
+            _ => (d > 0 && floats.len() == d).then_some(knn_recall::Query::Floats(&floats)),
+        };
+        if let Some(query) = query {
             let mut searcher = knn_recall::Searcher::new(graph.node_count());
-            if let Ok(hits) = searcher.search(&parsed.index.index, &query, 3, 5) {
+            if let Ok(hits) = searcher.search(&parsed.index.index, query, 3, 5) {
                 assert!(hits.len() <= 3);
                 // Padded to k, or to the node count when the graph is
                 // smaller: no list can hold more.
@@ -69,12 +73,16 @@ fuzz_target!(|data: &[u8]| {
                 }
                 let _ = s.halves();
             }
+            knn_format::faiss::Storage::Binary(s) => {
+                let _ = s.row(0);
+                let _ = s.code_size();
+            }
         }
         if let Some(footer) = parsed.envelope.footer {
             let _ = footer.verify(data);
         }
     }
-    for space in [None, Some(Space::L2), Some(Space::Cosine)] {
+    for space in [None, Some(Space::L2), Some(Space::Cosine), Some(Space::Hamming)] {
         let report = knn_check::verify(
             data,
             &Options {

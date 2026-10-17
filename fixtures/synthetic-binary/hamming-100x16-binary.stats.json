@@ -1,0 +1,59 @@
+{
+  "file": "hamming-100x16-binary.faiss",
+  "faiss_version": "1.15.1",
+  "nodes": 100,
+  "entry_point": 12,
+  "max_level": 1,
+  "layers": [
+    {
+      "level": 0,
+      "nodes": 100,
+      "slots": 32,
+      "edges": 1169,
+      "degree_min": 6,
+      "degree_max": 19,
+      "degree_histogram": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        3,
+        5,
+        13,
+        20,
+        12,
+        8,
+        15,
+        8,
+        3,
+        4,
+        4,
+        3,
+        1
+      ],
+      "unreachable": 0,
+      "unreachable_nodes": []
+    },
+    {
+      "level": 1,
+      "nodes": 6,
+      "slots": 16,
+      "edges": 26,
+      "degree_min": 4,
+      "degree_max": 5,
+      "degree_histogram": [
+        0,
+        0,
+        0,
+        0,
+        4,
+        2
+      ],
+      "unreachable": 0,
+      "unreachable_nodes": []
+    }
+  ]
+}

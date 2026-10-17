@@ -15,8 +15,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use knn_format::F32;
-use knn_format::faiss::{FlatStorage, FourCc, IndexHeader, Storage};
-use knn_recall::{Error, GroundTruth, Labels, Queries, ground_truth, score};
+use knn_format::faiss::{BinaryStorage, FlatStorage, FourCc, HeaderKind, IndexHeader, Storage};
+use knn_recall::{Error, GroundTruth, Labels, Queries, Query, ground_truth, score};
 use serde::Deserialize;
 
 fn fixtures() -> PathBuf {
@@ -36,7 +36,8 @@ struct Baseline {
 }
 
 /// Every baseline: `<name>.recall.json` beside each synthetic fixture,
-/// `recall.json` beside each real one, float, fp16, bf16, and byte.
+/// `recall.json` beside each real one, float, fp16, bf16, byte, and
+/// binary.
 fn baselines() -> Vec<PathBuf> {
     let mut out = Vec::new();
     for synthetic in [
@@ -44,6 +45,7 @@ fn baselines() -> Vec<PathBuf> {
         "synthetic-fp16",
         "synthetic-bf16",
         "synthetic-byte",
+        "synthetic-binary",
     ] {
         for entry in fs::read_dir(fixtures().join(synthetic)).unwrap() {
             let p = entry.unwrap().path();
@@ -59,6 +61,8 @@ fn baselines() -> Vec<PathBuf> {
         "opensearch-3.9.0-fp16/half-float",
         "opensearch-3.9.0-bf16/sq-bf16",
         "opensearch-3.9.0-byte/byte",
+        "opensearch-3.9.0-binary/binary",
+        "opensearch-3.9.0-binary/binary-encoder",
     ] {
         for entry in fs::read_dir(fixtures().join(set)).unwrap() {
             out.push(entry.unwrap().path().join("recall.json"));
@@ -66,6 +70,15 @@ fn baselines() -> Vec<PathBuf> {
     }
     out.sort();
     out
+}
+
+/// A baseline's queries: packed bits for a binary file, float32 rows for
+/// any other.
+fn load_queries(storage: &Storage<'_>, bytes: &[u8], d: usize) -> Queries {
+    match storage {
+        Storage::Binary(_) => Queries::from_bits(bytes, d).unwrap(),
+        Storage::Flat(_) | Storage::Sq(_) => Queries::from_bytes(bytes, d).unwrap(),
+    }
 }
 
 fn read_results(path: &Path) -> Vec<Vec<i64>> {
@@ -90,9 +103,11 @@ fn recall_matches_faiss_python() {
         let bytes = fs::read(dir.join(&b.file)).unwrap();
         let parsed = knn_format::parse(&bytes).unwrap();
         let storage = &parsed.index.index.storage;
-        let queries =
-            Queries::from_bytes(&fs::read(dir.join(&b.queries_file)).unwrap(), b.dimension)
-                .unwrap();
+        let queries = load_queries(
+            storage,
+            &fs::read(dir.join(&b.queries_file)).unwrap(),
+            b.dimension,
+        );
         assert_eq!(queries.len(), b.queries, "{}", b.file);
         let results = read_results(&dir.join(&b.results_file));
         let labels = Labels::from_id_map(parsed.index.id_map).unwrap();
@@ -115,11 +130,11 @@ fn recall_matches_faiss_python() {
         }
         seen += 1;
     }
-    assert_eq!(seen, 32, "15 synthetic and 17 real baselines");
-    // Thirteen synthetic files at efSearch 16 miss neighbors, three of
-    // them fp16, two bf16, and four byte, so the comparison covers partial
-    // matches, not only the perfect case.
-    assert_eq!(imperfect, 13);
+    assert_eq!(seen, 37, "18 synthetic and 19 real baselines");
+    // Fifteen synthetic files at efSearch 16 miss neighbors, three of
+    // them fp16, two bf16, four byte, and two binary, so the comparison
+    // covers partial matches, not only the perfect case.
+    assert_eq!(imperfect, 15);
 }
 
 /// Flat storage over rows spelled out in the test.
@@ -160,10 +175,12 @@ impl Built {
                 offset: 0,
                 d: self.d,
                 ntotal: i64::try_from(self.codes.len() / usize::try_from(self.d).unwrap()).unwrap(),
-                reserved: [1 << 20, 1 << 20],
                 is_trained: true,
                 metric_type: self.metric_type,
-                metric_arg: None,
+                kind: HeaderKind::Float {
+                    reserved: [1 << 20, 1 << 20],
+                    metric_arg: None,
+                },
             },
             codes: &self.codes,
         })
@@ -323,8 +340,11 @@ fn queries_decode_little_endian_rows() {
     let q = Queries::from_bytes(&bytes, 2).unwrap();
     assert_eq!(q.len(), 2);
     assert_eq!(q.d(), 2);
-    let rows: Vec<&[f32]> = q.rows().collect();
-    assert_eq!(rows, vec![&[1.5, -2.0][..], &[0.25, 8.0][..]]);
+    let rows: Vec<Query<'_>> = q.rows().collect();
+    assert_eq!(
+        rows,
+        vec![Query::Floats(&[1.5, -2.0]), Query::Floats(&[0.25, 8.0])]
+    );
 
     assert!(matches!(
         Queries::from_bytes(&bytes[..12], 2),
@@ -389,4 +409,120 @@ fn mismatches_are_errors_not_panics() {
         Err(Error::Metric { metric_type: 7 })
     ));
     let _: Option<GroundTruth> = None;
+}
+
+/// Binary storage over rows spelled out in the test, `code_size` bytes
+/// each.
+fn binary_storage(code_size: i32, codes: &[u8]) -> Storage<'_> {
+    let rows = codes.len() / usize::try_from(code_size).unwrap().max(1);
+    Storage::Binary(BinaryStorage {
+        header: IndexHeader {
+            offset: 0,
+            d: code_size * 8,
+            ntotal: i64::try_from(rows).unwrap(),
+            is_trained: true,
+            metric_type: 1,
+            kind: HeaderKind::Binary { code_size },
+        },
+        codes,
+    })
+}
+
+#[test]
+fn binary_queries_are_packed_bits() {
+    let q = Queries::from_bits(&[0x0f, 0xf0, 0xff, 0x00], 16).unwrap();
+    assert!(q.is_binary());
+    assert_eq!((q.len(), q.d()), (2, 16));
+    let rows: Vec<Query<'_>> = q.rows().collect();
+    assert_eq!(
+        rows,
+        vec![Query::Bits(&[0x0f, 0xf0]), Query::Bits(&[0xff, 0x00])]
+    );
+    assert_eq!(rows[0].dimension(), 16);
+
+    for d in [0, 12] {
+        assert!(matches!(
+            Queries::from_bits(&[0; 4], d),
+            Err(Error::BinaryDimension { d: got }) if got == d
+        ));
+    }
+    let err = Queries::from_bits(&[0; 3], 16).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            Error::QueriesLength {
+                len: 3,
+                d: 16,
+                row: 2
+            }
+        ),
+        "{err:?}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "3 bytes of queries is not a multiple of 2, the bytes in a row of dimension 16"
+    );
+    assert!(matches!(Queries::from_bits(&[], 16), Err(Error::NoQueries)));
+}
+
+#[test]
+fn hamming_distance_counts_the_bits_that_differ() {
+    // Rows 0..4, two bytes each, at Hamming distance 0, 8, 8, and 16 from
+    // the query: the two at 8 tie with the 2nd nearest, so both match.
+    let codes = [0x00, 0x00, 0xff, 0x00, 0x0f, 0x0f, 0xff, 0xff];
+    let s = binary_storage(2, &codes);
+    let labels = Labels::from_ids(&[10, 11, 12, 13]).unwrap();
+    let q = Queries::from_bits(&[0x00, 0x00], 16).unwrap();
+    let truth = ground_truth(&s, &q, 2).unwrap();
+    let r = score(&s, &labels, &q, &truth, &[vec![10, 12]]).unwrap();
+    assert_eq!(r.recall, 1.0);
+    let r = score(&s, &labels, &q, &truth, &[vec![12, 11]]).unwrap();
+    assert_eq!(r.recall, 1.0, "both rows at 8 tie with the 2nd nearest");
+    let r = score(&s, &labels, &q, &truth, &[vec![13, 10]]).unwrap();
+    assert_eq!(r.recall, 0.5, "16 bits away is no match");
+}
+
+#[test]
+fn binary_and_float_queries_do_not_mix() {
+    let codes = [0x00, 0xff];
+    let s = binary_storage(1, &codes);
+    let floats = queries(8, &[&[0.0; 8]]);
+    let err = ground_truth(&s, &floats, 1).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            Error::QueryKind {
+                file: "binary",
+                queries: "float32"
+            }
+        ),
+        "{err:?}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "the file holds binary vectors, but the queries are float32"
+    );
+    let b = Built::l2(&[&[0.0, 0.0]]);
+    let bits = Queries::from_bits(&[0x00, 0x00], 16).unwrap();
+    assert!(matches!(
+        ground_truth(&b.storage(), &bits, 1),
+        Err(Error::QueryKind {
+            file: "float32",
+            queries: "binary"
+        })
+    ));
+    // The dimension counts bits on both sides.
+    assert!(matches!(
+        ground_truth(&s, &bits, 1),
+        Err(Error::DimensionMismatch {
+            file: 8,
+            queries: 16
+        })
+    ));
+    // A code size of 0 has no rows to compare.
+    let empty = binary_storage(0, &codes);
+    assert!(matches!(
+        ground_truth(&empty, &bits, 1),
+        Err(Error::CodeSize { code_size: 0 })
+    ));
 }

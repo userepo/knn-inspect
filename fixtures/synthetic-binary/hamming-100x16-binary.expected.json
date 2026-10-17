@@ -1,0 +1,45 @@
+{
+  "file": "hamming-100x16-binary.faiss",
+  "size": 15643,
+  "faiss_version": "1.15.1",
+  "seed": 20261013,
+  "layout": [
+    "IBMp",
+    "IBHf",
+    "IBxF"
+  ],
+  "dimension": 16,
+  "count": 100,
+  "metric": "hamming",
+  "faiss_metric_type": 1,
+  "code_size": 2,
+  "hnsw": {
+    "m": 16,
+    "ef_construction": 100,
+    "ef_search": 16,
+    "max_level": 1,
+    "entry_point": 12,
+    "level_counts": [
+      100,
+      6
+    ],
+    "levels_len": 100,
+    "offsets_len": 101,
+    "neighbors_len": 3296,
+    "levels_crc32": 3073793771
+  },
+  "ids": {
+    "len": 100,
+    "first": 1000,
+    "last": 1099,
+    "crc32": 1526159279
+  },
+  "codes": {
+    "bytes": 200,
+    "crc32": 2470729642,
+    "first": [
+      183,
+      125
+    ]
+  }
+}

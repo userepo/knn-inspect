@@ -1,13 +1,15 @@
-//! The Faiss payload: `IxMp` wrapping `IHNf` over flat float32 storage,
-//! or `IHNs` over fp16, bf16, or byte scalar-quantized storage, as
-//! `faiss/impl/index_read.cpp` reads it.
+//! The Faiss payload, as `faiss/impl/index_read.cpp` reads it: `IxMp`
+//! wrapping `IHNf` over flat float32 storage, or `IHNs` over fp16, bf16,
+//! or byte scalar-quantized storage; or, for binary vectors, `IBMp`
+//! wrapping `IBHf` over `IBxF`, packed bits compared by Hamming distance.
 //!
 //! Every array is a view into the file's bytes. Element types are the
 //! unaligned little-endian wrappers from `zerocopy`; call `.get()` on an
-//! element for its native value. Scalar-quantized codes are the
-//! exception, raw bytes as Faiss counts them: [`SqStorage::row`] views a
-//! row's bytes, [`SqStorage::halves`] the 16-bit codes of fp16 or bf16
-//! storage, and [`CodeFormat::decode`] decodes a component.
+//! element for its native value. Scalar-quantized and binary codes are
+//! the exception, raw bytes as Faiss counts them: [`SqStorage::row`] and
+//! [`BinaryStorage::row`] view a row's bytes, [`SqStorage::halves`] the
+//! 16-bit codes of fp16 or bf16 storage, and [`CodeFormat::decode`]
+//! decodes a component.
 
 use std::fmt;
 
@@ -34,6 +36,15 @@ impl FourCc {
     pub const FLAT_IP: Self = Self(*b"IxFI");
     /// `IndexScalarQuantizer`.
     pub const SCALAR_QUANTIZER: Self = Self(*b"IxSQ");
+    /// `IndexBinaryIDMap`.
+    pub const BINARY_ID_MAP: Self = Self(*b"IBMp");
+    /// `IndexBinaryHNSW`.
+    pub const BINARY_HNSW: Self = Self(*b"IBHf");
+    /// `IndexBinaryFlat`.
+    pub const BINARY_FLAT: Self = Self(*b"IBxF");
+    /// What k-NN's patched `write_index_binary` writes in place of the
+    /// storage when it leaves the vectors out of the file.
+    pub const NULL: Self = Self(*b"null");
 }
 
 impl fmt::Display for FourCc {
@@ -63,11 +74,19 @@ pub enum Metric {
     InnerProduct,
     /// `METRIC_L2` (1): squared Euclidean distance.
     L2,
+    /// The Hamming distance between packed bits: the bits in which two
+    /// codes differ. Faiss's binary indexes compute it whatever metric
+    /// type their headers store, which k-NN leaves at 1 (`METRIC_L2`).
+    Hamming,
     /// Any other `faiss::MetricType`.
     Other(i32),
 }
 
 impl Metric {
+    /// The metric of a float index's `metric_type`. It is never
+    /// [`Self::Hamming`], which no metric type names: a binary index
+    /// computes it whatever its metric type, as [`IndexHeader::metric`]
+    /// reports.
     #[must_use]
     pub fn from_type(metric_type: i32) -> Self {
         match metric_type {
@@ -83,57 +102,76 @@ impl Metric {
         match self {
             Self::InnerProduct => "inner_product".to_owned(),
             Self::L2 => "l2".to_owned(),
+            Self::Hamming => "hamming".to_owned(),
             Self::Other(n) => format!("metric_{n}"),
         }
     }
 }
 
-/// The fields every Faiss index starts with (`read_index_header`).
+/// The fields every Faiss index starts with, as a float index
+/// (`read_index_header`) or a binary one (`read_index_binary_header`)
+/// stores them.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct IndexHeader {
     /// File offset of the fourcc.
     pub offset: usize,
-    /// Dimension.
+    /// Dimension: components of a float vector, bits of a binary one.
     pub d: i32,
     /// Vector count.
     pub ntotal: i64,
-    /// Two reserved int64s; Faiss writes `1 << 20` in both.
-    pub reserved: [i64; 2],
     /// Whether the index is trained.
     pub is_trained: bool,
     /// `faiss::MetricType` as stored.
     pub metric_type: i32,
-    /// Present only when `metric_type > 1`.
-    pub metric_arg: Option<f32>,
+    /// The fields only one of the two header formats has.
+    pub kind: HeaderKind,
+}
+
+/// What a float index header and a binary one each store that the other
+/// does not.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum HeaderKind {
+    /// A float index's (`Index`).
+    Float {
+        /// Two reserved int64s; Faiss writes `1 << 20` in both.
+        reserved: [i64; 2],
+        /// Present only when `metric_type > 1`.
+        metric_arg: Option<f32>,
+    },
+    /// A binary index's (`IndexBinary`).
+    Binary {
+        /// Bytes per vector. Faiss sets it to the dimension divided by 8
+        /// and reads every vector as this many bytes.
+        code_size: i32,
+    },
 }
 
 impl IndexHeader {
+    /// The distance the index computes: Hamming for a binary index,
+    /// whatever its metric type, otherwise the metric type's.
     #[must_use]
     pub fn metric(&self) -> Metric {
-        Metric::from_type(self.metric_type)
+        match self.kind {
+            HeaderKind::Float { .. } => Metric::from_type(self.metric_type),
+            HeaderKind::Binary { .. } => Metric::Hamming,
+        }
     }
 
+    /// A binary header's bytes per vector; `None` for a float header.
+    #[must_use]
+    pub fn code_size(&self) -> Option<i32> {
+        match self.kind {
+            HeaderKind::Float { .. } => None,
+            HeaderKind::Binary { code_size } => Some(code_size),
+        }
+    }
+
+    /// Reads a float index's header.
     fn read(cur: &mut Cursor<'_>, offset: usize) -> Result<Self> {
         // The header holds scalars only; no view into the data outlives
         // the call, so the cursor's lifetime is irrelevant here.
-        let d_offset = cur.offset();
-        let d = cur.i32("dimension")?;
-        if d < 0 {
-            return Err(Error::InvalidValue {
-                offset: d_offset,
-                what: "dimension",
-                value: i64::from(d),
-            });
-        }
-        let ntotal_offset = cur.offset();
-        let ntotal = cur.i64("vector count")?;
-        if ntotal < 0 {
-            return Err(Error::InvalidValue {
-                offset: ntotal_offset,
-                what: "vector count",
-                value: ntotal,
-            });
-        }
+        let d = read_count(cur, "dimension", Cursor::i32)?;
+        let ntotal = read_count(cur, "vector count", Cursor::i64)?;
         let reserved = [cur.i64("reserved field")?, cur.i64("reserved field")?];
         let is_trained = cur.u8("is_trained flag")? != 0;
         let metric_type = cur.i32("metric type")?;
@@ -146,12 +184,54 @@ impl IndexHeader {
             offset,
             d,
             ntotal,
-            reserved,
             is_trained,
             metric_type,
-            metric_arg,
+            kind: HeaderKind::Float {
+                reserved,
+                metric_arg,
+            },
         })
     }
+
+    /// Reads a binary index's header: the dimension, the code size, the
+    /// count, the trained flag, and the metric type, with no reserved
+    /// fields or metric argument.
+    fn read_binary(cur: &mut Cursor<'_>, offset: usize) -> Result<Self> {
+        let d = read_count(cur, "dimension", Cursor::i32)?;
+        let code_size = read_count(cur, "code size", Cursor::i32)?;
+        let ntotal = read_count(cur, "vector count", Cursor::i64)?;
+        let is_trained = cur.u8("is_trained flag")? != 0;
+        let metric_type = cur.i32("metric type")?;
+        Ok(Self {
+            offset,
+            d,
+            ntotal,
+            is_trained,
+            metric_type,
+            kind: HeaderKind::Binary { code_size },
+        })
+    }
+}
+
+/// Reads a header field that counts something, so cannot be negative.
+fn read_count<'a, T>(
+    cur: &mut Cursor<'a>,
+    what: &'static str,
+    read: fn(&mut Cursor<'a>, &'static str) -> Result<T>,
+) -> Result<T>
+where
+    T: Copy + Into<i64>,
+{
+    let offset = cur.offset();
+    let value = read(cur, what)?;
+    if value.into() < 0 {
+        return Err(Error::InvalidValue {
+            offset,
+            what,
+            value: value.into(),
+        });
+    }
+    Ok(value)
 }
 
 /// The HNSW graph (`read_HNSW`).
@@ -653,6 +733,46 @@ impl<'a> SqStorage<'a> {
     }
 }
 
+/// Binary storage (`IndexBinaryFlat`): each vector its bits packed into
+/// bytes, as k-NN's `binary` data type receives them.
+#[derive(Debug, Clone, Copy)]
+pub struct BinaryStorage<'a> {
+    /// The storage index's own header, a binary one.
+    pub header: IndexHeader,
+    /// All vectors, row-major, the header's code size in bytes each.
+    /// Faiss stores their length in bytes, so a damaged file can hold
+    /// part of a row.
+    pub codes: &'a [u8],
+}
+
+impl<'a> BinaryStorage<'a> {
+    /// Bytes per row: the header's code size, which Faiss reads every
+    /// vector by, or `None` when it is not positive, which holds no rows
+    /// to count.
+    #[must_use]
+    pub fn code_size(&self) -> Option<usize> {
+        self.header
+            .code_size()
+            .and_then(|size| usize::try_from(size).ok())
+            .filter(|&size| size > 0)
+    }
+
+    /// Vector `i`'s bytes, or `None` when it is not entirely inside
+    /// `codes`, as for every `i` at code size 0.
+    #[must_use]
+    pub fn row(&self, i: usize) -> Option<&'a [u8]> {
+        let row = self.code_size()?;
+        let start = i.checked_mul(row)?;
+        self.codes.get(start..start.checked_add(row)?)
+    }
+
+    /// Rows that `codes` holds in full.
+    #[must_use]
+    pub fn row_count(&self) -> usize {
+        self.code_size().map_or(0, |row| self.codes.len() / row)
+    }
+}
+
 /// An HNSW index's vectors.
 #[derive(Debug, Clone, Copy)]
 pub enum Storage<'a> {
@@ -660,6 +780,8 @@ pub enum Storage<'a> {
     Flat(FlatStorage<'a>),
     /// fp16, bf16, or byte, under `IHNs`.
     Sq(SqStorage<'a>),
+    /// Packed bits, under `IBHf`.
+    Binary(BinaryStorage<'a>),
 }
 
 impl<'a> Storage<'a> {
@@ -669,6 +791,7 @@ impl<'a> Storage<'a> {
         match self {
             Self::Flat(s) => s.fourcc,
             Self::Sq(_) => FourCc::SCALAR_QUANTIZER,
+            Self::Binary(_) => FourCc::BINARY_FLAT,
         }
     }
 
@@ -678,6 +801,7 @@ impl<'a> Storage<'a> {
         match self {
             Self::Flat(s) => &s.header,
             Self::Sq(s) => &s.header,
+            Self::Binary(s) => &s.header,
         }
     }
 
@@ -686,7 +810,7 @@ impl<'a> Storage<'a> {
     pub fn flat(&self) -> Option<&FlatStorage<'a>> {
         match self {
             Self::Flat(s) => Some(s),
-            Self::Sq(_) => None,
+            Self::Sq(_) | Self::Binary(_) => None,
         }
     }
 
@@ -696,16 +820,19 @@ impl<'a> Storage<'a> {
         match self {
             Self::Flat(s) => s.row_count(),
             Self::Sq(s) => s.row_count(),
+            Self::Binary(s) => s.row_count(),
         }
     }
 
     /// Bytes per stored component: 4 for float32, 2 for fp16 or bf16, 1
-    /// for byte.
+    /// for byte. Binary storage counts in bytes too, each holding eight
+    /// dimensions' bits, as Lucene's copy of a binary field does.
     #[must_use]
     pub fn component_size(&self) -> usize {
         match self {
             Self::Flat(_) => 4,
             Self::Sq(s) => s.format.component_size(),
+            Self::Binary(_) => 1,
         }
     }
 
@@ -715,16 +842,19 @@ impl<'a> Storage<'a> {
         match self {
             Self::Flat(s) => s.codes.as_bytes(),
             Self::Sq(s) => s.codes,
+            Self::Binary(s) => s.codes,
         }
     }
 
-    /// Components the storage holds in full, over all rows.
+    /// Components the storage holds in full, over all rows: for binary
+    /// storage, bytes.
     #[must_use]
     pub fn component_count(&self) -> usize {
         self.code_bytes().len() / self.component_size()
     }
 
-    /// Component `i` of the row-major storage, decoded to float32.
+    /// Component `i` of the row-major storage, decoded to float32; `None`
+    /// for binary storage, whose bits have no float32 value.
     #[must_use]
     pub fn component(&self, i: usize) -> Option<f32> {
         match self {
@@ -735,6 +865,7 @@ impl<'a> Storage<'a> {
                 s.format
                     .decode(s.codes.get(start..start.checked_add(size)?)?)
             }
+            Self::Binary(_) => None,
         }
     }
 }
@@ -742,7 +873,8 @@ impl<'a> Storage<'a> {
 /// An HNSW index: the graph plus its storage.
 #[derive(Debug, Clone, Copy)]
 pub struct HnswIndex<'a> {
-    /// `IHNf` over float32 storage, or `IHNs` over fp16, bf16, or byte.
+    /// `IHNf` over float32 storage, `IHNs` over fp16, bf16, or byte, or
+    /// `IBHf` over binary.
     pub fourcc: FourCc,
     /// The HNSW index's own header.
     pub header: IndexHeader,
@@ -752,9 +884,12 @@ pub struct HnswIndex<'a> {
     pub storage: Storage<'a>,
 }
 
-/// `IndexIDMap`: the outermost index, mapping node ids to labels.
+/// `IndexIDMap` or `IndexBinaryIDMap`: the outermost index, mapping node
+/// ids to labels.
 #[derive(Debug, Clone, Copy)]
 pub struct IdMapIndex<'a> {
+    /// `IxMp`, or `IBMp` over a binary index.
+    pub fourcc: FourCc,
     /// The ID map's own header.
     pub header: IndexHeader,
     /// The wrapped index.
@@ -769,13 +904,19 @@ impl IdMapIndex<'_> {
     /// The three fourccs, outermost first.
     #[must_use]
     pub fn layout(&self) -> [FourCc; 3] {
-        [
-            FourCc::ID_MAP,
-            self.index.fourcc,
-            self.index.storage.fourcc(),
-        ]
+        [self.fourcc, self.index.fourcc, self.index.storage.fourcc()]
     }
 }
+
+/// What the layouts k-NN writes for a binary index can name in place of
+/// its storage, as errors list them.
+const BINARY_STORAGE_EXPECTED: &str = "IBxF";
+
+/// The same, when the file names `null`: k-NN's patched Faiss writes it
+/// for a graph whose vectors stay in Lucene's files, as k-NN 3.9 builds
+/// an `on_disk` field and any float field whose `sq` encoder keeps 1, 2,
+/// or 4 bits.
+const NULL_STORAGE_EXPECTED: &str = "IBxF; null is a graph without its vectors, which k-NN writes for quantized fields (such as on_disk ones) that keep them in Lucene's files, and this tool does not read";
 
 /// Parses the payload, `base` being its offset in the file.
 ///
@@ -783,14 +924,21 @@ impl IdMapIndex<'_> {
 ///
 /// Returns an error for any fourcc or HNSW and storage pairing outside the
 /// supported layouts, a scalar quantizer type other than `QT_fp16`,
-/// `QT_bf16`, or `QT_8bit_direct_signed`, a negative dimension or count,
-/// a count beyond what Faiss accepts, or a structure running past the
-/// data.
+/// `QT_bf16`, or `QT_8bit_direct_signed`, a negative dimension, count, or
+/// code size, a count beyond what Faiss accepts, or a structure running
+/// past the data.
 pub fn parse(payload: &[u8], base: usize) -> Result<IdMapIndex<'_>> {
     let mut cur = Cursor::new(payload, base);
 
     let offset = cur.offset();
-    expect_fourcc(&mut cur, &[FourCc::ID_MAP], "IxMp")?;
+    let fourcc = expect_fourcc(
+        &mut cur,
+        &[FourCc::ID_MAP, FourCc::BINARY_ID_MAP],
+        "IxMp or IBMp",
+    )?;
+    if fourcc == FourCc::BINARY_ID_MAP {
+        return parse_binary(cur, offset);
+    }
     let header = IndexHeader::read(&mut cur, offset)?;
 
     let hnsw_offset = cur.offset();
@@ -832,12 +980,58 @@ pub fn parse(payload: &[u8], base: usize) -> Result<IdMapIndex<'_>> {
     let id_map = cur.vector("id_map")?;
 
     Ok(IdMapIndex {
+        fourcc,
         header,
         index: HnswIndex {
             fourcc: hnsw_fourcc,
             header: hnsw_header,
             graph,
             storage,
+        },
+        id_map,
+        end: cur.offset(),
+    })
+}
+
+/// The rest of a binary layout, `IBMp` read: its header, `IBHf` with its
+/// header and graph, `IBxF` with its header and codes, then the labels.
+fn parse_binary(mut cur: Cursor<'_>, offset: usize) -> Result<IdMapIndex<'_>> {
+    let header = IndexHeader::read_binary(&mut cur, offset)?;
+
+    let hnsw_offset = cur.offset();
+    expect_fourcc(&mut cur, &[FourCc::BINARY_HNSW], "IBHf")?;
+    let hnsw_header = IndexHeader::read_binary(&mut cur, hnsw_offset)?;
+    let graph = HnswGraph::read(&mut cur)?;
+
+    let storage_offset = cur.offset();
+    let storage_fourcc = FourCc(cur.fourcc("index type")?);
+    if storage_fourcc != FourCc::BINARY_FLAT {
+        return Err(Error::UnsupportedLayout {
+            offset: storage_offset,
+            fourcc: storage_fourcc,
+            expected: if storage_fourcc == FourCc::NULL {
+                NULL_STORAGE_EXPECTED
+            } else {
+                BINARY_STORAGE_EXPECTED
+            },
+        });
+    }
+    let storage_header = IndexHeader::read_binary(&mut cur, storage_offset)?;
+    let codes = cur.vector("binary codes")?;
+
+    let id_map = cur.vector("id_map")?;
+
+    Ok(IdMapIndex {
+        fourcc: FourCc::BINARY_ID_MAP,
+        header,
+        index: HnswIndex {
+            fourcc: FourCc::BINARY_HNSW,
+            header: hnsw_header,
+            graph,
+            storage: Storage::Binary(BinaryStorage {
+                header: storage_header,
+                codes,
+            }),
         },
         id_map,
         end: cur.offset(),

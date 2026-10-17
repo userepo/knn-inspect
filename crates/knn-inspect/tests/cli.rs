@@ -640,7 +640,7 @@ fn scan_walks_a_directory_and_cross_checks_lucene_vectors() {
     assert_eq!(v["status"], "clean");
     assert_eq!(
         v["summary"],
-        serde_json::json!({"files": 6, "clean": 6, "warnings": 0, "failed": 0})
+        serde_json::json!({"files": 6, "clean": 6, "warnings": 0, "unsupported": 0, "failed": 0})
     );
     let files = v["files"].as_array().unwrap();
     assert_eq!(files.len(), 6);
@@ -678,17 +678,17 @@ fn scan_walks_a_directory_and_cross_checks_lucene_vectors() {
     assert!(text.contains("6 native file(s)"), "{text}");
     assert!(
         text.contains(
-            "pass      lucene_vectors       500 vectors found byte for byte at offset 128"
+            "pass        lucene_vectors       500 vectors found byte for byte at offset 128"
         ),
         "{text}"
     );
     assert!(
-        text.contains("skip      lucene_vectors       no .vec file of segment _2 beside"),
+        text.contains("skip        lucene_vectors       no .vec file of segment _2 beside"),
         "{text}"
     );
     assert!(
         text.trim_end()
-            .ends_with("6 file(s): 6 clean, 0 with warnings, 0 failed; exit code 0"),
+            .ends_with("6 file(s): 6 clean, 0 with warnings, 0 unsupported, 0 failed; exit code 0"),
         "{text}"
     );
 }
@@ -810,8 +810,8 @@ fn scan_reports_every_corrupted_file() {
 
     let o = run(&["scan", dir.to_str().unwrap()]);
     let text = stdout(&o);
-    assert!(text.contains("FAIL      neighbor_levels"), "{text}");
-    assert!(text.contains("WARN      self_loops"), "{text}");
+    assert!(text.contains("FAIL        neighbor_levels"), "{text}");
+    assert!(text.contains("WARN        self_loops"), "{text}");
     assert!(text.contains("(did not parse)"), "{text}");
 }
 
@@ -1037,7 +1037,7 @@ fn scan_fails_files_whose_lucene_files_are_damaged() {
 
     let o = run(&["scan", scratch.0.to_str().unwrap()]);
     assert!(
-        stdout(&o).contains("FAIL      lucene_docs"),
+        stdout(&o).contains("FAIL        lucene_docs"),
         "{}",
         stdout(&o)
     );
@@ -1149,7 +1149,7 @@ fn scan_flags_labels_that_are_not_doc_ids_of_the_segment() {
 
     let o = run(&["scan", scratch.0.to_str().unwrap()]);
     assert!(
-        stdout(&o).contains("FAIL      lucene_docs"),
+        stdout(&o).contains("FAIL        lucene_docs"),
         "{}",
         stdout(&o)
     );
@@ -1288,7 +1288,7 @@ fn scan_reads_fp16_segments() {
     let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
     assert_eq!(
         v["summary"],
-        serde_json::json!({"files": 6, "clean": 6, "warnings": 0, "failed": 0})
+        serde_json::json!({"files": 6, "clean": 6, "warnings": 0, "unsupported": 0, "failed": 0})
     );
     for f in v["files"].as_array().unwrap() {
         assert_eq!(
@@ -1544,7 +1544,7 @@ fn bf16_files_are_read() {
     let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
     assert_eq!(
         v["summary"],
-        serde_json::json!({"files": 3, "clean": 3, "warnings": 0, "failed": 0})
+        serde_json::json!({"files": 3, "clean": 3, "warnings": 0, "unsupported": 0, "failed": 0})
     );
     for f in v["files"].as_array().unwrap() {
         let lv = &f["lucene_vectors"];
@@ -1624,7 +1624,7 @@ fn byte_files_are_read() {
     let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
     assert_eq!(
         v["summary"],
-        serde_json::json!({"files": 2, "clean": 2, "warnings": 0, "failed": 0})
+        serde_json::json!({"files": 2, "clean": 2, "warnings": 0, "unsupported": 0, "failed": 0})
     );
     for f in v["files"].as_array().unwrap() {
         let lv = &f["lucene_vectors"];
@@ -1909,4 +1909,581 @@ fn scan_accepts_the_bf16_code_either_faiss_encoder_gives() {
     seg.set_float(k, halfway_up(seg.code(k)));
     reseal(&mut seg.vec);
     assert_eq!(seg.scan()["status"], "mismatch");
+}
+
+#[test]
+fn binary_files_are_read() {
+    let dir = fixtures().join("opensearch-3.9.0-binary/binary/hamming");
+    let real = dir.join("_2_165_vec.faiss");
+    let path = real.to_str().unwrap();
+    let o = run(&["info", path]);
+    assert_eq!(o.status.code(), Some(0));
+    let text = stdout(&o);
+    assert!(text.contains("IBMp > IBHf > IBxF"), "{text}");
+    assert!(
+        text.contains("dimension       128 bits, code size 16 bytes"),
+        "{text}"
+    );
+    assert!(text.contains("metric          hamming"), "{text}");
+    let o = run(&["info", "--json", path]);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["layout"], serde_json::json!(["IBMp", "IBHf", "IBxF"]));
+    assert_eq!(v["dimension"], 128);
+    assert_eq!(v["code_size"], 16);
+    assert_eq!(v["metric"], "hamming");
+    assert!(v.get("quantizer").is_none(), "{v}");
+
+    let o = run(&["verify", path, "--space", "hamming"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+    let text = stdout(&o);
+    assert!(
+        text.contains("binary codes are bits, all of them valid"),
+        "{text}"
+    );
+    // A float space is a float field with the binary encoder, which the
+    // file cannot tell apart: noted, and clean.
+    let o = run(&["verify", path, "--space", "l2"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+    assert!(
+        stdout(&o).contains("binary storage in an l2 field"),
+        "{}",
+        stdout(&o)
+    );
+    let o = run(&["verify", path, "--json", "--space", "hamming"]);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["space"], "hamming");
+    let o = run(&["stats", path]);
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+
+    // The tool's own search over packed bits reproduces Faiss's recall,
+    // with queries of packed bits.
+    let synthetic = fixtures().join("synthetic-binary");
+    let file = synthetic.join("hamming-1000x256-binary.faiss");
+    let queries = synthetic.join("hamming-1000x256-binary.queries.u8");
+    let o = run(&[
+        "recall",
+        file.to_str().unwrap(),
+        "--queries",
+        queries.to_str().unwrap(),
+        "--json",
+    ]);
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["recall"], 0.752);
+    assert_eq!(v["metric"], "hamming");
+    assert_eq!(v["dimension"], 256);
+    let o = run(&["recall", file.to_str().unwrap(), "--sample", "20"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+    // Float32 queries are not bits: the 100 float32 queries of 32
+    // dimensions are 12,800 bytes, which is 400 rows of 256 bits, so they
+    // are read as bits and searched; 4 bytes short of that is refused.
+    let floats = fixtures().join("synthetic/l2-1000x32.queries.f32");
+    let mut short = std::fs::read(&floats).unwrap();
+    short.truncate(short.len() - 4);
+    let scratch = Scratch::new("binary-queries");
+    let short_path = scratch.0.join("short.u8");
+    std::fs::write(&short_path, &short).unwrap();
+    let o = run(&[
+        "recall",
+        file.to_str().unwrap(),
+        "--queries",
+        short_path.to_str().unwrap(),
+    ]);
+    assert_eq!(o.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        err.contains(
+            "12796 bytes of queries is not a multiple of 32, the bytes in a row of dimension 256"
+        ),
+        "{err}"
+    );
+
+    // scan finds the bits in the segment's .vec at 92, where its .vemf
+    // puts them: Lucene's copy of a binary field is a byte field of
+    // dimension / 8 bytes.
+    let o = run(&["scan", dir.to_str().unwrap(), "--json"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    let lv = &v["files"][0]["lucene_vectors"];
+    assert_eq!(lv["status"], "match", "{lv}");
+    assert_eq!(lv["offset"], 92, "{lv}");
+    assert_eq!(
+        lv["detail"],
+        "500 vectors found byte for byte at offset 92, where the .vemf puts them"
+    );
+    assert_eq!(v["files"][0]["code_size"], 16, "{v}");
+    let o = run(&["scan", dir.to_str().unwrap()]);
+    assert!(
+        stdout(&o).contains("IBMp > IBHf > IBxF  d=128 bits n=500 hamming"),
+        "{}",
+        stdout(&o)
+    );
+}
+
+/// A copy of a real binary segment's native file, `.vec`, `.vemf`, and
+/// quantization state where it has one; `meta_bytes`, when set, is
+/// written as the `.vemf` instead of the source's.
+struct BinarySegment {
+    scratch: Scratch,
+    source: PathBuf,
+    native: Vec<u8>,
+    meta: bool,
+    meta_bytes: Option<Vec<u8>>,
+    state: bool,
+}
+
+impl BinarySegment {
+    const VEC: &'static str = "_2_NativeEngines990KnnVectorsFormat_0.vec";
+
+    fn new(name: &str, set: &str) -> Self {
+        let source = fixtures().join(set);
+        Self {
+            scratch: Scratch::new(name),
+            native: std::fs::read(source.join("_2_165_vec.faiss")).unwrap(),
+            source,
+            meta: true,
+            meta_bytes: None,
+            state: true,
+        }
+    }
+
+    fn scan(&self) -> serde_json::Value {
+        let dir = &self.scratch.0;
+        std::fs::write(dir.join("_2_165_vec.faiss"), &self.native).unwrap();
+        std::fs::copy(self.source.join(Self::VEC), dir.join(Self::VEC)).unwrap();
+        for (keep, extension) in [(self.meta, "vemf"), (self.state, "osknnqstate")] {
+            let from = self.source.join(Self::VEC).with_extension(extension);
+            let to = dir.join(Self::VEC).with_extension(extension);
+            match &self.meta_bytes {
+                Some(bytes) if keep && extension == "vemf" => std::fs::write(to, bytes).unwrap(),
+                _ if keep && from.is_file() => {
+                    std::fs::copy(from, to).unwrap();
+                }
+                _ => {
+                    let _ = std::fs::remove_file(to);
+                }
+            }
+        }
+        let o = run(&["scan", dir.to_str().unwrap(), "--json"]);
+        let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+        v["files"][0]["lucene_vectors"].clone()
+    }
+}
+
+#[test]
+fn scan_flags_binary_codes_that_differ_from_the_lucene_copy() {
+    let mut seg = BinarySegment::new("binary-flip", "opensearch-3.9.0-binary/binary/hamming");
+    assert_eq!(seg.scan()["status"], "match");
+    // One bit of the native codes flipped, the file resealed.
+    let codes = {
+        let parsed = knn_format::parse(&seg.native).unwrap();
+        knn_format::view_offset(&seg.native, parsed.index.index.storage.code_bytes()).unwrap()
+    };
+    seg.native[codes + 100] ^= 0x01;
+    reseal(&mut seg.native);
+    let lv = seg.scan();
+    assert_eq!(lv["status"], "mismatch", "{lv}");
+    assert!(
+        lv["detail"]
+            .as_str()
+            .unwrap()
+            .ends_with("(the field the .vemf puts at offset 92 holds other values)"),
+        "{lv}"
+    );
+    // Without the .vemf the .vec is searched, and holds them nowhere.
+    seg.meta = false;
+    let lv = seg.scan();
+    assert_eq!(lv["status"], "mismatch", "{lv}");
+}
+
+#[test]
+fn scan_skips_fields_with_the_binary_encoder() {
+    // A float field with the binary encoder writes a binary index over the
+    // bits its float32 vectors quantize to; its .vec holds the floats,
+    // which the bits cannot be checked against.
+    let mut seg = BinarySegment::new(
+        "binary-encoder",
+        "opensearch-3.9.0-binary/binary-encoder/l2",
+    );
+    let lv = seg.scan();
+    assert_eq!(lv["status"], "skipped", "{lv}");
+    let detail = lv["detail"].as_str().unwrap();
+    assert!(
+        detail.starts_with("the stored bits may quantize the float32 vectors a .vec holds"),
+        "{detail}"
+    );
+    assert!(
+        detail.ends_with(
+            "(its .vemf records a float32 field of as many vectors whose bits fit the codes, and a quantization state file lies beside it)"
+        ),
+        "{detail}"
+    );
+    // The .vemf alone does not say it: a plain float field of as many
+    // vectors has no quantization state.
+    seg.state = false;
+    assert_eq!(seg.scan()["status"], "mismatch");
+    seg.state = true;
+    // Without the .vemf, the quantization state beside the .vec says the
+    // same.
+    seg.meta = false;
+    let lv = seg.scan();
+    assert_eq!(lv["status"], "skipped", "{lv}");
+    assert!(
+        lv["detail"]
+            .as_str()
+            .unwrap()
+            .ends_with("(a quantization state file lies beside it)"),
+        "{lv}"
+    );
+    // With neither, nothing says the .vec is not the bits' own: a
+    // mismatch.
+    seg.state = false;
+    let lv = seg.scan();
+    assert_eq!(lv["status"], "mismatch", "{lv}");
+}
+
+/// Lucene's vlong: 7 bits a byte, low bits first.
+fn vlong(mut v: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    while v >= 0x80 {
+        out.push(u8::try_from(v & 0x7f).unwrap() | 0x80);
+        v >>= 7;
+    }
+    out.push(u8::try_from(v).unwrap());
+    out
+}
+
+/// A record of `Lucene99FlatVectorsFormatMeta` for a dense float32 field:
+/// field 7, euclidean, `dimension` components (under 128, one vint byte),
+/// 500 vectors, at an offset and length no check reads here.
+fn float_record(dimension: u8) -> Vec<u8> {
+    float_record_at(dimension, 128, 64_000)
+}
+
+/// [`float_record`] at `offset`, `length` bytes long.
+fn float_record_at(dimension: u8, offset: u64, length: u64) -> Vec<u8> {
+    record_at(1, dimension, offset, length)
+}
+
+/// A record of encoding `encoding` (0 byte, 1 float32), as
+/// [`float_record`] describes.
+fn record_at(encoding: i32, dimension: u8, offset: u64, length: u64) -> Vec<u8> {
+    assert!(dimension < 0x80, "a one-byte vint");
+    let mut r = Vec::new();
+    for word in [7_i32, encoding, 0] {
+        r.extend_from_slice(&word.to_le_bytes());
+    }
+    r.extend(vlong(offset));
+    r.extend(vlong(length));
+    r.push(dimension);
+    r.extend_from_slice(&500_i32.to_le_bytes());
+    r.extend_from_slice(&(-1_i64).to_le_bytes());
+    r.extend_from_slice(&0_i64.to_le_bytes());
+    r.extend_from_slice(&(-1_i16).to_le_bytes());
+    r.push(0xff);
+    r
+}
+
+#[test]
+fn scan_flags_corrupt_bits_beside_float_fields_that_are_not_theirs() {
+    // A binary field with one code byte changed, in a segment that also
+    // holds float32 fields of as many vectors, as when every document has
+    // both.
+    let mut seg = BinarySegment::new("binary-and-float", "opensearch-3.9.0-binary/binary/hamming");
+    let codes = {
+        let parsed = knn_format::parse(&seg.native).unwrap();
+        knn_format::view_offset(&seg.native, parsed.index.index.storage.code_bytes()).unwrap()
+    };
+    seg.native[codes + 100] ^= 0x01;
+    reseal(&mut seg.native);
+    let mismatch = "(the field the .vemf puts at offset 92 holds other values)";
+
+    // A real on_disk float field's .vec and .vemf beside the binary one,
+    // with a quantization state, as a quantized field has: still, 16
+    // float32 components do not pack into the codes' 16 bytes at 1, 2, or
+    // 4 bits, so they are no source of these codes.
+    let on_disk = fixtures().join("opensearch-3.9.0-binary/on-disk/l2");
+    for extension in ["vec", "vemf"] {
+        let name = format!("_2_Faiss1040ScalarQuantizedKnnVectorsFormat_0.{extension}");
+        std::fs::copy(on_disk.join(&name), seg.scratch.0.join(&name)).unwrap();
+    }
+    let state = fixtures()
+        .join("opensearch-3.9.0-binary/binary-encoder/l2")
+        .join(BinarySegment::VEC)
+        .with_extension("osknnqstate");
+    std::fs::copy(
+        &state,
+        seg.scratch
+            .0
+            .join("_2_Faiss1040ScalarQuantizedKnnVectorsFormat_0.osknnqstate"),
+    )
+    .unwrap();
+    let lv = seg.scan();
+    assert_eq!(lv["status"], "mismatch", "{lv}");
+    assert!(lv["detail"].as_str().unwrap().contains(mismatch), "{lv}");
+
+    // A float32 field of 127 components in the binary field's own .vemf:
+    // at 1 bit its vectors pack into the codes' 16 bytes, but without a
+    // quantization state no field of the format is quantized.
+    let original =
+        std::fs::read(seg.source.join(BinarySegment::VEC).with_extension("vemf")).unwrap();
+    // The records end with the field number -1, then the 16-byte footer.
+    let records_end = original.len() - 20;
+    let mut meta = original[..records_end].to_vec();
+    meta.extend(float_record(127));
+    meta.extend_from_slice(&original[records_end..]);
+    reseal(&mut meta);
+    seg.meta_bytes = Some(meta);
+    seg.state = false;
+    let lv = seg.scan();
+    assert_eq!(lv["status"], "mismatch", "{lv}");
+    assert!(lv["detail"].as_str().unwrap().contains(mismatch), "{lv}");
+
+    // With a quantization state beside it, the float field may be the one
+    // the bits quantize, and the check cannot tell: skipped.
+    std::fs::copy(
+        state,
+        seg.scratch
+            .0
+            .join(BinarySegment::VEC)
+            .with_extension("osknnqstate"),
+    )
+    .unwrap();
+    let dir = &seg.scratch.0;
+    std::fs::write(dir.join("_2_165_vec.faiss"), &seg.native).unwrap();
+    let o = run(&["scan", dir.to_str().unwrap(), "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["files"][0]["lucene_vectors"]["status"], "skipped", "{v}");
+}
+
+#[test]
+fn a_mismatch_names_the_field_that_was_compared() {
+    // One code byte of a binary field changed, and a float32 field of 500
+    // vectors of 16 components, as many as the codes' bytes, after it in
+    // the same .vec: a field of their shape whose components are 4 bytes
+    // wide. The mismatch is the binary field's, and says so.
+    let mut seg = BinarySegment::new("binary-reason", "opensearch-3.9.0-binary/binary/hamming");
+    let codes = {
+        let parsed = knn_format::parse(&seg.native).unwrap();
+        knn_format::view_offset(&seg.native, parsed.index.index.storage.code_bytes()).unwrap()
+    };
+    seg.native[codes + 100] ^= 0x01;
+    reseal(&mut seg.native);
+
+    let source_vec = std::fs::read(seg.source.join(BinarySegment::VEC)).unwrap();
+    // The bits end at 92 + 8,000; the floats follow, zeros, before the
+    // footer.
+    let floats_at = 8092;
+    let mut vec = source_vec[..source_vec.len() - 16].to_vec();
+    assert_eq!(vec.len(), floats_at);
+    vec.resize(floats_at + 500 * 16 * 4, 0);
+    vec.extend_from_slice(&source_vec[source_vec.len() - 16..]);
+    reseal(&mut vec);
+
+    let source_meta =
+        std::fs::read(seg.source.join(BinarySegment::VEC).with_extension("vemf")).unwrap();
+    let records_end = source_meta.len() - 20;
+    let mut meta = source_meta[..records_end].to_vec();
+    meta.extend(float_record_at(16, floats_at as u64, 500 * 16 * 4));
+    meta.extend_from_slice(&source_meta[records_end..]);
+    reseal(&mut meta);
+    seg.meta_bytes = Some(meta);
+    seg.state = false;
+
+    let mismatch = "(the field the .vemf puts at offset 92 holds other values)";
+    // Over the fixture's .vec the float field lies past the end, which is
+    // no closer than the binary field came.
+    let lv = seg.scan();
+    assert_eq!(lv["status"], "mismatch", "{lv}");
+    assert!(lv["detail"].as_str().unwrap().ends_with(mismatch), "{lv}");
+    // Over the .vec that holds the floats, their width does not fit.
+    let dir = &seg.scratch.0;
+    std::fs::write(dir.join(BinarySegment::VEC), &vec).unwrap();
+    let o = run(&["scan", dir.to_str().unwrap(), "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    let lv = &v["files"][0]["lucene_vectors"];
+    assert_eq!(lv["status"], "mismatch", "{lv}");
+    assert!(lv["detail"].as_str().unwrap().ends_with(mismatch), "{lv}");
+}
+
+/// `meta`, a real `.vemf`, with its records replaced by `records`, the -1
+/// that ends them, and its footer, resealed.
+fn vemf_with(meta: &[u8], records: &[u8]) -> Vec<u8> {
+    // The Lucene header of the fixtures' Lucene99 .vemf is 89 bytes.
+    let mut out = meta[..89].to_vec();
+    out.extend_from_slice(records);
+    out.extend_from_slice(&(-1_i32).to_le_bytes());
+    out.extend_from_slice(&meta[meta.len() - 16..]);
+    reseal(&mut out);
+    out
+}
+
+#[test]
+fn every_bit_width_of_the_binary_encoder_is_recognized() {
+    // The binary-encoder segment's 2-byte codes, with a .vemf recording
+    // only a float32 field of `dimension` components. At 2 bits 8
+    // components take 2 bytes, at 4 bits 4 components do, and 32
+    // components take 2 bytes at no width k-NN's encoder offers.
+    let mut seg = BinarySegment::new("binary-widths", "opensearch-3.9.0-binary/binary-encoder/l2");
+    let source = std::fs::read(seg.source.join(BinarySegment::VEC).with_extension("vemf")).unwrap();
+    for (dimension, status) in [(8, "skipped"), (4, "skipped"), (32, "mismatch")] {
+        seg.meta_bytes = Some(vemf_with(&source, &float_record(dimension)));
+        let lv = seg.scan();
+        assert_eq!(lv["status"], status, "{dimension} components: {lv}");
+    }
+}
+
+#[test]
+fn equally_close_fields_report_the_last() {
+    // Corrupt binary codes, and two byte fields of their shape that hold
+    // other values: the fixture's at 92 and a second, at 96, after it.
+    // The report names the second.
+    let mut seg = BinarySegment::new("binary-ties", "opensearch-3.9.0-binary/binary/hamming");
+    let codes = {
+        let parsed = knn_format::parse(&seg.native).unwrap();
+        knn_format::view_offset(&seg.native, parsed.index.index.storage.code_bytes()).unwrap()
+    };
+    seg.native[codes + 100] ^= 0x01;
+    reseal(&mut seg.native);
+    let source = std::fs::read(seg.source.join(BinarySegment::VEC).with_extension("vemf")).unwrap();
+    // The fixture's own record: from the header to the -1 and the footer.
+    let mut records = source[89..source.len() - 20].to_vec();
+    records.extend(record_at(0, 16, 96, 8000));
+    seg.meta_bytes = Some(vemf_with(&source, &records));
+    let lv = seg.scan();
+    assert_eq!(lv["status"], "mismatch", "{lv}");
+    assert!(
+        lv["detail"]
+            .as_str()
+            .unwrap()
+            .ends_with("(the field the .vemf puts at offset 96 holds other values)"),
+        "{lv}"
+    );
+}
+
+#[test]
+fn scan_reports_an_on_disk_graph_as_unsupported() {
+    // k-NN 3.9 writes an on_disk field's graph without its vectors, a
+    // layout this tool does not read. The file is sound, so scan says
+    // unsupported, exit code 2, with the structure check naming the
+    // layout; verify alone fails it.
+    let dir = fixtures().join("opensearch-3.9.0-binary/on-disk/l2");
+    let o = run(&["scan", dir.to_str().unwrap(), "--json"]);
+    assert_eq!(o.status.code(), Some(2), "{}", stdout(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["status"], "unsupported", "{v}");
+    assert_eq!(
+        v["summary"],
+        serde_json::json!({"files": 1, "clean": 0, "warnings": 0, "unsupported": 1, "failed": 0})
+    );
+    let f = &v["files"][0];
+    assert_eq!(f["status"], "unsupported", "{f}");
+    assert!(f.get("layout").is_none(), "{f}");
+    let checks = f["checks"].as_array().unwrap();
+    let structure = checks.iter().find(|c| c["name"] == "structure").unwrap();
+    assert!(
+        structure["findings"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("null is a graph without its vectors"),
+        "{structure}"
+    );
+    assert_eq!(
+        f["lucene_vectors"]["detail"],
+        "the native file's layout is not supported"
+    );
+    assert_eq!(
+        f["lucene_docs"]["detail"],
+        "the native file's layout is not supported"
+    );
+    let o = run(&["scan", dir.to_str().unwrap()]);
+    let text = stdout(&o);
+    assert!(
+        text.contains("    unsupported (a layout this tool does not read)\n"),
+        "{text}"
+    );
+    // The structure finding names the layout, as a note: the file is not
+    // failed for it.
+    assert!(
+        text.contains("    note        structure            unsupported index type null"),
+        "{text}"
+    );
+    assert!(!text.contains("FAIL"), "{text}");
+    assert!(
+        text.ends_with(
+            "1 file(s): 0 clean, 0 with warnings, 1 unsupported, 0 failed; exit code 2\n"
+        ),
+        "{text}"
+    );
+    let o = run(&["verify", dir.join("_2_165_vec.faiss").to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(1), "{}", stdout(&o));
+
+    // The same layout in a file whose footer does not verify, or with no
+    // footer at all, is failed: nothing says the unknown fourcc is not
+    // damage.
+    let scratch = Scratch::new("unsupported-damaged");
+    let mut bytes = std::fs::read(dir.join("_2_165_vec.faiss")).unwrap();
+    let at = bytes.len() - 1;
+    bytes[at] ^= 0xff;
+    std::fs::write(scratch.0.join("_2_165_vec.faiss"), &bytes).unwrap();
+    let o = run(&["scan", scratch.0.to_str().unwrap(), "--json"]);
+    assert_eq!(o.status.code(), Some(1), "{}", stdout(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["files"][0]["status"], "failed", "{v}");
+    let bare = fixtures().join("corrupted/wrong-fourcc.faiss");
+    std::fs::copy(bare, scratch.0.join("_2_165_vec.faiss")).unwrap();
+    let o = run(&["scan", scratch.0.to_str().unwrap(), "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["files"][0]["status"], "failed", "{v}");
+}
+
+#[test]
+fn info_reports_the_id_maps_code_size() {
+    // The storage header says 3, the ID map's 2: info reports the ID
+    // map's, as it does the dimension and count, and verify fails the
+    // disagreement.
+    let file = fixtures().join("corrupted/binary-header-code-size.faiss");
+    let path = file.to_str().unwrap();
+    let o = run(&["info", "--json", path]);
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["code_size"], 2, "{v}");
+    assert_eq!(v["dimension"], 16, "{v}");
+    let o = run(&["verify", path]);
+    assert_eq!(o.status.code(), Some(1), "{}", stdout(&o));
+    // A float file records no code size.
+    let float = fixtures().join("synthetic/l2-100x4.faiss");
+    let o = run(&["info", "--json", float.to_str().unwrap()]);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert!(v.get("code_size").is_none(), "{v}");
+}
+
+#[test]
+fn recall_reads_a_binary_files_rows_by_its_code_size() {
+    // Dimension 12 but code size 2: Faiss reads every vector as 2 bytes,
+    // and so do the queries, from a file or sampled.
+    let file = fixtures().join("corrupted/binary-dimension-not-byte.faiss");
+    let queries = fixtures().join("synthetic-binary/hamming-100x16-binary.queries.u8");
+    let o = run(&[
+        "recall",
+        file.to_str().unwrap(),
+        "--queries",
+        queries.to_str().unwrap(),
+        "--json",
+    ]);
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}{}",
+        stdout(&o),
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["queries"], 100);
+    assert_eq!(
+        v["dimension"], 16,
+        "the queries' dimension: the bits of the code size, not the header's 12"
+    );
+    let o = run(&["recall", file.to_str().unwrap(), "--sample", "5", "--json"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
 }

@@ -14,10 +14,12 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use knn_format::faiss::{FlatStorage, FourCc, HnswGraph, HnswIndex, IndexHeader, Metric, Storage};
+use knn_format::faiss::{
+    FlatStorage, FourCc, HeaderKind, HnswGraph, HnswIndex, IndexHeader, Metric, Storage,
+};
 use knn_format::{F32, F64, I32, U64};
 use knn_recall::{
-    Error, Labels, Queries, Searcher, ground_truth, result_labels, score, search_all,
+    Error, Labels, Queries, Query, Searcher, ground_truth, result_labels, score, search_all,
 };
 use serde::Deserialize;
 
@@ -43,6 +45,7 @@ fn baselines() -> Vec<PathBuf> {
         "synthetic-fp16",
         "synthetic-bf16",
         "synthetic-byte",
+        "synthetic-binary",
     ] {
         for entry in fs::read_dir(fixtures().join(synthetic)).unwrap() {
             let p = entry.unwrap().path();
@@ -58,6 +61,8 @@ fn baselines() -> Vec<PathBuf> {
         "opensearch-3.9.0-fp16/half-float",
         "opensearch-3.9.0-bf16/sq-bf16",
         "opensearch-3.9.0-byte/byte",
+        "opensearch-3.9.0-binary/binary",
+        "opensearch-3.9.0-binary/binary-encoder",
     ] {
         for entry in fs::read_dir(fixtures().join(set)).unwrap() {
             out.push(entry.unwrap().path().join("recall.json"));
@@ -65,6 +70,15 @@ fn baselines() -> Vec<PathBuf> {
     }
     out.sort();
     out
+}
+
+/// A baseline's queries: packed bits for a binary file, float32 rows for
+/// any other.
+fn load_queries(storage: &Storage<'_>, bytes: &[u8], d: usize) -> Queries {
+    match storage {
+        Storage::Binary(_) => Queries::from_bits(bytes, d).unwrap(),
+        Storage::Flat(_) | Storage::Sq(_) => Queries::from_bytes(bytes, d).unwrap(),
+    }
 }
 
 fn read_results(path: &Path) -> Vec<Vec<i64>> {
@@ -91,9 +105,11 @@ fn own_search_matches_faiss() {
         let bytes = fs::read(dir.join(&b.file)).unwrap();
         let parsed = knn_format::parse(&bytes).unwrap();
         let index = &parsed.index;
-        let queries =
-            Queries::from_bytes(&fs::read(dir.join(&b.queries_file)).unwrap(), b.dimension)
-                .unwrap();
+        let queries = load_queries(
+            &index.index.storage,
+            &fs::read(dir.join(&b.queries_file)).unwrap(),
+            b.dimension,
+        );
         let faiss = read_results(&dir.join(&b.results_file));
         assert_eq!(
             usize::try_from(index.index.graph.ef_search).unwrap(),
@@ -133,20 +149,25 @@ fn own_search_matches_faiss() {
             // Only an inner-product list may differ: see below.
             assert!(
                 inner_product,
-                "{}: an L2 list differs from Faiss's: {ours:?} vs {theirs:?}",
+                "{}: an L2 or Hamming list differs from Faiss's: {ours:?} vs {theirs:?}",
                 b.file
             );
             inner_product_differences += 1;
         }
         seen += 1;
     }
-    assert_eq!(seen, 32, "15 synthetic and 17 real baselines");
+    assert_eq!(seen, 37, "18 synthetic and 19 real baselines");
     // The search follows Faiss step for step. Every L2 list comes out
     // identical to the ones faiss-cpu 1.15.1 wrote, fp16, bf16, and byte
     // ones included, and so do the nearly all-tied lists of the byte ties
     // case, which pin how the search breaks exact distance ties: reversing
     // both of its node-id tie-breaks, the candidate queue's and the result
-    // heap's, changes 103 of the L2 lists. A last-bit difference in a
+    // heap's, changes 103 of the L2 lists. Every Hamming list of the binary
+    // files comes out identical too: Faiss orders Hamming distances, small
+    // integers that tie at every turn, with the same max-heaps as L2.
+    // Reversing those two tie-breaks changes all 500 binary lists, and
+    // picking the leftmost of equal candidates from the queue instead of
+    // the rightmost changes 171 of them. A last-bit difference in a
     // distance sum (this crate sums in order; Faiss's float32 code and its
     // SIMD builds' scalar-quantizer code regroup) could legitimately change
     // a list on other data; here, any mismatch means a changed search, so
@@ -234,10 +255,12 @@ impl Built {
             offset: 0,
             d: self.d,
             ntotal: n,
-            reserved: [1 << 20, 1 << 20],
             is_trained: true,
             metric_type: self.metric_type,
-            metric_arg: None,
+            kind: HeaderKind::Float {
+                reserved: [1 << 20, 1 << 20],
+                metric_arg: None,
+            },
         };
         HnswIndex {
             fourcc: FourCc::HNSW_FLAT,
@@ -373,6 +396,7 @@ fn unreachable_nodes_leave_short_lists() {
     let index = b.index();
     let hits = Searcher::new(3).search(&index, &[0.0], 3, 16).unwrap();
     let parsed = knn_format::faiss::IdMapIndex {
+        fourcc: FourCc::ID_MAP,
         header: index.header,
         index,
         id_map: &[knn_format::I64::new(100), knn_format::I64::new(101)],
@@ -510,7 +534,7 @@ fn scalar_quantized_samples_are_the_decoded_rows() {
         assert_eq!(&rows[..8], &[487, 727, 212, 720, 842, 285, 158, 580]);
         for (q, &row) in q.rows().zip(&rows) {
             let v: Vec<f32> = sq.decoded(row).unwrap().collect();
-            assert_eq!(q, &v[..], "{file}");
+            assert_eq!(q, Query::Floats(&v[..]), "{file}");
         }
     }
 }
@@ -543,7 +567,7 @@ fn sampling_is_deterministic_and_distinct() {
             .iter()
             .map(|x| x.get())
             .collect();
-        assert_eq!(q, &v[..]);
+        assert_eq!(q, Query::Floats(&v[..]));
     }
     let (_, rows3) = knn_recall::sample_queries(storage, 50, 8).unwrap();
     assert_ne!(rows1, rows3, "another seed, another sample");
@@ -564,4 +588,55 @@ fn sampling_is_deterministic_and_distinct() {
     let mut all_sorted = all;
     all_sorted.sort_unstable();
     assert_eq!(all_sorted, (0..1000).collect::<Vec<_>>());
+}
+
+#[test]
+fn binary_samples_are_the_stored_bits() {
+    for file in [
+        "synthetic-binary/hamming-1000x256-binary.faiss",
+        "opensearch-3.9.0-binary/binary/hamming/_2_165_vec.faiss",
+    ] {
+        let bytes = fs::read(fixtures().join(file)).unwrap();
+        let parsed = knn_format::parse(&bytes).unwrap();
+        let storage = &parsed.index.index.storage;
+        let Storage::Binary(binary) = storage else {
+            panic!("{file}: binary storage");
+        };
+        let (q, rows) = knn_recall::sample_queries(storage, 20, 7).unwrap();
+        assert!(q.is_binary(), "{file}");
+        assert_eq!(q.d(), usize::try_from(binary.header.d).unwrap(), "{file}");
+        for (q, &row) in q.rows().zip(&rows) {
+            assert_eq!(q, Query::Bits(binary.row(row).unwrap()), "{file}");
+        }
+        // A query that is a stored vector finds it at distance 0, first or
+        // tied with another copy of the same bits.
+        let mut searcher = Searcher::new(parsed.index.index.graph.node_count());
+        let row = binary.row(rows[0]).unwrap();
+        let hits = searcher.search(&parsed.index.index, row, 5, 64).unwrap();
+        assert_eq!(hits[0].distance.to_bits(), 0.0_f32.to_bits(), "{file}");
+        // Each hit's distance is the bits in which its codes differ from
+        // the query's, nearest first.
+        for pair in hits.windows(2) {
+            assert!(pair[0].distance <= pair[1].distance, "{file}: {hits:?}");
+        }
+        for hit in &hits {
+            let bits: u32 = binary
+                .row(hit.node)
+                .unwrap()
+                .iter()
+                .zip(row)
+                .map(|(a, b)| (a ^ b).count_ones())
+                .sum();
+            let bits = u16::try_from(bits).unwrap();
+            assert_eq!(hit.distance.to_bits(), f32::from(bits).to_bits(), "{file}");
+        }
+        // Searching with float32 queries is refused, not guessed at.
+        assert!(matches!(
+            searcher.search(&parsed.index.index, &[0.0_f32; 8], 5, 64),
+            Err(Error::QueryKind {
+                file: "binary",
+                queries: "float32"
+            })
+        ));
+    }
 }

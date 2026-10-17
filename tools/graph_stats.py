@@ -18,8 +18,8 @@ Usage:
     python tools/graph_stats.py --fixtures fixtures   rewrite the baselines
 
 The baselines are `<name>.stats.json` next to each synthetic fixture and
-`stats.json` next to each real fixture's manifest, float, fp16, bf16, and
-byte alike.
+`stats.json` next to each real fixture's manifest, float, fp16, bf16,
+byte, and binary alike.
 Rewrite them whenever the fixtures are regenerated: real fixtures get new
 neighbor arrays on every extraction.
 """
@@ -48,8 +48,15 @@ def load_graph(path: pathlib.Path) -> dict:
     footer = parse_footer(data)
     start = header["length"] if header else 0
     end = footer["offset"] if footer else len(data)
-    index = faiss.deserialize_index(np.frombuffer(data[start:end], dtype=np.uint8))
-    graph = faiss.downcast_index(faiss.downcast_index(index).index).hnsw
+    payload = np.frombuffer(data[start:end], dtype=np.uint8)
+    if data[start : start + 4] == b"IBMp":
+        # A binary index. `index` must stay referenced while its parts are
+        # read: the downcast views do not own what they point at.
+        index = faiss.deserialize_index_binary(payload)
+        graph = faiss.downcast_IndexBinary(faiss.downcast_IndexBinary(index).index).hnsw
+    else:
+        index = faiss.deserialize_index(payload)
+        graph = faiss.downcast_index(faiss.downcast_index(index).index).hnsw
     return {
         "levels": faiss.vector_to_array(graph.levels),
         "offsets": faiss.vector_to_array(graph.offsets),
@@ -127,6 +134,19 @@ def graph_stats(path: pathlib.Path) -> dict:
     }
 
 
+REAL_SETS = (
+    "opensearch-3.9.0",
+    "opensearch-3.9.0-fp16",
+    "opensearch-3.9.0-bf16",
+    "opensearch-3.9.0-byte",
+    "opensearch-3.9.0-binary",
+)
+
+# Real sets whose native file holds a graph without its vectors (a `null`
+# storage), which Faiss Python cannot read.
+UNREADABLE = ("on-disk",)
+
+
 def write(stats: dict, out: pathlib.Path) -> None:
     with open(out, "w", encoding="utf-8", newline="\n") as f:
         json.dump(stats, f, indent=2)
@@ -141,16 +161,18 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.fixtures:
-        for synthetic in ("synthetic", "synthetic-fp16", "synthetic-bf16", "synthetic-byte"):
+        for synthetic in ("synthetic", "synthetic-fp16", "synthetic-bf16", "synthetic-byte", "synthetic-binary"):
             for path in sorted((args.fixtures / synthetic).glob("*.faiss")):
                 write(graph_stats(path), path.with_suffix(".stats.json"))
         for manifest in sorted(
             m
-            for real in ("opensearch-3.9.0", "opensearch-3.9.0-fp16", "opensearch-3.9.0-bf16", "opensearch-3.9.0-byte")
+            for real in REAL_SETS
             for m in (args.fixtures / real).glob("*/*/manifest.json")
         ):
             files = json.loads(manifest.read_text(encoding="utf-8"))["files"]
             native = next(f["name"] for f in files if f["name"].endswith((".faiss", ".faissc")))
+            if manifest.parent.parent.name in UNREADABLE:
+                continue
             write(graph_stats(manifest.parent / native), manifest.parent / "stats.json")
     elif args.file:
         print(json.dumps(graph_stats(args.file), indent=2))

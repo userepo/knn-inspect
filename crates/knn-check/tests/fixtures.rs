@@ -49,6 +49,7 @@ fn space_of(name: &str) -> Space {
         "l2" => Space::L2,
         "innerproduct" => Space::InnerProduct,
         "cosinesimil" => Space::Cosine,
+        "hamming" => Space::Hamming,
         other => panic!("unknown space {other}"),
     }
 }
@@ -68,6 +69,7 @@ fn synthetic_fixtures_are_clean() {
         "synthetic-fp16",
         "synthetic-bf16",
         "synthetic-byte",
+        "synthetic-binary",
     ]
     .into_iter()
     .flat_map(|d| fs::read_dir(fixtures().join(d)).unwrap());
@@ -100,8 +102,8 @@ fn synthetic_fixtures_are_clean() {
         seen += 1;
     }
     assert_eq!(
-        seen, 15,
-        "five float, three fp16, three bf16, and four byte synthetic fixtures"
+        seen, 18,
+        "five float, three fp16, three bf16, four byte, and three binary synthetic fixtures"
     );
 }
 
@@ -197,6 +199,8 @@ fn real_fixtures_are_clean_with_their_space() {
         "opensearch-3.9.0-fp16/half-float",
         "opensearch-3.9.0-bf16/sq-bf16",
         "opensearch-3.9.0-byte/byte",
+        "opensearch-3.9.0-binary/binary",
+        "opensearch-3.9.0-binary/binary-encoder",
     ] {
         for entry in fs::read_dir(fixtures().join(set)).unwrap() {
             let dir = entry.unwrap().path();
@@ -223,8 +227,162 @@ fn real_fixtures_are_clean_with_their_space() {
         }
     }
     assert_eq!(
-        seen, 17,
-        "six float, six fp16, three bf16, and two byte real fixtures"
+        seen, 19,
+        "six float, six fp16, three bf16, two byte, one binary, and one binary-encoder real fixtures"
+    );
+}
+
+#[test]
+fn binary_files_belong_to_hamming_or_binary_encoder_fields() {
+    // A real binary field and a float field with the binary encoder: both
+    // are binary indexes, clean as hamming. Any other space is a float
+    // field with the binary encoder, which the file cannot tell from a
+    // binary field, so it is noted and stays clean.
+    for dir in [
+        "opensearch-3.9.0-binary/binary/hamming",
+        "opensearch-3.9.0-binary/binary-encoder/l2",
+    ] {
+        let bytes = fs::read(fixtures().join(dir).join("_2_165_vec.faiss")).unwrap();
+        let report = knn_check::verify(&bytes, &options(Some(Space::Hamming)));
+        assert_eq!(report.status, Status::Clean, "{dir}: {report:#?}");
+        assert_eq!(report.result(Check::Metric).unwrap().count, 0, "{dir}");
+        assert!(
+            report
+                .result(Check::VectorValues)
+                .unwrap()
+                .skipped
+                .is_some(),
+            "{dir}: bits have no values to check"
+        );
+        for space in [Space::L2, Space::InnerProduct, Space::Cosine] {
+            let report = knn_check::verify(&bytes, &options(Some(space)));
+            assert_eq!(
+                report.status,
+                Status::Clean,
+                "{dir} as {}: {report:#?}",
+                space.name()
+            );
+            let metric = report.result(Check::Metric).unwrap();
+            assert_eq!(metric.severity, Some(Severity::Info), "{dir}");
+            assert_eq!(
+                metric.findings[0].message,
+                format!(
+                    "binary storage in {} {} field: k-NN writes it for a float field with the binary encoder too, whose index compares the quantized bits by hamming distance",
+                    if space == Space::Cosine { "a" } else { "an" },
+                    space.name()
+                )
+            );
+            if space == Space::Cosine {
+                let norms = report.result(Check::Norms).unwrap();
+                assert!(
+                    norms
+                        .skipped
+                        .as_deref()
+                        .is_some_and(|s| s.starts_with("binary codes have no length")),
+                    "{norms:?}"
+                );
+            }
+        }
+    }
+    // A float file is no hamming field.
+    let bytes = fs::read(fixtures().join("opensearch-3.9.0/nocfs/l2/_2_165_vec.faiss")).unwrap();
+    let report = knn_check::verify(&bytes, &options(Some(Space::Hamming)));
+    let metric = report.result(Check::Metric).unwrap();
+    assert!(metric.failed());
+    assert_eq!(
+        metric.findings[0].message,
+        "file records metric l2, but a hamming field needs hamming; k-NN accepts hamming for binary fields only"
+    );
+}
+
+#[test]
+fn binary_header_findings_name_the_field_and_point_at_it() {
+    let dir = fixtures().join("corrupted");
+    let verify = |name: &str| knn_check::verify(&fs::read(dir.join(name)).unwrap(), &options(None));
+
+    let report = verify("binary-header-code-size.faiss");
+    let headers = report.result(Check::Headers).unwrap();
+    assert_eq!(headers.count, 1, "{report:#?}");
+    let finding = &headers.findings[0];
+    assert_eq!(
+        finding.message,
+        "storage header code size 3 differs from the id map's 2"
+    );
+    // The storage header starts at its fourcc, where the offset points.
+    let bytes = fs::read(dir.join("binary-header-code-size.faiss")).unwrap();
+    let ibxf = bytes.windows(4).position(|w| w == b"IBxF").unwrap();
+    assert_eq!(finding.offset, Some(ibxf));
+
+    let report = verify("binary-dimension-not-byte.faiss");
+    let headers = report.result(Check::Headers).unwrap();
+    assert_eq!(
+        headers.findings[0].message,
+        "binary dimension 12 is not a multiple of 8"
+    );
+    assert_eq!(
+        headers.findings[0].offset,
+        Some(4),
+        "the id map's dimension"
+    );
+
+    let report = verify("binary-metric-type.faiss");
+    assert_eq!(report.status, Status::Warnings, "{report:#?}");
+    let headers = report.result(Check::Headers).unwrap();
+    assert_eq!(headers.count, 3, "one per header: {report:#?}");
+    assert!(
+        headers.findings[0].message.starts_with(
+            "id map header records metric type 0; a binary index computes hamming distance"
+        ),
+        "{:?}",
+        headers.findings[0]
+    );
+
+    let report = verify("binary-codes-short.faiss");
+    assert_eq!(
+        report.result(Check::VectorCount).unwrap().findings[0].message,
+        "storage holds 198 bytes of binary codes; 100 vectors of 2 bytes need 200"
+    );
+}
+
+#[test]
+fn a_code_size_that_is_not_the_dimension_in_bytes_fails() {
+    // All three headers agree on a code size of 3 for 16 bits.
+    let mut bytes =
+        fs::read(fixtures().join("synthetic-binary/hamming-100x16-binary.faiss")).unwrap();
+    for tag in [&b"IBMp"[..], b"IBHf", b"IBxF"] {
+        let at = bytes.windows(4).position(|w| w == tag).unwrap();
+        bytes[at + 8..at + 12].copy_from_slice(&3_i32.to_le_bytes());
+    }
+    let report = knn_check::verify(&bytes, &options(None));
+    let headers = report.result(Check::Headers).unwrap();
+    assert_eq!(headers.count, 1, "{report:#?}");
+    assert_eq!(
+        headers.findings[0].message,
+        "code size 3 is not 2: dimension 16 packs into 2 bytes"
+    );
+    assert_eq!(headers.findings[0].offset, Some(8));
+    // 100 vectors of 3 bytes would need 300.
+    assert!(report.result(Check::VectorCount).unwrap().failed());
+}
+
+#[test]
+fn an_on_disk_graph_fails_the_structure_check_by_name() {
+    let bytes =
+        fs::read(fixtures().join("opensearch-3.9.0-binary/on-disk/l2/_2_165_vec.faiss")).unwrap();
+    let report = knn_check::verify(&bytes, &options(Some(Space::L2)));
+    let structure = report.result(Check::Structure).unwrap();
+    assert!(structure.failed(), "{report:#?}");
+    assert!(
+        structure.findings[0]
+            .message
+            .contains("null is a graph without its vectors"),
+        "{:?}",
+        structure.findings[0]
+    );
+    // The envelope is still read: the footer verifies.
+    assert_eq!(
+        report.result(Check::Checksum).unwrap().severity,
+        Some(Severity::Info)
     );
 }
 
@@ -491,4 +649,29 @@ fn rows_are_walked_by_the_storage_dimension() {
             assert_eq!(f.offset, Some(codes + i * row), "{file}");
         }
     }
+}
+
+#[test]
+fn a_binary_metric_type_only_warns_even_when_headers_disagree() {
+    // Only the HNSW header's metric type set to 0: a binary index uses
+    // none, so the disagreement is the warning about a value k-NN never
+    // writes, not a failure.
+    let mut bytes =
+        fs::read(fixtures().join("synthetic-binary/hamming-100x16-binary.faiss")).unwrap();
+    let ibhf = bytes.windows(4).position(|w| w == b"IBHf").unwrap();
+    // d, code size, count, and the trained flag: 17 bytes after the fourcc.
+    let at = ibhf + 4 + 17;
+    assert_eq!(bytes[at..at + 4], 1_i32.to_le_bytes());
+    bytes[at..at + 4].copy_from_slice(&0_i32.to_le_bytes());
+    let report = knn_check::verify(&bytes, &options(None));
+    assert_eq!(report.status, Status::Warnings, "{report:#?}");
+    let headers = report.result(Check::Headers).unwrap();
+    assert_eq!(headers.count, 1, "{report:#?}");
+    assert!(
+        headers.findings[0]
+            .message
+            .starts_with("hnsw header records metric type 0"),
+        "{:?}",
+        headers.findings[0]
+    );
 }

@@ -4,8 +4,9 @@
 This is the reference the format notes and the Rust parser are checked
 against: a straight transcription of `faiss/impl/index_read.cpp` for the
 layouts k-NN writes for HNSW fields, with no Faiss dependency: `IxMp` >
-`IHNf` > `IxF2`/`IxFI` (float32 storage), and `IxMp` > `IHNs` > `IxSQ`
-(scalar-quantized storage, such as fp16).
+`IHNf` > `IxF2`/`IxFI` (float32 storage), `IxMp` > `IHNs` > `IxSQ`
+(scalar-quantized storage, such as fp16), and `IBMp` > `IBHf` > `IBxF`
+(binary storage, packed bits).
 A file with a Lucene envelope is accepted; the footer is skipped (see
 strip_envelope.py for its layout).
 
@@ -88,17 +89,52 @@ class Walker:
             self._take("<f", f"{prefix}.metric_arg")
         return {"d": d, "ntotal": ntotal, "metric_type": metric}
 
+    def binary_header(self, prefix: str) -> dict:
+        """read_index_binary_header: no reserved fields, no metric argument."""
+        d = self._take("<i", f"{prefix}.d", "dimension, in bits")
+        code_size = self._take("<i", f"{prefix}.code_size", "bytes per vector")
+        ntotal = self._take("<q", f"{prefix}.ntotal", "vector count")
+        self._take("<?", f"{prefix}.is_trained")
+        metric = self._take("<i", f"{prefix}.metric_type", "unused: binary indexes compute Hamming distance")
+        return {"d": d, "code_size": code_size, "ntotal": ntotal, "metric_type": metric}
+
     def walk(self) -> dict:
         out: dict = {}
         tag = self.fourcc("idmap.fourcc")
+        if tag == "IBMp":
+            return self.walk_binary(out)
         if tag not in ("IxMp", "IxM2"):
-            raise ValueError(f"expected IxMp at offset {self.base}, found {tag!r}")
+            raise ValueError(f"expected IxMp or IBMp at offset {self.base}, found {tag!r}")
         out["idmap"] = self.index_header("idmap")
 
         hnsw_tag = self.fourcc("hnsw.fourcc")
         if hnsw_tag not in ("IHNf", "IHNs"):
             raise ValueError(f"expected IHNf or IHNs, found {hnsw_tag!r}")
         out["hnsw"] = self.index_header("hnsw")
+        self.hnsw_graph(out)
+        self.storage(out, hnsw_tag)
+        self.vector("idmap.id_map", "<q")
+        out["end"] = self.base + self.pos
+        return out
+
+    def walk_binary(self, out: dict) -> dict:
+        out["idmap"] = self.binary_header("idmap")
+        hnsw_tag = self.fourcc("hnsw.fourcc")
+        if hnsw_tag != "IBHf":
+            raise ValueError(f"expected IBHf under IBMp, found {hnsw_tag!r}")
+        out["hnsw"] = self.binary_header("hnsw")
+        self.hnsw_graph(out)
+        tag = self.fourcc("storage.fourcc")
+        if tag != "IBxF":
+            raise ValueError(f"expected IBxF under IBHf, found {tag!r}")
+        out["storage"] = self.binary_header("storage")
+        # read_vector(xb): a byte vector, ntotal * code_size bytes.
+        self.vector("storage.codes", "<B")
+        self.vector("idmap.id_map", "<q")
+        out["end"] = self.base + self.pos
+        return out
+
+    def hnsw_graph(self, out: dict) -> None:
         self.vector("hnsw.assign_probas", "<d")
         self.vector("hnsw.cum_nneighbor_per_level", "<i")
         levels_start, nlevels_vec = self.vector("hnsw.levels", "<i")
@@ -112,6 +148,7 @@ class Walker:
         levels = struct.unpack_from(f"<{nlevels_vec}i", self.data, levels_start)
         out["hnsw"]["level_counts"] = [sum(1 for v in levels if v > i) for i in range(out["hnsw"]["max_level"] + 1)]
 
+    def storage(self, out: dict, hnsw_tag: str) -> None:
         tag = self.fourcc("storage.fourcc")
         if hnsw_tag == "IHNf":
             if tag not in ("IxF2", "IxFI", "IxFl"):
@@ -140,10 +177,6 @@ class Walker:
                 "d": sq_d,
                 "code_size": code_size,
             }
-
-        self.vector("idmap.id_map", "<q")
-        out["end"] = self.base + self.pos
-        return out
 
 
 def main() -> int:
@@ -179,7 +212,9 @@ def main() -> int:
             print(f"{f['offset']:>10} {f['size']:>8}  {f['field']:<32} {f['value']}{note}")
         print(f"payload ends at {w.pos}; trailing bytes before footer: {trailing}")
         h = summary["hnsw"]
-        print(f"summary: d={summary['idmap']['d']} n={summary['idmap']['ntotal']} metric={METRICS.get(summary['storage']['metric_type'])} "
+        storage = summary["storage"]
+        metric = "hamming" if "code_size" in storage else METRICS.get(storage["metric_type"])
+        print(f"summary: d={summary['idmap']['d']} n={summary['idmap']['ntotal']} metric={metric} "
               f"levels={h['level_counts']} entry={h['entry_point']} efC={h['ef_construction']} efS={h['ef_search']}")
     return 0 if trailing == 0 else 2
 

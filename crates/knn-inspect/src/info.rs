@@ -18,6 +18,9 @@ struct Report {
     dimension: i32,
     count: i64,
     metric: String,
+    /// Bytes per vector, which only a binary index's header records.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code_size: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     quantizer: Option<QuantizerReport>,
     hnsw: HnswReport,
@@ -123,8 +126,10 @@ pub fn run(path: &Path, json: bool) -> anyhow::Result<ExitCode> {
         dimension: idx.header.d,
         count: idx.header.ntotal,
         metric: storage.header().metric().name(),
+        // From the ID map's header, as the dimension and count are.
+        code_size: idx.header.code_size(),
         quantizer: match storage {
-            Storage::Flat(_) => None,
+            Storage::Flat(_) | Storage::Binary(_) => None,
             Storage::Sq(s) => Some(QuantizerReport {
                 qtype: s.quantizer.qtype,
                 name: quantizer_type_name(s.quantizer.qtype)
@@ -192,7 +197,13 @@ fn print_text(r: &Report) {
         r.payload.offset, r.payload.length, r.payload.trailing_bytes
     );
     println!("  layout          {}", r.layout.join(" > "));
-    println!("  dimension       {}", r.dimension);
+    match r.code_size {
+        Some(size) => println!(
+            "  dimension       {} bits, code size {size} bytes",
+            r.dimension
+        ),
+        None => println!("  dimension       {}", r.dimension),
+    }
     println!("  vectors         {}", r.count);
     println!("  metric          {}", r.metric);
     if let Some(q) = &r.quantizer {

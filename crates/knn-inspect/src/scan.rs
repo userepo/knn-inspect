@@ -10,11 +10,11 @@ use std::process::ExitCode;
 
 use anyhow::Context;
 use clap::Args;
-use knn_check::{Options, Severity, Space, Status};
+use knn_check::{Check, Options, Severity, Space, Status};
 use knn_format::U16;
 use knn_format::envelope::Envelope;
 use knn_format::faiss::{CodeFormat, HalfRounding, Storage, bf16_rounds_to, byte_code};
-use knn_format::flat_vectors::{FlatField, FlatVectorsMeta};
+use knn_format::flat_vectors::{FlatField, FlatVectorsMeta, VectorEncoding};
 use knn_format::segment_info::SegmentInfo;
 use knn_format::{NativeFile, view_offset};
 use serde::Serialize;
@@ -42,7 +42,7 @@ pub struct ScanArgs {
 struct Output {
     directory: String,
     space: Option<Space>,
-    status: Status,
+    status: Verdict,
     files: Vec<FileReport>,
     /// Subdirectories that could not be read, and so were not scanned.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -55,7 +55,46 @@ struct Summary {
     files: usize,
     clean: usize,
     warnings: usize,
+    unsupported: usize,
     failed: usize,
+}
+
+/// A file's verdict, or the directory's: [`Status`] plus a layout this
+/// tool does not read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum Verdict {
+    /// No failures, no warnings.
+    Clean,
+    /// Warnings only.
+    Warnings,
+    /// A sound file, its footer verifying, in a layout or scalar quantizer
+    /// type this tool does not read: nothing is known to be wrong with it.
+    Unsupported,
+    /// At least one failure.
+    Failed,
+}
+
+impl Verdict {
+    /// The process exit code: 0 clean, 1 failed, 2 warnings or
+    /// unsupported, which is not a failure of the file.
+    fn exit_code(self) -> u8 {
+        match self {
+            Self::Clean => 0,
+            Self::Failed => 1,
+            Self::Warnings | Self::Unsupported => 2,
+        }
+    }
+}
+
+impl From<Status> for Verdict {
+    fn from(status: Status) -> Self {
+        match status {
+            Status::Clean => Self::Clean,
+            Status::Warnings => Self::Warnings,
+            Status::Failed => Self::Failed,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -73,7 +112,10 @@ struct FileReport {
     count: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     metric: Option<String>,
-    status: Status,
+    /// Bytes per vector, for binary storage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code_size: Option<i32>,
+    status: Verdict,
     #[serde(skip_serializing_if = "Option::is_none")]
     failures: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -164,7 +206,8 @@ impl CrossCheck {
 
 /// Runs `scan`; the exit code is the worst verdict over the files found:
 /// 0 clean, 1 any failure (or a file that would not open, a subdirectory
-/// that could not be read, or no native files at all), 2 warnings only.
+/// that could not be read, or no native files at all), 2 warnings or a
+/// sound file in a layout this tool does not read.
 ///
 /// # Errors
 ///
@@ -177,24 +220,22 @@ pub fn run(args: &ScanArgs) -> anyhow::Result<ExitCode> {
     };
     let reports: Vec<FileReport> = files.iter().map(|f| scan_file(f, &options)).collect();
 
+    let count = |verdict| reports.iter().filter(|r| r.status == verdict).count();
     let summary = Summary {
         files: reports.len(),
-        clean: reports.iter().filter(|r| r.status == Status::Clean).count(),
-        warnings: reports
-            .iter()
-            .filter(|r| r.status == Status::Warnings)
-            .count(),
-        failed: reports
-            .iter()
-            .filter(|r| r.status == Status::Failed)
-            .count(),
+        clean: count(Verdict::Clean),
+        warnings: count(Verdict::Warnings),
+        unsupported: count(Verdict::Unsupported),
+        failed: count(Verdict::Failed),
     };
     let status = if summary.failed > 0 || reports.is_empty() || !unreadable.is_empty() {
-        Status::Failed
+        Verdict::Failed
+    } else if summary.unsupported > 0 {
+        Verdict::Unsupported
     } else if summary.warnings > 0 {
-        Status::Warnings
+        Verdict::Warnings
     } else {
-        Status::Clean
+        Verdict::Clean
     };
     let out = Output {
         directory: shown(&args.dir),
@@ -317,7 +358,8 @@ fn scan_file(path: &Path, options: &Options) -> FileReport {
                 dimension: None,
                 count: None,
                 metric: None,
-                status: Status::Failed,
+                code_size: None,
+                status: Verdict::Failed,
                 failures: None,
                 warnings: None,
                 checks: None,
@@ -330,21 +372,42 @@ fn scan_file(path: &Path, options: &Options) -> FileReport {
     };
     let bytes = file.bytes();
     let report = knn_check::verify(bytes, options);
-    let parsed = knn_format::parse(bytes).ok();
+    let parsed = knn_format::parse(bytes);
+    // A layout or quantizer type this tool does not read, in a file whose
+    // footer verifies and whose checks found nothing else: not known to be
+    // wrong, so not failed. Without a verifying footer nothing says the
+    // unknown fourcc is not damage, as with a .si in an unknown format.
+    let unsupported = matches!(
+        parsed,
+        Err(knn_format::Error::UnsupportedLayout { .. }
+            | knn_format::Error::UnsupportedQuantizer { .. })
+    ) && report.failures == 1
+        && report
+            .result(Check::Checksum)
+            .is_some_and(|c| c.severity == Some(Severity::Info));
+    let parsed = parsed.ok();
     let idx = parsed.as_ref().map(|p| &p.index);
 
-    let (lucene_vectors, lucene_docs) = match &parsed {
-        Some(p) => (lucene_vectors(path, bytes, p), lucene_docs(path, p)),
-        None => (
-            LuceneVectors::skipped("the native file did not parse".to_owned()),
-            LuceneDocs::skipped("the native file did not parse".to_owned()),
-        ),
+    let (lucene_vectors, lucene_docs) = if let Some(p) = &parsed {
+        (lucene_vectors(path, bytes, p), lucene_docs(path, p))
+    } else {
+        let why = if unsupported {
+            "the native file's layout is not supported"
+        } else {
+            "the native file did not parse"
+        };
+        (
+            LuceneVectors::skipped(why.to_owned()),
+            LuceneDocs::skipped(why.to_owned()),
+        )
     };
     let crossed = lucene_vectors.status.fails() || lucene_docs.status.fails();
     let status = if crossed {
-        Status::Failed
+        Verdict::Failed
+    } else if unsupported {
+        Verdict::Unsupported
     } else {
-        report.status
+        report.status.into()
     };
     FileReport {
         file: shown(path),
@@ -354,6 +417,7 @@ fn scan_file(path: &Path, options: &Options) -> FileReport {
         dimension: idx.map(|i| i.header.d),
         count: idx.map(|i| i.header.ntotal),
         metric: idx.map(|i| i.index.storage.header().metric().name()),
+        code_size: idx.and_then(|i| i.header.code_size()),
         status,
         failures: Some(report.failures),
         warnings: Some(report.warnings),
@@ -489,7 +553,8 @@ fn stored_vectors<'a>(
     // fp16 or bf16 field holds the float32 vectors the codes were rounded
     // from instead, so those codes are also looked for that way; a byte
     // field's holds the int8 values the codes are 128 above, so byte codes
-    // are looked for that way only.
+    // are looked for that way only. A binary field's .vec holds the packed
+    // bits byte for byte.
     let all = &parsed.index.index.storage;
     let (storage, sources) = match all {
         Storage::Flat(flat) => {
@@ -508,13 +573,19 @@ fn stored_vectors<'a>(
             ),
             CodeFormat::Byte => (sq.codes, Sources::Int8),
         },
+        Storage::Binary(binary) => (binary.codes, Sources::Bits),
     };
     if storage.is_empty() {
         return Err("the native file holds no vectors".to_owned());
     }
+    // Lucene sees a binary field as bytes, its dimension the code size.
+    let d = match all {
+        Storage::Binary(binary) => binary.code_size().unwrap_or(0),
+        Storage::Flat(_) | Storage::Sq(_) => usize::try_from(all.header().d).unwrap_or(0),
+    };
     let shape = Shape {
         rows: all.row_count(),
-        d: usize::try_from(all.header().d).unwrap_or(0),
+        d,
         component_size: all.component_size(),
     };
     Ok((storage, sources, shape))
@@ -543,12 +614,13 @@ fn lucene_vectors(path: &Path, bytes: &[u8], parsed: &knn_format::Parsed<'_>) ->
     };
     let rows = shape.rows;
 
-    // .vec files read cleanly but not holding the vectors, those whose
-    // values repeat too much to search, and those that could not be
-    // trusted.
-    let mut tried = Vec::new();
-    let mut repetitive = Vec::new();
-    let mut untrusted = Vec::new();
+    let mut misses = Misses::default();
+    let Misses {
+        tried,
+        repetitive,
+        quantized,
+        untrusted,
+    } = &mut misses;
     for candidate in &candidates {
         // Mapped, not read: a .vec can be as large as the index itself.
         let mapped = match NativeFile::open(candidate) {
@@ -564,8 +636,15 @@ fn lucene_vectors(path: &Path, bytes: &[u8], parsed: &knn_format::Parsed<'_>) ->
         // they are looked for exactly there; without one, at every offset
         // Lucene could have used.
         let (located, why_not) = match field_table(candidate) {
-            Table::Fields(fields) => locate_by_meta(vec, storage, sources, &fields, shape),
-            Table::Absent => (locate(vec, storage, sources), None),
+            Table::Fields(fields) => locate_by_meta(
+                vec,
+                storage,
+                sources,
+                &fields,
+                shape,
+                has_quantization_state(candidate),
+            ),
+            Table::Absent => (locate_searching(candidate, vec, storage, sources), None),
             Table::Damaged(why) => {
                 untrusted.push(why);
                 continue;
@@ -598,41 +677,76 @@ fn lucene_vectors(path: &Path, bytes: &[u8], parsed: &knn_format::Parsed<'_>) ->
             Ok(()) if located == Located::GaveUp => {
                 repetitive.push(shown(candidate));
             }
-            Ok(()) => tried.push(match why_not {
-                Some(why) => format!("{} ({why})", shown(candidate)),
-                None => shown(candidate),
-            }),
+            Ok(()) => {
+                if let Located::Quantized { why } = located {
+                    quantized.push(format!("{} ({why})", shown(candidate)));
+                } else {
+                    tried.push(match why_not {
+                        Some(why) => format!("{} ({why})", shown(candidate)),
+                        None => shown(candidate),
+                    });
+                }
+            }
             Err(why) => untrusted.push(format!("{} {why}", shown(candidate))),
         }
     }
-    // Not found: a damaged .vec or .vemf may be the reason, so it outranks
-    // a mismatch.
-    if !untrusted.is_empty() {
-        return LuceneVectors {
-            status: CrossCheck::Damaged,
-            file: candidates.first().map(|c| shown(c)),
+    misses.verdict(candidates.first().map(|c| shown(c)))
+}
+
+/// The `.vec` files that did not hold the stored vectors, by why, each
+/// entry the file as shown and what it says.
+#[derive(Default)]
+struct Misses {
+    /// Read cleanly but not holding the vectors.
+    tried: Vec<String>,
+    /// Values that repeat too much to search.
+    repetitive: Vec<String>,
+    /// Holding, it seems, the float32 vectors binary codes quantize.
+    quantized: Vec<String>,
+    /// Not to be trusted: unopened, damaged, or beside a damaged `.vemf`.
+    untrusted: Vec<String>,
+}
+
+impl Misses {
+    /// The cross-check's outcome when no `.vec` held the vectors; `file`
+    /// is the first candidate, as shown.
+    fn verdict(self, file: Option<String>) -> LuceneVectors {
+        // A damaged .vec or .vemf may be the reason, so it outranks a
+        // mismatch.
+        if !self.untrusted.is_empty() {
+            return LuceneVectors {
+                status: CrossCheck::Damaged,
+                file,
+                offset: None,
+                detail: format!(
+                    "the stored vectors could not be matched against a sound .vec of the segment; {}",
+                    self.untrusted.join("; ")
+                ),
+            };
+        }
+        // A search that gave up cannot say the vectors are not there.
+        if !self.repetitive.is_empty() {
+            return LuceneVectors::skipped(format!(
+                "the values of {} repeat too much to search for the stored vectors in bounded time",
+                self.repetitive.join(", ")
+            ));
+        }
+        // Nor can floats the bits may quantize.
+        if !self.quantized.is_empty() {
+            return LuceneVectors::skipped(format!(
+                "the stored bits may quantize the float32 vectors a .vec holds, as a field with k-NN's binary encoder does, and cannot be checked against them without the field's quantization state: {}",
+                self.quantized.join(", ")
+            ));
+        }
+        LuceneVectors {
+            status: CrossCheck::Mismatch,
+            file,
             offset: None,
             detail: format!(
-                "the stored vectors could not be matched against a sound .vec of the segment; {}",
-                untrusted.join("; ")
+                "the stored vectors appear in none of the segment's .vec files: {}",
+                self.tried.join(", ")
             ),
-        };
-    }
-    // A search that gave up cannot say the vectors are not there.
-    if !repetitive.is_empty() {
-        return skipped(format!(
-            "the values of {} repeat too much to search for the stored vectors in bounded time",
-            repetitive.join(", ")
-        ));
-    }
-    LuceneVectors {
-        status: CrossCheck::Mismatch,
-        file: candidates.first().map(|c| shown(c)),
-        offset: None,
-        detail: format!(
-            "the stored vectors appear in none of the segment's .vec files: {}",
-            tried.join(", ")
-        ),
+        }
     }
 }
 
@@ -689,6 +803,10 @@ enum Located {
     Absent,
     /// A search gave up on values that repeat too much.
     GaveUp,
+    /// The binary codes are not in the file, which looks like the `.vec`
+    /// of a field with k-NN's `binary` encoder, as the text says: it holds
+    /// the floats the bits quantize, which cannot be compared with them.
+    Quantized { why: &'static str },
 }
 
 /// The stored vectors' shape: whole rows, the dimension, and the bytes
@@ -748,56 +866,77 @@ fn locate_by_meta(
     sources: Sources<'_>,
     fields: &[FlatField],
     shape: Shape,
+    quantization_state: bool,
 ) -> (Located, Option<String>) {
     let Shape {
         rows,
         d,
         component_size,
     } = shape;
-    let mut reason = format!("no field of {rows} vectors of dimension {d} in its .vemf");
+    let mut reason = Reason {
+        text: format!("no field of {rows} vectors of dimension {d} in its .vemf"),
+        closeness: Reason::NO_FIELD,
+    };
+    // Binary codes may quantize a float32 field of as many vectors, its
+    // dimension counting floats: one whose components, at a bit width k-NN's
+    // binary encoder takes, pack into the code size, beside the
+    // quantization state k-NN keeps for such a field. That field decides
+    // nothing, and if no field holds the codes the check cannot tell: a
+    // contradicting byte field of the codes' shape could be another binary
+    // field of the segment, and failing would fail the encoder field's
+    // file on every scan.
+    let mut quantized = false;
     for field in fields {
+        if matches!(sources, Sources::Bits)
+            && field.encoding == VectorEncoding::Float32
+            && usize::try_from(field.count) == Ok(rows)
+            && quantizes_to(field, d)
+        {
+            quantized |= quantization_state;
+            continue;
+        }
         if usize::try_from(field.dimension) != Ok(d) || usize::try_from(field.count) != Ok(rows) {
             continue;
         }
         let Some(expected) = field.vector_bytes() else {
-            reason = format!(
-                "the .vemf's field of {rows} vectors of dimension {d} is larger than any file"
+            reason.offer(
+                Reason::UNREADABLE,
+                format!(
+                    "the .vemf's field of {rows} vectors of dimension {d} is larger than any file"
+                ),
             );
             continue;
         };
         if field.data_length != expected {
-            reason = format!(
-                "the .vemf records {} bytes for its field of {rows} vectors of dimension {d}, not {expected}",
-                field.data_length
+            reason.offer(
+                Reason::UNREADABLE,
+                format!(
+                    "the .vemf records {} bytes for its field of {rows} vectors of dimension {d}, not {expected}",
+                    field.data_length
+                ),
             );
             continue;
         }
         let Some(held) = usize::try_from(field.data_offset).ok().and_then(|offset| {
             vec.get(offset..offset.checked_add(usize::try_from(expected).ok()?)?)
         }) else {
-            reason = format!(
-                "the .vemf puts its field of {rows} vectors of dimension {d} at offset {}, past the end of the .vec",
-                field.data_offset
+            reason.offer(
+                Reason::UNREADABLE,
+                format!(
+                    "the .vemf puts its field of {rows} vectors of dimension {d} at offset {}, past the end of the .vec",
+                    field.data_offset
+                ),
             );
             continue;
         };
-        let whole = rows.saturating_mul(d);
-        let how = match (sources, field.component_bytes) {
-            (Sources::Int8, 1) => storage
-                .get(..whole)
-                .is_some_and(|codes| holds(held, codes, |c| byte_code(i8::from_ne_bytes([c]))))
-                .then_some(INT8_VALUES),
-            (Sources::Rounded(codes, format), 4) => codes
-                .get(..whole)
-                .is_some_and(|codes| holds_rounded(held, codes, format))
-                .then_some(ROUNDED_SOURCES),
-            (_, bytes) if usize::try_from(bytes) == Ok(component_size) => storage
-                .get(..whole.saturating_mul(component_size))
-                .is_some_and(|stored| holds(held, stored, |b| b))
-                .then_some(BYTE_FOR_BYTE),
-            (_, bytes) => {
-                reason = format!(
-                    "the .vemf's field of {rows} vectors of dimension {d} holds {bytes}-byte components, not {component_size}-byte ones"
+        let how = match compare_field(held, storage, sources, field.component_bytes, shape) {
+            Ok(how) => how,
+            Err(bytes) => {
+                reason.offer(
+                    Reason::OTHER_WIDTH,
+                    format!(
+                        "the .vemf's field of {rows} vectors of dimension {d} holds {bytes}-byte components, not {component_size}-byte ones"
+                    ),
                 );
                 continue;
             }
@@ -814,14 +953,80 @@ fn locate_by_meta(
                 );
             }
             None => {
-                reason = format!(
-                    "the field the .vemf puts at offset {} holds other values",
-                    field.data_offset
+                reason.offer(
+                    Reason::COMPARED,
+                    format!(
+                        "the field the .vemf puts at offset {} holds other values",
+                        field.data_offset
+                    ),
                 );
             }
         }
     }
-    (Located::Absent, Some(reason))
+    if quantized {
+        return (
+            Located::Quantized {
+                why: "its .vemf records a float32 field of as many vectors whose bits fit the codes, and a quantization state file lies beside it",
+            },
+            None,
+        );
+    }
+    (Located::Absent, Some(reason.text))
+}
+
+/// How `held`, a field's data of `component_bytes`-byte components, holds
+/// the stored vectors, if it does: as int8 values for byte codes, as the
+/// float32 values fp16 or bf16 codes round from, or byte for byte. `Err`
+/// with the width when no reading compares them.
+fn compare_field(
+    held: &[u8],
+    storage: &[u8],
+    sources: Sources<'_>,
+    component_bytes: u32,
+    shape: Shape,
+) -> Result<Option<&'static str>, u32> {
+    let whole = shape.rows.saturating_mul(shape.d);
+    Ok(match (sources, component_bytes) {
+        (Sources::Int8, 1) => storage
+            .get(..whole)
+            .is_some_and(|codes| holds(held, codes, |c| byte_code(i8::from_ne_bytes([c]))))
+            .then_some(INT8_VALUES),
+        (Sources::Rounded(codes, format), 4) => codes
+            .get(..whole)
+            .is_some_and(|codes| holds_rounded(held, codes, format))
+            .then_some(ROUNDED_SOURCES),
+        (_, bytes) if usize::try_from(bytes) == Ok(shape.component_size) => storage
+            .get(..whole.saturating_mul(shape.component_size))
+            .is_some_and(|stored| holds(held, stored, |b| b))
+            .then_some(BYTE_FOR_BYTE),
+        (_, bytes) => return Err(bytes),
+    })
+}
+
+/// Why no field of a `.vemf` held the stored vectors: what the field that
+/// came closest says, the last of those that came as close.
+struct Reason {
+    text: String,
+    closeness: u8,
+}
+
+impl Reason {
+    /// No field of the vectors' shape.
+    const NO_FIELD: u8 = 0;
+    /// A field of their shape whose components have another width.
+    const OTHER_WIDTH: u8 = 1;
+    /// A field of their shape whose data cannot be read where the `.vemf`
+    /// puts it.
+    const UNREADABLE: u8 = 2;
+    /// A field compared with them, holding other values.
+    const COMPARED: u8 = 3;
+
+    fn offer(&mut self, closeness: u8, text: String) {
+        if closeness >= self.closeness {
+            self.closeness = closeness;
+            self.text = text;
+        }
+    }
 }
 
 /// Whether `held`, bytes of a `.vec`, is `stored` with every byte mapped
@@ -841,6 +1046,47 @@ fn holds_rounded(held: &[u8], codes: &[U16], format: CodeFormat) -> bool {
         })
 }
 
+/// The bit widths k-NN's `binary` encoder quantizes a component to
+/// (`QFrameBitEncoder` at tag 3.9.0.0).
+const ENCODER_BITS: [u64; 3] = [1, 2, 4];
+
+/// Whether a float32 field's vectors, quantized at one of the
+/// [`ENCODER_BITS`], take `code_size` bytes: k-NN pads the bits of a vector
+/// to whole bytes (`getDimensions` in its scalar quantization states).
+fn quantizes_to(field: &FlatField, code_size: usize) -> bool {
+    let Ok(code_size) = u64::try_from(code_size) else {
+        return false;
+    };
+    ENCODER_BITS.iter().any(|&bits| {
+        u64::from(field.dimension)
+            .checked_mul(bits)
+            .is_some_and(|total| total.div_ceil(8) == code_size)
+    })
+}
+
+/// Whether the quantization state k-NN keeps for the quantized fields of a
+/// per-field format (`.osknnqstate`) lies beside its `.vec`.
+fn has_quantization_state(vec_path: &Path) -> bool {
+    vec_path.with_extension("osknnqstate").is_file()
+}
+
+/// Searches a `.vec` that has no `.vemf` to say where its fields lie. Binary
+/// codes it does not hold, beside the quantization state k-NN writes for a
+/// quantized field (`.osknnqstate`), may be the bits of a field with the
+/// `binary` encoder, whose `.vec` holds float32 vectors.
+fn locate_searching(candidate: &Path, vec: &[u8], storage: &[u8], sources: Sources<'_>) -> Located {
+    let located = locate(vec, storage, sources);
+    if matches!(sources, Sources::Bits)
+        && located == Located::Absent
+        && has_quantization_state(candidate)
+    {
+        return Located::Quantized {
+            why: "a quantization state file lies beside it",
+        };
+    }
+    located
+}
+
 /// What a `.vec` holds in place of the stored vectors, besides possibly
 /// the same bytes.
 #[derive(Debug, Clone, Copy)]
@@ -856,6 +1102,12 @@ enum Sources<'a> {
     /// byte-for-byte hit would be a `.vec` whose every value is 128 off
     /// and is not looked for.
     Int8,
+    /// Nothing else for packed bits, which a binary field's `.vec` holds
+    /// as they are. A float field with k-NN's `binary` encoder writes the
+    /// same native layout over bits that quantize its float32 vectors,
+    /// and its `.vec` holds those, which cannot be checked against the
+    /// bits without the quantization state.
+    Bits,
 }
 
 /// Looks in `vec` for `storage` byte for byte, then for its `sources`;
@@ -876,7 +1128,7 @@ fn locate(vec: &[u8], storage: &[u8], sources: Sources<'_>) -> Located {
     }
     let rounded = match sources {
         Sources::Rounded(codes, format) => find_rounded(vec, region, codes, format),
-        Sources::None | Sources::Int8 => Search::Missing,
+        Sources::None | Sources::Int8 | Sources::Bits => Search::Missing,
     };
     match (exact, rounded) {
         (_, Search::Found(_)) => rounded.located(ROUNDED_SOURCES),
@@ -1119,29 +1371,47 @@ fn find_rounded(vec: &[u8], region: Range<usize>, codes: &[U16], format: CodeFor
     Search::Missing
 }
 
+/// The width of the column a file's verdict and each check's tag take in
+/// text output: that of "unsupported", the longest.
+const VERDICT_WIDTH: usize = 11;
+
 fn text(out: &Output) -> String {
     let mut s = String::new();
     writeln!(s, "{}: {} native file(s)", out.directory, out.summary.files)
         .expect("writing to a String cannot fail");
     for r in &out.files {
         let verdict = match r.status {
-            Status::Clean => "clean",
-            Status::Warnings => "warnings",
-            Status::Failed => "FAILED",
+            Verdict::Clean => "clean",
+            Verdict::Warnings => "warnings",
+            Verdict::Unsupported => "unsupported",
+            Verdict::Failed => "FAILED",
         };
         let shape = match (&r.layout, r.dimension, r.count, &r.metric) {
             (Some(layout), Some(d), Some(n), Some(metric)) => {
-                format!("{}  d={d} n={n} {metric}", layout.join(" > "))
+                let bits = if r.code_size.is_some() { " bits" } else { "" };
+                format!("{}  d={d}{bits} n={n} {metric}", layout.join(" > "))
+            }
+            _ if r.status == Verdict::Unsupported => {
+                "(a layout this tool does not read)".to_owned()
             }
             _ => "(did not parse)".to_owned(),
         };
         writeln!(s, "  {}", r.file).expect("writing to a String cannot fail");
-        writeln!(s, "    {verdict:<9} {shape}").expect("writing to a String cannot fail");
+        writeln!(s, "    {verdict:<VERDICT_WIDTH$} {shape}")
+            .expect("writing to a String cannot fail");
         if let Some(e) = &r.error {
-            writeln!(s, "    error     {e}").expect("writing to a String cannot fail");
+            writeln!(s, "    {:<VERDICT_WIDTH$} {e}", "error")
+                .expect("writing to a String cannot fail");
         }
         for c in r.checks.iter().flatten() {
             let tag = match c.severity {
+                // The structure check names the layout an unsupported file
+                // is in; the file is not failed for it.
+                Some(Severity::Failure)
+                    if r.status == Verdict::Unsupported && c.check == Check::Structure =>
+                {
+                    "note"
+                }
                 Some(Severity::Failure) => "FAIL",
                 Some(Severity::Warning) => "WARN",
                 _ => continue,
@@ -1152,19 +1422,19 @@ fn text(out: &Output) -> String {
             } else {
                 String::new()
             };
-            writeln!(s, "    {tag}      {:<20} {first}{more}", c.name)
+            writeln!(s, "    {tag:<VERDICT_WIDTH$} {:<20} {first}{more}", c.name)
                 .expect("writing to a String cannot fail");
         }
         let tag = cross_tag(r.lucene_vectors.status);
         writeln!(
             s,
-            "    {tag}      {:<20} {}",
+            "    {tag:<VERDICT_WIDTH$} {:<20} {}",
             "lucene_vectors", r.lucene_vectors.detail
         )
         .expect("writing to a String cannot fail");
         writeln!(
             s,
-            "    {}      {:<20} {}",
+            "    {:<VERDICT_WIDTH$} {:<20} {}",
             cross_tag(r.lucene_docs.status),
             "lucene_docs",
             r.lucene_docs.detail
@@ -1173,16 +1443,21 @@ fn text(out: &Output) -> String {
     }
     for u in &out.unreadable {
         writeln!(s, "  {}", u.path).expect("writing to a String cannot fail");
-        writeln!(s, "    FAILED    not scanned: {}", u.error)
-            .expect("writing to a String cannot fail");
+        writeln!(
+            s,
+            "    {:<VERDICT_WIDTH$} not scanned: {}",
+            "FAILED", u.error
+        )
+        .expect("writing to a String cannot fail");
     }
     let summary = &out.summary;
     writeln!(
         s,
-        "{} file(s): {} clean, {} with warnings, {} failed; exit code {}",
+        "{} file(s): {} clean, {} with warnings, {} unsupported, {} failed; exit code {}",
         summary.files,
         summary.clean,
         summary.warnings,
+        summary.unsupported,
         summary.failed,
         out.status.exit_code()
     )

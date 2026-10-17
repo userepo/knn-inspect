@@ -9,20 +9,22 @@ k-NN writes for its `sq` encoder with `type: fp16` and its `half_float`
 data type) in `fixtures/synthetic-fp16/`, with bf16 storage (`QT_bf16`,
 for the `sq` encoder with `type: bf16`) in `fixtures/synthetic-bf16/`,
 and with byte storage (`QT_8bit_direct_signed`, for the `byte` data
-type) in `fixtures/synthetic-byte/`.
+type) in `fixtures/synthetic-byte/`; and, for the `binary` data type, an
+`IndexBinaryIDMap` wrapping `IndexBinaryHNSW` over `IndexBinaryFlat`, in
+`fixtures/synthetic-binary/`.
 Next to every `.faiss` file an `.expected.json` records the values the
 Rust parser must report, read back from the same in-memory index. An
 fp16, bf16, or byte case draws the same vectors as the float case of the
 same shape; a byte case scales them (by 32, or by 1 for the ties case),
 rounds them, and clips them to [-128, 127], the only values a byte field
-takes.
+takes. A binary case draws a component per bit and keeps its sign.
 
 Faiss is pinned to one thread so the graph is reproducible run to run.
 
 Usage:
     python tools/make_synthetic.py [--out fixtures/synthetic]
         [--fp16-out fixtures/synthetic-fp16] [--bf16-out fixtures/synthetic-bf16]
-        [--byte-out fixtures/synthetic-byte]
+        [--byte-out fixtures/synthetic-byte] [--binary-out fixtures/synthetic-binary]
 """
 
 from __future__ import annotations
@@ -81,6 +83,18 @@ BYTE_CASES = [
     ("l2-1000x32-byte", 1000, 32, "l2", 32),
     ("ip-1000x32-byte", 1000, 32, "ip", 32),
     ("l2-1000x4-ties-byte", 1000, 4, "l2", 1),
+]
+
+# And binary storage: name, count, and dimension in bits. Hamming
+# distances are small integers, so every case ties often; the 8-bit case
+# can hold at most 256 distinct vectors among its 1,000, so nearly every
+# distance ties and vectors repeat. Faiss breaks Hamming ties as it breaks
+# L2 ones, in 1.15.1, which writes the baselines, as in the Faiss that
+# k-NN 3.9.0 builds.
+BINARY_CASES = [
+    ("hamming-100x16-binary", 100, 16),
+    ("hamming-1000x256-binary", 1000, 256),
+    ("hamming-1000x8-ties-binary", 1000, 8),
 ]
 
 # k-NN's defaults for the hnsw method.
@@ -414,27 +428,98 @@ def build_byte(name: str, count: int, dim: int, metric: str, scale: int, out: pa
     return expected
 
 
+def build_binary(name: str, count: int, dim: int, out: pathlib.Path) -> dict:
+    rng = np.random.default_rng(SEED)
+    # One bit per drawn component, set where it is positive, packed eight
+    # to a byte, most significant bit first, as k-NN receives a binary
+    # vector. Faiss compares whole bytes, so the order within one does not
+    # change any distance.
+    vectors = rng.standard_normal((count, dim), dtype=np.float32)
+    codes = np.packbits(vectors > 0, axis=1)
+
+    hnsw = faiss.IndexBinaryHNSW(dim, M)
+    hnsw.hnsw.efConstruction = EF_CONSTRUCTION
+    index = faiss.IndexBinaryIDMap(hnsw)
+    labels = np.arange(count, dtype=np.int64) + LABEL_OFFSET
+    index.add_with_ids(codes, labels)
+
+    path = out / f"{name}.faiss"
+    faiss.write_index_binary(index, str(path))
+
+    graph = hnsw.hnsw
+    levels = faiss.vector_to_array(graph.levels)
+    storage = faiss.downcast_IndexBinary(hnsw.storage)
+    xb = faiss.vector_to_array(storage.xb)
+    # The storage holds the packed bits as given; every header keeps
+    # Faiss's default metric type, METRIC_L2, which a binary index does not
+    # use, as k-NN's do.
+    assert np.array_equal(xb, codes.reshape(-1))
+    for header in (index, hnsw, storage):
+        assert header.code_size == dim // 8 and header.metric_type == faiss.METRIC_L2
+    expected = {
+        "file": path.name,
+        "size": path.stat().st_size,
+        "faiss_version": faiss.__version__,
+        "seed": SEED,
+        "layout": ["IBMp", "IBHf", "IBxF"],
+        "dimension": dim,
+        "count": count,
+        "metric": "hamming",
+        "faiss_metric_type": int(index.metric_type),
+        "code_size": int(index.code_size),
+        "hnsw": {
+            "m": M,
+            "ef_construction": graph.efConstruction,
+            "ef_search": graph.efSearch,
+            "max_level": graph.max_level,
+            "entry_point": graph.entry_point,
+            "level_counts": [int((levels > i).sum()) for i in range(graph.max_level + 1)],
+            "levels_len": int(graph.levels.size()),
+            "offsets_len": int(graph.offsets.size()),
+            "neighbors_len": int(graph.neighbors.size()),
+            "levels_crc32": crc32_of(levels),
+        },
+        "ids": {
+            "len": int(count),
+            "first": int(labels[0]),
+            "last": int(labels[-1]),
+            "crc32": crc32_of(faiss.vector_to_array(index.id_map)),
+        },
+        "codes": {
+            "bytes": int(xb.size),
+            "crc32": crc32_of(xb),
+            "first": codes[0].tolist(),
+        },
+    }
+    with open(out / f"{name}.expected.json", "w", encoding="utf-8", newline="\n") as f:
+        json.dump(expected, f, indent=2)
+        f.write("\n")
+    return expected
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument("--out", type=pathlib.Path, default=pathlib.Path("fixtures/synthetic"))
     parser.add_argument("--fp16-out", type=pathlib.Path, default=pathlib.Path("fixtures/synthetic-fp16"))
     parser.add_argument("--bf16-out", type=pathlib.Path, default=pathlib.Path("fixtures/synthetic-bf16"))
     parser.add_argument("--byte-out", type=pathlib.Path, default=pathlib.Path("fixtures/synthetic-byte"))
+    parser.add_argument("--binary-out", type=pathlib.Path, default=pathlib.Path("fixtures/synthetic-binary"))
     args = parser.parse_args()
 
     level = faiss.SIMDConfig.get_level_name()
     if level != "NONE":
         raise SystemExit(f"Faiss runs its {level} code; use a portable build")
     faiss.omp_set_num_threads(1)
-    for out in (args.out, args.fp16_out, args.bf16_out, args.byte_out):
+    for out in (args.out, args.fp16_out, args.bf16_out, args.byte_out, args.binary_out):
         out.mkdir(parents=True, exist_ok=True)
     built = [build(n, c, d, m, args.out) for n, c, d, m in CASES]
     built += [build_fp16(n, c, d, m, args.fp16_out) for n, c, d, m in FP16_CASES]
     built += [build_bf16(n, c, d, m, args.bf16_out) for n, c, d, m in BF16_CASES]
     built += [build_byte(n, c, d, m, s, args.byte_out) for n, c, d, m, s in BYTE_CASES]
+    built += [build_binary(n, c, d, args.binary_out) for n, c, d in BINARY_CASES]
     for e in built:
         print(
-            f"{e['file']:<22} {e['size']:>9} bytes  d={e['dimension']:<4} n={e['count']:<5} "
+            f"{e['file']:<34} {e['size']:>9} bytes  d={e['dimension']:<4} n={e['count']:<5} "
             f"{e['metric']:<13} levels={e['hnsw']['level_counts']} entry={e['hnsw']['entry_point']}"
         )
 

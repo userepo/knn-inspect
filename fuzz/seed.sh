@@ -1,7 +1,7 @@
 #!/bin/sh
 # Seeds the fuzz corpus with the committed fixtures (float, fp16, bf16,
-# and byte, clean and corrupted) and the real segments' .si and .vemf
-# files for the segment info and flat-vectors metadata readers.
+# byte, and binary, clean and corrupted) and the real segments' .si and
+# .vemf files for the segment info and flat-vectors metadata readers.
 # Files larger than MAX_LEN are skipped: libFuzzer would only ever see
 # their first MAX_LEN bytes, which is just another truncated file, a case
 # the truncation tests already cover. Keep MAX_LEN in step with the
@@ -12,7 +12,7 @@ MAX_LEN=200000
 dest=corpus/parse_and_verify
 mkdir -p "$dest"
 seeded=0
-for f in ../fixtures/synthetic/*.faiss ../fixtures/synthetic-fp16/*.faiss ../fixtures/synthetic-bf16/*.faiss ../fixtures/synthetic-byte/*.faiss ../fixtures/opensearch-3.9.0/*/*/*.faiss* ../fixtures/opensearch-3.9.0/*/*/*.si ../fixtures/opensearch-3.9.0*/*/*/*.vemf ../fixtures/opensearch-3.9.0-fp16/*/*/*.faiss ../fixtures/opensearch-3.9.0-bf16/*/*/*.faiss ../fixtures/opensearch-3.9.0-byte/*/*/*.faiss ../fixtures/corrupted/*.faiss; do
+for f in ../fixtures/synthetic/*.faiss ../fixtures/synthetic-fp16/*.faiss ../fixtures/synthetic-bf16/*.faiss ../fixtures/synthetic-byte/*.faiss ../fixtures/opensearch-3.9.0/*/*/*.faiss* ../fixtures/opensearch-3.9.0/*/*/*.si ../fixtures/opensearch-3.9.0*/*/*/*.vemf ../fixtures/opensearch-3.9.0-fp16/*/*/*.faiss ../fixtures/opensearch-3.9.0-bf16/*/*/*.faiss ../fixtures/opensearch-3.9.0-byte/*/*/*.faiss ../fixtures/synthetic-binary/*.faiss ../fixtures/opensearch-3.9.0-binary/*/*/*.faiss ../fixtures/corrupted/*.faiss; do
     size=$(wc -c < "$f")
     if [ "$size" -gt "$MAX_LEN" ]; then
         echo "skipped $f ($size bytes > $MAX_LEN)"

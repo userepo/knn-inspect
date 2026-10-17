@@ -18,7 +18,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use knn_format::faiss::{FourCc, Metric};
+use knn_format::faiss::{FourCc, HeaderKind, Metric};
 use knn_format::{Error, NativeFile};
 use serde::Deserialize;
 use zerocopy::IntoBytes;
@@ -153,9 +153,12 @@ fn synthetic_fixtures_match_faiss_python() {
             );
             assert!(header.is_trained, "{name}: {what} trained");
             assert_eq!(
-                header.reserved,
-                [1 << 20, 1 << 20],
-                "{name}: {what} reserved"
+                header.kind,
+                HeaderKind::Float {
+                    reserved: [1 << 20, 1 << 20],
+                    metric_arg: None
+                },
+                "{name}: {what} reserved fields"
             );
         }
 

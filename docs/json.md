@@ -19,10 +19,11 @@ map's values, which k-NN sets to Lucene doc ids.
 | `envelope.footer` | object, nullable | Lucene footer: `offset`, `algorithm`, `checksum` (hex string), `verified` (whether the CRC32 matches) |
 | `payload.offset`, `payload.length` | integer | Where the Faiss payload lies |
 | `payload.trailing_bytes` | integer | Bytes between the end of the index and the footer; 0 in a well-formed file |
-| `layout` | array of strings | The Faiss fourccs, outermost first: `IxMp`, then `IHNf` and `IxF2` or `IxFI` (float32 storage), or `IHNs` and `IxSQ` (fp16, bf16, or byte storage) |
-| `dimension` | integer | Vector dimension |
+| `layout` | array of strings | The Faiss fourccs, outermost first: `IxMp`, then `IHNf` and `IxF2` or `IxFI` (float32 storage), or `IHNs` and `IxSQ` (fp16, bf16, or byte storage); or `IBMp`, `IBHf`, and `IBxF` (binary storage, since 0.7.0) |
+| `dimension` | integer | Vector dimension; bits for binary storage |
 | `count` | integer | Vector count from the ID map's header |
-| `metric` | string | `l2` or `inner_product` as the file records it; a cosine field reads `inner_product` |
+| `metric` | string | `l2` or `inner_product` as the file records it; a cosine field reads `inner_product`. `hamming` for binary storage, which computes Hamming distance whatever metric type its headers record (since 0.7.0) |
+| `code_size` | integer, optional | For binary storage, the bytes per vector the ID map's header records: the dimension / 8 in a well-formed file. Since 0.7.0 |
 | `quantizer` | object, optional | For scalar-quantized storage, the quantizer as stored: `qtype` (4, 7, or 8), `name` (`QT_fp16`, `QT_bf16`, or `QT_8bit_direct_signed`), `dimension`, `code_size` (bytes per vector: twice the dimension for fp16 and bf16, the dimension for byte), `trained` (number of trained values; none of the three formats uses any). Since 0.4.0; bf16 since 0.5.0; byte since 0.6.0 |
 | `hnsw.m` | integer, nullable | Neighbor slots per node on the upper levels; `null` if the level table is too short to say |
 | `hnsw.ef_construction`, `hnsw.ef_search` | integer | As stored |
@@ -37,7 +38,7 @@ map's values, which k-NN sets to Lucene doc ids.
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `file`, `size` | | As for `info` |
-| `space` | string, nullable | The `--space` given: `l2`, `innerproduct`, or `cosinesimil`; `null` when none |
+| `space` | string, nullable | The `--space` given: `l2`, `innerproduct`, `cosinesimil`, or `hamming` (since 0.7.0); `null` when none |
 | `status` | string | `clean`, `warnings`, or `failed`; the exit code is 0, 2, or 1 |
 | `failures`, `warnings` | integer | Checks that reported a failure, and checks that reported a warning and nothing worse |
 | `checks` | array | One entry per check, in run order (see below) |
@@ -79,12 +80,12 @@ Each entry of `layers`:
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `file` | string | The path as given |
-| `queries_file` | string, optional | The `--queries` file |
+| `queries_file` | string, optional | The `--queries` file: row-major little-endian float32, or for binary storage packed bits, a row the bytes of the file's code size, its dimension / 8 in a well-formed file (since 0.7.0) |
 | `sample` | object, optional | For `--sample`: `count` and `seed` |
 | `results_file` | string, optional | The `--results` file |
 | `ids_file` | string, optional | The `--ids` file |
 | `search` | object, optional | For the tool's own search: `ef_search` used and `search_ms` |
-| `dimension`, `vectors` | integer | Of the file |
+| `dimension`, `vectors` | integer | Of the file; for binary storage, `dimension` is the bits of the code size, which the queries must have (since 0.7.0) |
 | `metric` | string | As for `info` |
 | `ground_truth_ms` | integer | Time of the brute-force pass |
 | `k` | integer | The `--k` given |
@@ -103,10 +104,10 @@ Each entry of `layers`:
 | --- | --- | --- |
 | `directory` | string | The path as given, with `/` shown as `\` on Windows wherever that names the same path; every path below is shown the same way (since 0.5.1) |
 | `space` | string, nullable | The `--space` given, as for `verify` |
-| `status` | string | The worst verdict over the files: `failed` also when a file would not open, a subdirectory could not be read, or no file was found |
+| `status` | string | The worst verdict over the files: `clean`, `warnings`, `unsupported` (since 0.7.0), or `failed`; `failed` also when a file would not open, a subdirectory could not be read, or no file was found. The exit code is 0, 2, 2, or 1 |
 | `files` | array | One entry per `.faiss` or `.faissc` file, in path order (see below) |
 | `unreadable` | array, optional | Subdirectories, or entries in one, that could not be read and so were not scanned: `path` and `error`. Any entry makes `status` `failed` |
-| `summary` | object | `files`, `clean`, `warnings`, `failed`: counts of entries by status |
+| `summary` | object | `files`, `clean`, `warnings`, `unsupported` (since 0.7.0), `failed`: counts of entries by status |
 
 Each entry of `files`:
 
@@ -116,7 +117,8 @@ Each entry of `files`:
 | `size` | integer, nullable | Bytes; `null` when the file would not open |
 | `error` | string, optional | Why the file would not open; `failures`, `warnings`, and `checks` are then absent, and both cross-checks are `skipped` |
 | `layout`, `dimension`, `count`, `metric` | optional | As for `info`; absent when the file did not parse |
-| `status` | string | `clean`, `warnings`, or `failed`, counting both Lucene cross-checks |
+| `code_size` | integer, optional | As for `info`, for binary storage (since 0.7.0) |
+| `status` | string | `clean`, `warnings`, or `failed`, counting both Lucene cross-checks; or `unsupported` (since 0.7.0): a file whose footer verifies, in a layout or scalar quantizer type this tool does not read, which fails only the structure check. `verify` fails such a file; `scan` does not count it as failed, since nothing is known to be wrong with it |
 | `failures`, `warnings`, `checks` | optional | As for `verify` |
 | `lucene_vectors.status` | string | `match`, `mismatch`, `damaged`, or `skipped` (`damaged` since 0.3.0) |
 | `lucene_vectors.file` | string, optional | The segment's `.vec` file the vectors were found in, or the first one looked in |
@@ -141,22 +143,31 @@ fails the file.
   what the `.vec` of k-NN's `sq` encoder holds (the `.vec` of a
   `half_float` field holds the codes byte for byte); for byte storage it
   looks only for the int8 values the codes are 128 above, which is what
-  a byte field's `.vec` holds (since 0.6.0). `detail` says which way
-  they were found. Since 0.6.1 it reads the `.vemf` beside the `.vec`,
-  which records where each field's vectors lie, and compares there only,
-  which `detail` also says; without a `.vemf`, or with a sound one in a
-  format this tool does not read, it searches the `.vec` where Lucene
-  can put vector data (since 0.6.0: at a multiple of 4 bytes, between
-  the header and the footer), and a `.vemf` that cannot be read or fails
-  its checksum makes the check `damaged`. When the vectors are found in
-  a `.vec` that is damaged, `offset` still says where. It is skipped
-  when no loose `.vec` lies beside the native file, as in a compound
-  segment, where the `.vec` is inside the `.cfs`, or when the values of
-  a sound `.vec` repeat too much to search for the stored vectors in
-  bounded time (since 0.4.0 for fp16 and 0.5.0 for bf16, the first
-  versions to read them, and since 0.6.0 for every storage). Before
-  0.3.0, a `.vec` that could not be opened was reported as `mismatch`,
-  and a failing checksum was only mentioned in `detail`.
+  a byte field's `.vec` holds (since 0.6.0); for binary storage it looks
+  for the codes byte for byte, as a binary field's `.vec` holds the
+  packed bits (since 0.7.0). `detail` says which way they were found.
+  Since 0.6.1 it reads the `.vemf` beside the `.vec`, which records
+  where each field's vectors lie, and compares there only, which
+  `detail` also says; without a `.vemf`, or with a sound one in a format
+  this tool does not read, it searches the `.vec` where Lucene can put
+  vector data (since 0.6.0: at a multiple of 4 bytes, between the header
+  and the footer), and a `.vemf` that cannot be read or fails its
+  checksum makes the check `damaged`. When the vectors are found in a
+  `.vec` that is damaged, `offset` still says where. It is skipped when
+  no loose `.vec` lies beside the native file, as in a compound segment,
+  where the `.vec` is inside the `.cfs`; when the values of a sound
+  `.vec` repeat too much to search for the stored vectors in bounded
+  time (since 0.4.0 for fp16 and 0.5.0 for bf16, the first versions to
+  read them, and since 0.6.0 for every storage); and for binary storage
+  no field of the `.vec` holds, when its `.vemf` records a float32 field
+  of as many vectors whose bits, at 1, 2, or 4 a component, pack into
+  the code size, and a quantization state file (`.osknnqstate`) lies
+  beside it, or, without a `.vemf`, when that file lies beside it: a
+  float field with k-NN's binary encoder writes a binary index over bits
+  that quantize the float32 vectors its `.vec` holds, which the bits
+  cannot be checked against (since 0.7.0). Before 0.3.0, a `.vec` that
+  could not be opened was reported as `mismatch`, and a failing checksum
+  was only mentioned in `detail`.
 - `lucene_docs` reads the document count from the segment's `.si` and
   checks that every label in the ID map, which k-NN sets to a doc id,
   lies in `0..doc_count`, with no more labels than documents. The `.si`

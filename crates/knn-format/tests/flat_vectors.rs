@@ -36,6 +36,9 @@ struct Case {
 
 const LUCENE_VEMF: &str = "_2_NativeEngines990KnnVectorsFormat_0.vemf";
 const HALF_FLOAT_VEMF: &str = "_2_NativeEngines990HalfFloatKnnVectorsFormat_0.vemf";
+/// The `.vemf` of k-NN 3.9's `on_disk` format, whose float32 vectors Lucene
+/// keeps as any other: only the per-field format's name differs.
+const ON_DISK_VEMF: &str = "_2_Faiss1040ScalarQuantizedKnnVectorsFormat_0.vemf";
 const ALL: &[&str] = &["l2", "innerproduct", "cosinesimil"];
 
 const CASES: &[Case] = &[
@@ -83,6 +86,36 @@ const CASES: &[Case] = &[
         encoding: VectorEncoding::Byte,
         data_offset: 92,
         component_bytes: 1,
+    },
+    // A binary field is a Lucene byte field of dimension / 8 bytes: the
+    // fixture's 128 bits are 16 bytes.
+    Case {
+        set: "opensearch-3.9.0-binary/binary",
+        spaces: &["hamming"],
+        meta: LUCENE_VEMF,
+        format: MetaFormat::Lucene99,
+        encoding: VectorEncoding::Byte,
+        data_offset: 92,
+        component_bytes: 1,
+    },
+    // A float field with the binary encoder keeps its float32 vectors.
+    Case {
+        set: "opensearch-3.9.0-binary/binary-encoder",
+        spaces: &["l2"],
+        meta: LUCENE_VEMF,
+        format: MetaFormat::Lucene99,
+        encoding: VectorEncoding::Float32,
+        data_offset: 128,
+        component_bytes: 4,
+    },
+    Case {
+        set: "opensearch-3.9.0-binary/on-disk",
+        spaces: &["l2"],
+        meta: ON_DISK_VEMF,
+        format: MetaFormat::Lucene99,
+        encoding: VectorEncoding::Float32,
+        data_offset: 128,
+        component_bytes: 4,
     },
 ];
 
@@ -136,7 +169,10 @@ fn real_fixtures_record_one_field_of_500_vectors() {
             seen += 1;
         }
     }
-    assert_eq!(seen, 14, "six float, six fp16, three bf16, two byte");
+    assert_eq!(
+        seen, 17,
+        "three float, six fp16, three bf16, two byte, one binary, one binary-encoder, one on-disk"
+    );
 }
 
 #[test]

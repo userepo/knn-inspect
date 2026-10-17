@@ -368,5 +368,55 @@
       "check": "vector_count",
       "severity": "failure"
     }
+  },
+  {
+    "file": "binary-header-code-size.faiss",
+    "source": "fixtures/synthetic-binary/hamming-100x16-binary.faiss",
+    "mutation": "storage header code size set to 3; the other two say 2",
+    "space": null,
+    "expect": {
+      "check": "headers",
+      "severity": "failure"
+    }
+  },
+  {
+    "file": "binary-dimension-not-byte.faiss",
+    "source": "fixtures/synthetic-binary/hamming-100x16-binary.faiss",
+    "mutation": "all three headers' dimension set to 12, not a multiple of 8",
+    "space": null,
+    "expect": {
+      "check": "headers",
+      "severity": "failure"
+    }
+  },
+  {
+    "file": "binary-metric-type.faiss",
+    "source": "fixtures/synthetic-binary/hamming-100x16-binary.faiss",
+    "mutation": "all three headers' metric type set to 0, which a binary index ignores and k-NN never writes",
+    "space": null,
+    "expect": {
+      "check": "headers",
+      "severity": "warning"
+    }
+  },
+  {
+    "file": "binary-codes-short.faiss",
+    "source": "fixtures/synthetic-binary/hamming-100x16-binary.faiss",
+    "mutation": "last vector's 2 code bytes removed and the byte count lowered to match",
+    "space": null,
+    "expect": {
+      "check": "vector_count",
+      "severity": "failure"
+    }
+  },
+  {
+    "file": "hamming-float-file.faiss",
+    "source": "fixtures/synthetic/l2-100x4.faiss",
+    "mutation": "an L2 float file verified with --space hamming, which k-NN accepts for binary fields only",
+    "space": "hamming",
+    "expect": {
+      "check": "metric",
+      "severity": "failure"
+    }
   }
 ]

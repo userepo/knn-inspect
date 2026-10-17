@@ -21,6 +21,9 @@ float, fp16, bf16, and byte fixtures alike. For scalar-quantized storage
 the brute force runs over the vectors Faiss decodes from the codes. The
 queries of a byte file are integers too, as a byte field receives them,
 each component drawn from the values the file stores in that position.
+A binary file's queries are packed bits, `queries.u8` in place of
+`queries.f32`, each byte drawn from the bytes the file stores in that
+position; Faiss searches and brute-forces them by Hamming distance.
 Rewrite them whenever the fixtures are regenerated.
 """
 
@@ -54,17 +57,36 @@ QUERIES = 100
 K = 10
 SEED = 20261014
 
+REAL_SETS = (
+    "opensearch-3.9.0",
+    "opensearch-3.9.0-fp16",
+    "opensearch-3.9.0-bf16",
+    "opensearch-3.9.0-byte",
+    "opensearch-3.9.0-binary",
+)
 
-def load_index(path: pathlib.Path) -> faiss.Index:
+# Real sets whose native file holds a graph without its vectors (a `null`
+# storage), which Faiss Python cannot read.
+UNREADABLE = ("on-disk",)
+
+
+def payload(path: pathlib.Path) -> np.ndarray:
     data = path.read_bytes()
     header = parse_header(data)
     footer = parse_footer(data)
     start = header["length"] if header else 0
     end = footer["offset"] if footer else len(data)
-    return faiss.deserialize_index(np.frombuffer(data[start:end], dtype=np.uint8))
+    return np.frombuffer(data[start:end], dtype=np.uint8)
+
+
+def load_index(path: pathlib.Path) -> faiss.Index:
+    return faiss.deserialize_index(payload(path))
 
 
 def baseline(path: pathlib.Path, out_dir: pathlib.Path, prefix: str) -> dict:
+    data = payload(path)
+    if bytes(data[:4]) == b"IBMp":
+        return binary_baseline(data, path, out_dir, prefix)
     index = load_index(path)
     hnsw = faiss.downcast_index(faiss.downcast_index(index).index)
     storage = faiss.downcast_index(hnsw.storage)
@@ -111,9 +133,46 @@ def baseline(path: pathlib.Path, out_dir: pathlib.Path, prefix: str) -> dict:
         truth = {int(labels[node]) for node in within}
         returned = {int(v) for v in i_hnsw[q] if v >= 0}
         matches.append(len(returned & truth))
-    histogram = np.bincount(matches, minlength=K + 1).tolist()
 
-    queries_file = out_dir / f"{prefix}queries.f32"
+    return write_report(path, out_dir, prefix, "queries.f32", queries, i_hnsw, d, ef_search, matches)
+
+
+def binary_baseline(data: np.ndarray, path: pathlib.Path, out_dir: pathlib.Path, prefix: str) -> dict:
+    """The same over a binary index: packed-bit queries, Hamming distance."""
+    # `index` must stay referenced while its parts are read: the downcast
+    # views do not own what they point at.
+    index = faiss.deserialize_index_binary(data)
+    hnsw = faiss.downcast_IndexBinary(index.index)
+    storage = faiss.downcast_IndexBinary(hnsw.storage)
+    d = storage.d
+    code_size = storage.code_size
+    codes = faiss.vector_to_array(storage.xb).reshape(storage.ntotal, code_size)
+    labels = faiss.vector_to_array(index.id_map)
+
+    # Each query byte is one the file stores in that position, as the byte
+    # queries are drawn, so queries look like the data.
+    rng = np.random.default_rng(SEED)
+    rows = rng.integers(0, len(codes), (QUERIES, code_size))
+    queries = np.ascontiguousarray(codes[rows, np.arange(code_size)])
+
+    flat = faiss.IndexBinaryFlat(d)
+    flat.add(codes)
+    d_all, i_all = flat.search(queries, len(codes))
+    ef_search = hnsw.hnsw.efSearch
+    _, i_hnsw = index.search(queries, K)
+
+    matches = []
+    for q in range(QUERIES):
+        within = i_all[q][d_all[q] <= d_all[q, K - 1]]
+        truth = {int(labels[node]) for node in within}
+        returned = {int(v) for v in i_hnsw[q] if v >= 0}
+        matches.append(len(returned & truth))
+    return write_report(path, out_dir, prefix, "queries.u8", queries, i_hnsw, d, ef_search, matches)
+
+
+def write_report(path, out_dir, prefix, queries_name, queries, i_hnsw, d, ef_search, matches) -> dict:
+    histogram = np.bincount(matches, minlength=K + 1).tolist()
+    queries_file = out_dir / f"{prefix}{queries_name}"
     results_file = out_dir / f"{prefix}results.jsonl"
     queries_file.write_bytes(queries.tobytes())
     with open(results_file, "w", encoding="utf-8", newline="\n") as f:
@@ -148,14 +207,17 @@ def main() -> None:
     if level != "NONE":
         raise SystemExit(f"Faiss runs its {level} code; use a portable build")
     faiss.omp_set_num_threads(1)
-    for synthetic in ("synthetic", "synthetic-fp16", "synthetic-bf16", "synthetic-byte"):
+    for synthetic in ("synthetic", "synthetic-fp16", "synthetic-bf16", "synthetic-byte", "synthetic-binary"):
         for path in sorted((args.fixtures / synthetic).glob("*.faiss")):
             baseline(path, path.parent, f"{path.stem}.")
     for manifest in sorted(
         m
-        for real in ("opensearch-3.9.0", "opensearch-3.9.0-fp16", "opensearch-3.9.0-bf16", "opensearch-3.9.0-byte")
+        for real in REAL_SETS
         for m in (args.fixtures / real).glob("*/*/manifest.json")
     ):
+        # A graph without its vectors has nothing to search.
+        if manifest.parent.parent.name in UNREADABLE:
+            continue
         files = json.loads(manifest.read_text(encoding="utf-8"))["files"]
         native = next(f["name"] for f in files if f["name"].endswith((".faiss", ".faissc")))
         baseline(manifest.parent / native, manifest.parent, "")

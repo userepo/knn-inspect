@@ -10,7 +10,9 @@ Bare synthetic files carry no footer, so a mutation there exercises just
 the structural check it targets; the real OpenSearch file carries a
 footer, so it is used for the envelope and checksum cases. The `fp16-`,
 `bf16-`, and `byte-` cases mutate the smallest synthetic fp16, bf16, and
-byte files, for the checks that read the scalar quantizer and its codes.
+byte files, for the checks that read the scalar quantizer and its codes,
+and the `binary-` cases the smallest binary file, for the checks that
+read the binary headers and codes.
 
 Usage:
     python tools/make_corrupted.py [--out fixtures/corrupted]
@@ -33,6 +35,7 @@ SYNTHETIC_IP = ROOT / "fixtures/synthetic/ip-100x4.faiss"
 SYNTHETIC_FP16 = ROOT / "fixtures/synthetic-fp16/l2-100x4-fp16.faiss"
 SYNTHETIC_BF16 = ROOT / "fixtures/synthetic-bf16/l2-100x4-bf16.faiss"
 SYNTHETIC_BYTE = ROOT / "fixtures/synthetic-byte/l2-100x4-byte.faiss"
+SYNTHETIC_BINARY = ROOT / "fixtures/synthetic-binary/hamming-100x16-binary.faiss"
 REAL_L2 = ROOT / "fixtures/opensearch-3.9.0/nocfs/l2/_2_165_vec.faiss"
 
 
@@ -314,6 +317,37 @@ def build() -> Cases:
         return d[: o + n - 4] + d[o + n :]
 
     c.add("byte-codes-short", SYNTHETIC_BYTE, "last vector's 4 code bytes removed and the byte count lowered to match", "vector_count", "failure", byte_codes_short)
+
+    # --- binary: the binary headers and codes ---
+    def binary_code_size(d, f):
+        put(d, f["storage.code_size"]["offset"], "<i", 3)
+        return d
+
+    c.add("binary-header-code-size", SYNTHETIC_BINARY, "storage header code size set to 3; the other two say 2", "headers", "failure", binary_code_size)
+
+    def binary_dimension(d, f):
+        for prefix in ("idmap", "hnsw", "storage"):
+            put(d, f[f"{prefix}.d"]["offset"], "<i", 12)
+        return d
+
+    c.add("binary-dimension-not-byte", SYNTHETIC_BINARY, "all three headers' dimension set to 12, not a multiple of 8", "headers", "failure", binary_dimension)
+
+    def binary_metric_type(d, f):
+        for prefix in ("idmap", "hnsw", "storage"):
+            put(d, f[f"{prefix}.metric_type"]["offset"], "<i", 0)
+        return d
+
+    c.add("binary-metric-type", SYNTHETIC_BINARY, "all three headers' metric type set to 0, which a binary index ignores and k-NN never writes", "headers", "warning", binary_metric_type)
+
+    def binary_codes_short(d, f):
+        o = f["storage.codes.data"]["offset"]
+        n = f["storage.codes.len"]["value"]
+        put(d, f["storage.codes.len"]["offset"], "<Q", n - 2)
+        return d[: o + n - 2] + d[o + n :]
+
+    c.add("binary-codes-short", SYNTHETIC_BINARY, "last vector's 2 code bytes removed and the byte count lowered to match", "vector_count", "failure", binary_codes_short)
+
+    c.add("hamming-float-file", SYNTHETIC_L2, "an L2 float file verified with --space hamming, which k-NN accepts for binary fields only", "metric", "failure", lambda d, f: d, space="hamming")
 
     return c
 

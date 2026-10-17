@@ -1,0 +1,45 @@
+{
+  "file": "hamming-1000x8-ties-binary.faiss",
+  "size": 153099,
+  "faiss_version": "1.15.1",
+  "seed": 20261013,
+  "layout": [
+    "IBMp",
+    "IBHf",
+    "IBxF"
+  ],
+  "dimension": 8,
+  "count": 1000,
+  "metric": "hamming",
+  "faiss_metric_type": 1,
+  "code_size": 1,
+  "hnsw": {
+    "m": 16,
+    "ef_construction": 100,
+    "ef_search": 16,
+    "max_level": 2,
+    "entry_point": 592,
+    "level_counts": [
+      1000,
+      57,
+      3
+    ],
+    "levels_len": 1000,
+    "offsets_len": 1001,
+    "neighbors_len": 32960,
+    "levels_crc32": 330177091
+  },
+  "ids": {
+    "len": 1000,
+    "first": 1000,
+    "last": 1999,
+    "crc32": 3986414682
+  },
+  "codes": {
+    "bytes": 1000,
+    "crc32": 1347573251,
+    "first": [
+      183
+    ]
+  }
+}

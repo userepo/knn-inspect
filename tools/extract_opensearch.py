@@ -15,11 +15,19 @@ the file list, and `pos_of_doc`, the insertion position of each doc).
 `--encoding` picks how the field stores its vectors: `float` (the
 default), `sq-fp16` (the `sq` encoder with `type: fp16`, `bits: 16`),
 `sq-bf16` (the same with `type: bf16`), `half-float` (the `half_float`
-data type), or `byte` (the `byte` data type). The vectors indexed are
-the same for every encoding, except that `byte` scales them by 32,
-rounds them, and clips them to [-128, 127], the only values a byte field
-takes. k-NN's Faiss engine refuses `cosinesimil` for byte fields, so
-`byte` indexes `l2` and `innerproduct` only.
+data type), `byte` (the `byte` data type), `binary` (the `binary` data
+type), `binary-encoder` (a float field with the `binary` encoder,
+`bits: 1`), or `on-disk` (a float field in `on_disk` mode, at its default
+32x compression). The vectors indexed are the same for every encoding,
+except that `byte` scales them by 32, rounds them, and clips them to
+[-128, 127], the only values a byte field takes, and `binary` keeps one
+bit per component of the `l2` draw, set where the value is positive,
+packed eight to a byte; `--dim` counts bits for `binary`. k-NN's Faiss
+engine refuses `cosinesimil` for byte fields, so `byte` indexes `l2` and
+`innerproduct` only, and accepts only `hamming` for binary fields.
+
+Next to a binary field's segment, `vectors.u8` holds the packed bits in
+place of `vectors.f32`, the bytes of row i the bits of document i.
 
 Usage:
     docker compose -f tools/docker-compose.yml up -d
@@ -29,6 +37,9 @@ Usage:
     python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-fp16/half-float --encoding half-float
     python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-bf16/sq-bf16 --encoding sq-bf16
     python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-byte/byte --encoding byte
+    python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-binary/binary --encoding binary --dim 128
+    python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-binary/binary-encoder --encoding binary-encoder --spaces l2
+    python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-binary/on-disk --encoding on-disk --spaces l2
 """
 
 from __future__ import annotations
@@ -50,7 +61,10 @@ SPACES = ["l2", "innerproduct", "cosinesimil"]
 # over normalized vectors, and cannot normalize bytes, so it refuses the
 # space for byte fields at mapping time.
 BYTE_SPACES = ["l2", "innerproduct"]
-ENCODINGS = ["float", "sq-fp16", "sq-bf16", "half-float", "byte"]
+# k-NN accepts only hamming for binary fields, and hamming for nothing
+# else.
+BINARY_SPACES = ["hamming"]
+ENCODINGS = ["float", "sq-fp16", "sq-bf16", "half-float", "byte", "binary", "binary-encoder", "on-disk"]
 M = 16
 EF_CONSTRUCTION = 100
 SEED = 20261013
@@ -89,11 +103,17 @@ def create_index(host: str, index: str, space: str, dim: int, compound: bool, en
         # 16 with a type picks fp16 or bf16.
         sq_type = encoding.removeprefix("sq-")
         parameters["encoder"] = {"name": "sq", "parameters": {"type": sq_type, "bits": 16}}
+    elif encoding == "binary-encoder":
+        parameters["encoder"] = {"name": "binary", "parameters": {"bits": 1}}
     field: dict = {"type": "knn_vector", "dimension": dim}
     if encoding == "half-float":
         field["data_type"] = "half_float"
     elif encoding == "byte":
         field["data_type"] = "byte"
+    elif encoding == "binary":
+        field["data_type"] = "binary"
+    elif encoding == "on-disk":
+        field["mode"] = "on_disk"
     field["space_type"] = space
     field["method"] = {"name": "hnsw", "engine": "faiss", "parameters": parameters}
     body = {
@@ -200,16 +220,18 @@ def main() -> None:
     parser.add_argument("--compound", action="store_true", help="enable Lucene compound files")
     parser.add_argument("--count", type=int, default=500)
     parser.add_argument("--dim", type=int, default=16)
-    parser.add_argument("--spaces", nargs="+", choices=SPACES, help="default: every space the encoding allows")
+    parser.add_argument("--spaces", nargs="+", choices=SPACES + BINARY_SPACES, help="default: every space the encoding allows")
     parser.add_argument("--batches", type=int, default=2, help="bulk batches before the force merge")
     parser.add_argument("--encoding", default="float", choices=ENCODINGS, help="how the field stores its vectors")
     args = parser.parse_args()
     if args.count > MAX_RESULT_WINDOW:
         parser.error(f"--count above {MAX_RESULT_WINDOW} exceeds index.max_result_window, which doc_order reads in one page")
-    allowed = BYTE_SPACES if args.encoding == "byte" else SPACES
+    allowed = {"byte": BYTE_SPACES, "binary": BINARY_SPACES}.get(args.encoding, SPACES)
     spaces = args.spaces or allowed
     if refused := [s for s in spaces if s not in allowed]:
         parser.error(f"k-NN's Faiss engine refuses {', '.join(refused)} for {args.encoding} fields")
+    if args.encoding == "binary" and args.dim % 8:
+        parser.error("--dim counts bits for binary fields, and k-NN requires a multiple of 8")
 
     info = wait_for_cluster(args.host, timeout=180)
     os_version = info["version"]["number"]
@@ -224,7 +246,13 @@ def main() -> None:
     rng = np.random.default_rng(SEED)
     draws = {space: rng.standard_normal((args.count, args.dim), dtype=np.float32) for space in SPACES}
     for space in spaces:
-        vectors = draws[space]
+        if args.encoding == "binary":
+            # The l2 draw's signs, one bit per component, packed as k-NN
+            # receives a binary vector: eight bits to a signed byte, most
+            # significant first.
+            vectors = np.packbits(draws["l2"] > 0, axis=1).view(np.int8)
+        else:
+            vectors = draws[space]
         if args.encoding == "byte":
             # The same draw as the other encodings, scaled, rounded, and
             # clipped to the byte range: a byte field takes integers only.
@@ -248,8 +276,14 @@ def main() -> None:
             sys.exit(f"{index}: compound files {'present' if has_cfs else 'absent'} but --compound={args.compound}; files: {names}")
 
         # Row i is document i, which is also Faiss label i in the native file.
-        vectors[pos_of_doc].astype(np.float32).tofile(dest / "vectors.f32")
-        vectors_note = "row-major little-endian float32 in doc-id order: row i is document i, the Faiss label i; pos_of_doc[i] is its insertion position and its _id"
+        if args.encoding == "binary":
+            vectors_file = "vectors.u8"
+            vectors[pos_of_doc].view(np.uint8).tofile(dest / vectors_file)
+            vectors_note = f"{args.dim // 8} bytes of packed bits per row, as the binary field received them (most significant bit first), in doc-id order: row i is document i, the Faiss label i; pos_of_doc[i] is its insertion position and its _id"
+        else:
+            vectors_file = "vectors.f32"
+            vectors[pos_of_doc].astype(np.float32).tofile(dest / vectors_file)
+            vectors_note = "row-major little-endian float32 in doc-id order: row i is document i, the Faiss label i; pos_of_doc[i] is its insertion position and its _id"
         if args.encoding == "byte":
             vectors_note += "; every value is an integer in [-128, 127], as the byte field received it"
         manifest = {
@@ -264,7 +298,7 @@ def main() -> None:
             "count": args.count,
             "dimension": args.dim,
             "seed": SEED,
-            "vectors_file": "vectors.f32",
+            "vectors_file": vectors_file,
             "vectors_note": vectors_note,
             "pos_of_doc": pos_of_doc,
             "request": body,

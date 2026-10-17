@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use knn_format::envelope::Envelope;
 use knn_format::faiss::{
-    CodeFormat, HnswGraph, IdMapIndex, IndexHeader, Metric, SqStorage, Storage,
+    CodeFormat, HeaderKind, HnswGraph, IdMapIndex, IndexHeader, Metric, SqStorage, Storage,
 };
 use knn_format::{Parsed, view_offset};
 
@@ -27,6 +27,16 @@ const BF16_UNIT_NORM_TOLERANCE: f64 = 8e-3;
 /// Why byte storage cannot belong to a cosine field.
 const BYTE_COSINE: &str =
     "k-NN's Faiss engine refuses cosinesimil for byte fields, since it cannot normalize bytes";
+
+/// Why only binary storage can belong to a hamming field.
+const HAMMING_SPACE: &str = "k-NN accepts hamming for binary fields only";
+
+/// Why binary storage can belong to a float field too.
+const BINARY_ENCODER: &str = "k-NN writes it for a float field with the binary encoder too, whose index compares the quantized bits by hamming distance";
+
+/// The metric type Faiss's `IndexBinary` starts with and k-NN never
+/// changes: `METRIC_L2`, which a binary index does not use.
+const BINARY_METRIC_TYPE: i32 = 1;
 
 /// Runs every check over `bytes`.
 #[must_use]
@@ -161,7 +171,9 @@ fn check_headers(col: &mut Collector, bytes: &[u8], idx: &IdMapIndex<'_>) {
                 None,
             );
         }
-        if h.metric_type != first.metric_type {
+        // A binary index does not use its metric type, so disagreeing ones
+        // change nothing; the warning below reports any k-NN never writes.
+        if h.metric_type != first.metric_type && !matches!(h.kind, HeaderKind::Binary { .. }) {
             col.fail(
                 Check::Headers,
                 format!(
@@ -176,6 +188,30 @@ fn check_headers(col: &mut Collector, bytes: &[u8], idx: &IdMapIndex<'_>) {
             col.fail(
                 Check::Headers,
                 format!("{name} header metric type {m} is not L2 (1) or inner product (0)"),
+                at,
+                None,
+            );
+        }
+        if let (Some(size), Some(first_size)) = (h.code_size(), first.code_size())
+            && size != first_size
+        {
+            col.fail(
+                Check::Headers,
+                format!("{name} header code size {size} differs from the id map's {first_size}"),
+                at,
+                None,
+            );
+        }
+        // Faiss computes Hamming distance for a binary index whatever its
+        // metric type says, so another value changes no search; but k-NN
+        // never writes one.
+        if matches!(h.kind, HeaderKind::Binary { .. }) && h.metric_type != BINARY_METRIC_TYPE {
+            col.warn(
+                Check::Headers,
+                format!(
+                    "{name} header records metric type {}; a binary index computes hamming distance whatever it says, and k-NN writes {BINARY_METRIC_TYPE}",
+                    h.metric_type
+                ),
                 at,
                 None,
             );
@@ -199,6 +235,37 @@ fn check_headers(col: &mut Collector, bytes: &[u8], idx: &IdMapIndex<'_>) {
     }
     if let Storage::Sq(storage) = &idx.index.storage {
         check_quantizer(col, bytes, storage, first.d);
+    }
+    if let HeaderKind::Binary { code_size } = first.kind {
+        check_binary_shape(col, first, code_size);
+    }
+}
+
+/// A binary index's dimension counts bits, so it must be a multiple of 8,
+/// and its code size must be the dimension's bytes: Faiss's `IndexBinary`
+/// requires both, and k-NN refuses any other binary field.
+fn check_binary_shape(col: &mut Collector, header: &IndexHeader, code_size: i32) {
+    let d = header.d;
+    // The code size follows the dimension, 4 bytes in.
+    let code_size_at = header.offset.checked_add(8);
+    if d % 8 != 0 {
+        col.fail(
+            Check::Headers,
+            format!("binary dimension {d} is not a multiple of 8"),
+            header.offset.checked_add(4),
+            None,
+        );
+    } else if code_size != d / 8 {
+        col.fail(
+            Check::Headers,
+            format!(
+                "code size {code_size} is not {}: dimension {d} packs into {} bytes",
+                d / 8,
+                d / 8
+            ),
+            code_size_at,
+            None,
+        );
     }
 }
 
@@ -255,15 +322,36 @@ fn check_metric(col: &mut Collector, idx: &IdMapIndex<'_>, space: Option<Space>)
         col.skip(Check::Metric, "no --space given");
         return;
     };
-    let metric = idx.index.storage.header().metric();
+    let storage = &idx.index.storage;
+    // A binary index belongs to a hamming field of binary vectors, or to a
+    // float field of any other space whose vectors k-NN quantizes to bits
+    // (the binary encoder). Either is valid, and only the field mapping
+    // says which, so a float space is noted, not failed.
+    if let Storage::Binary(_) = storage {
+        if space != Space::Hamming {
+            col.info(
+                Check::Metric,
+                format!(
+                    "binary storage in {} {} field: {BINARY_ENCODER}",
+                    article(space),
+                    space.name()
+                ),
+                Some(storage.header().offset),
+                None,
+            );
+        }
+        return;
+    }
+    let metric = storage.header().metric();
     let wanted = match space {
         Space::L2 => Metric::L2,
         Space::InnerProduct | Space::Cosine => Metric::InnerProduct,
+        Space::Hamming => Metric::Hamming,
     };
     // Faiss has no cosine metric; k-NN serves cosinesimil as inner product
     // over normalized vectors, cannot normalize bytes, and refuses the
     // space for byte fields when the mapping is created.
-    let byte_cosine = match &idx.index.storage {
+    let byte_cosine = match storage {
         Storage::Sq(s) if space == Space::Cosine && s.format == CodeFormat::Byte => {
             Some(s.quantizer.offset)
         }
@@ -271,17 +359,22 @@ fn check_metric(col: &mut Collector, idx: &IdMapIndex<'_>, space: Option<Space>)
     };
     if metric != wanted {
         // One finding, so text output, which shows a check's first, keeps
-        // the byte note with the failure.
-        let note = byte_cosine.map_or(String::new(), |_| format!("; {BYTE_COSINE}"));
+        // the byte or hamming note with the failure.
+        let note = match (byte_cosine, space) {
+            (Some(_), _) => format!("; {BYTE_COSINE}"),
+            (None, Space::Hamming) => format!("; {HAMMING_SPACE}"),
+            (None, _) => String::new(),
+        };
         col.fail(
             Check::Metric,
             format!(
-                "file records metric {}, but a {} field needs {}{note}",
+                "file records metric {}, but {} {} field needs {}{note}",
                 metric.name(),
+                article(space),
                 space.name(),
                 wanted.name()
             ),
-            Some(idx.index.storage.header().offset),
+            Some(storage.header().offset),
             None,
         );
     } else if let Some(at) = byte_cosine {
@@ -291,6 +384,15 @@ fn check_metric(col: &mut Collector, idx: &IdMapIndex<'_>, space: Option<Space>)
             Some(at),
             None,
         );
+    }
+}
+
+/// The indefinite article a space's name takes as it is said: "an l2",
+/// "an innerproduct", "a cosinesimil", "a hamming".
+fn article(space: Space) -> &'static str {
+    match space {
+        Space::L2 | Space::InnerProduct => "an",
+        Space::Cosine | Space::Hamming => "a",
     }
 }
 
@@ -565,6 +667,10 @@ fn check_vector_count(col: &mut Collector, idx: &IdMapIndex<'_>) {
                 }
             },
         ),
+        Storage::Binary(s) => {
+            check_binary_count(col, idx, s.codes.len());
+            return;
+        }
     };
     let expected = usize::try_from(idx.header.ntotal)
         .ok()
@@ -586,6 +692,28 @@ fn check_vector_count(col: &mut Collector, idx: &IdMapIndex<'_>) {
     }
 }
 
+/// Binary storage holds `count x code size` bytes, by the id map's
+/// header, as Faiss's own reader requires of the storage's.
+fn check_binary_count(col: &mut Collector, idx: &IdMapIndex<'_>, held: usize) {
+    let code_size = idx.header.code_size().unwrap_or(0);
+    let expected = usize::try_from(idx.header.ntotal)
+        .ok()
+        .zip(usize::try_from(code_size).ok())
+        .and_then(|(n, size)| n.checked_mul(size));
+    if expected != Some(held) {
+        col.fail(
+            Check::VectorCount,
+            format!(
+                "storage holds {held} bytes of binary codes; {} vectors of {code_size} bytes need {}",
+                idx.header.ntotal,
+                expected.map_or_else(|| "more than fit".to_owned(), |e| e.to_string())
+            ),
+            Some(idx.index.storage.header().offset),
+            None,
+        );
+    }
+}
+
 fn check_id_map_length(col: &mut Collector, bytes: &[u8], idx: &IdMapIndex<'_>) {
     let n = usize::try_from(idx.header.ntotal).unwrap_or(usize::MAX);
     if idx.id_map.len() != n {
@@ -604,11 +732,19 @@ fn check_id_map_length(col: &mut Collector, bytes: &[u8], idx: &IdMapIndex<'_>) 
 
 fn check_vector_values(col: &mut Collector, bytes: &[u8], idx: &IdMapIndex<'_>) {
     let storage = &idx.index.storage;
-    if let Storage::Sq(s) = storage
-        && s.format == CodeFormat::Byte
-    {
-        col.skip(Check::VectorValues, "every byte code is a finite value");
-        return;
+    match storage {
+        Storage::Sq(s) if s.format == CodeFormat::Byte => {
+            col.skip(Check::VectorValues, "every byte code is a finite value");
+            return;
+        }
+        Storage::Binary(_) => {
+            col.skip(
+                Check::VectorValues,
+                "binary codes are bits, all of them valid",
+            );
+            return;
+        }
+        Storage::Flat(_) | Storage::Sq(_) => {}
     }
     // Vectors numbered as the storage counts them, as in the norms check.
     let d = usize::try_from(storage.header().d).unwrap_or(0).max(1);
@@ -709,6 +845,15 @@ fn check_norms(col: &mut Collector, bytes: &[u8], idx: &IdMapIndex<'_>, space: O
                 return;
             }
         },
+        // Bits have no length. A cosine field with the binary encoder
+        // keeps its float32 vectors in its .vec.
+        Storage::Binary(_) => {
+            col.skip(
+                Check::Norms,
+                "binary codes have no length to check; a cosine field's float32 vectors are in its .vec",
+            );
+            return;
+        }
     };
     // Rows as the storage counts them, by its own header's dimension.
     let d = usize::try_from(storage.header().d).unwrap_or(0);

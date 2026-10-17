@@ -21,7 +21,9 @@
 //! max-heaps (an inner product as its negation). Faiss 1.15.1 searches an
 //! inner-product index with min-heaps over the similarities instead, which
 //! break exact ties by node the other way, in the candidate queue as well
-//! as the results.
+//! as the results. A binary index (`IndexBinaryHNSW`) runs the same search
+//! over Hamming distances, which Faiss computes as float32 and orders with
+//! the L2 max-heaps in both versions.
 //!
 //! Where Faiss would read out of bounds on a malformed graph (a neighbor
 //! id past the node count, a node without a stored vector), the entry is
@@ -34,14 +36,15 @@ use std::collections::BinaryHeap;
 use knn_format::faiss::{HnswGraph, HnswIndex, IdMapIndex};
 use rayon::prelude::*;
 
-use crate::{Distance, Error, Queries, Result, Vectors, checked_vectors};
+use crate::{Distance, Error, Queries, Query, Result, Vectors, check_query, checked_vectors};
 
 /// One result of a search.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Hit {
     /// The node, which is also the storage row.
     pub node: usize,
-    /// In the file's metric: squared L2, or the inner product.
+    /// In the file's metric: squared L2, the inner product, or the
+    /// Hamming distance.
     pub distance: f32,
 }
 
@@ -70,25 +73,22 @@ impl Searcher {
     ///
     /// # Errors
     ///
-    /// Returns an error when `k` is 0, the file's dimension or metric is
-    /// unusable, or `query` has another dimension.
-    pub fn search(
+    /// Returns an error when `k` is 0, the file's dimension, code size, or
+    /// metric is unusable, or `query` has another dimension or is of the
+    /// other kind: float32 for binary storage, or bits for any other.
+    pub fn search<'q>(
         &mut self,
         index: &HnswIndex<'_>,
-        query: &[f32],
+        query: impl Into<Query<'q>>,
         k: usize,
         ef_search: usize,
     ) -> Result<Vec<Hit>> {
         if k == 0 {
             return Err(Error::ZeroK);
         }
+        let query = query.into();
         let vectors = Vectors::of(&index.storage)?;
-        if query.len() != vectors.d {
-            return Err(Error::DimensionMismatch {
-                file: vectors.d,
-                queries: query.len(),
-            });
-        }
+        check_query(&vectors, query.kind(), query.dimension())?;
         let distance = Distance::of_storage(&index.storage)?;
         let graph = &index.graph;
         if self.visited.len() != graph.node_count() {
@@ -149,7 +149,7 @@ impl Searcher {
             .map(|e| Hit {
                 node: e.node,
                 distance: match distance {
-                    Distance::L2 => e.dis,
+                    Distance::L2 | Distance::Hamming => e.dis,
                     Distance::NegatedInnerProduct => -e.dis,
                 },
             })
@@ -250,8 +250,9 @@ fn neighbor_list<'g>(
 ///
 /// # Errors
 ///
-/// Returns an error when `k` is 0, the file's dimension or metric is
-/// unusable, or the queries' dimension differs from the file's.
+/// Returns an error when `k` is 0, the file's dimension, code size, or
+/// metric is unusable, or the queries' kind or dimension differs from the
+/// file's.
 pub fn search_all(
     index: &HnswIndex<'_>,
     queries: &Queries,

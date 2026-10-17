@@ -97,7 +97,9 @@ struct Manifest {
 fn sq<'a>(storage: &'a Storage<'_>, name: &str) -> &'a SqStorage<'a> {
     match storage {
         Storage::Sq(s) => s,
-        Storage::Flat(_) => panic!("{name}: expected scalar-quantized storage"),
+        Storage::Flat(_) | Storage::Binary(_) => {
+            panic!("{name}: expected scalar-quantized storage")
+        }
     }
 }
 

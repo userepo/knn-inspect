@@ -3,10 +3,12 @@
 //! [`ground_truth`] finds, for every query, how far away its k-th nearest
 //! stored vector is, by exhaustive search in parallel over the queries.
 //! Storage is float32, or fp16, bf16, or byte codes decoded exactly to
-//! float32 as Faiss decodes them. [`score`] then counts, per query, how
-//! many labels of an externally produced result list are at least that
-//! close. A tie with the k-th neighbor counts, so a result list that is
-//! exactly right scores 1.0 even when the top k is not unique.
+//! float32 as Faiss decodes them, or packed bits, which are compared by
+//! Hamming distance against queries of packed bits. [`score`] then
+//! counts, per query, how many labels of an externally produced result
+//! list are at least that close. A tie with the k-th neighbor counts, so
+//! a result list that is exactly right scores 1.0 even when the top k is
+//! not unique.
 //!
 //! Result lists carry the file's own labels (the ID map's) unless the
 //! caller supplies [`Labels`] built from ids of its own, such as the
@@ -29,8 +31,9 @@
 //! it with min-heaps over the similarities instead, which break ties
 //! toward the higher node in the candidate queue and the results alike,
 //! so a tie can change which results it returns, not only their order.
-//! Both break L2 ties alike. Exact ties are rare with float data and
-//! happen with byte vectors and integer queries.
+//! Both break L2 and Hamming ties alike. Exact ties are rare with float
+//! data, happen with byte vectors and integer queries, and are the rule
+//! with binary vectors, whose distances are small integers.
 
 mod hnsw;
 
@@ -49,13 +52,16 @@ use serde::Serialize;
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// The query bytes do not hold whole rows.
-    #[error("{len} bytes of queries is not a multiple of {row} (dimension {d} x 4 bytes)")]
+    #[error(
+        "{len} bytes of queries is not a multiple of {row}, the bytes in a row of dimension {d}"
+    )]
     QueriesLength {
         /// Bytes given.
         len: usize,
         /// The dimension.
         d: usize,
-        /// Bytes per row.
+        /// Bytes per row: 4 per component of float32 queries, one per 8
+        /// dimensions of binary ones.
         row: usize,
     },
     /// No query rows.
@@ -67,6 +73,18 @@ pub enum Error {
         /// As stored.
         d: i32,
     },
+    /// A binary dimension counts bits, packed eight to a byte.
+    #[error("binary dimension {d} is not a positive multiple of 8")]
+    BinaryDimension {
+        /// As given.
+        d: usize,
+    },
+    /// A binary file's code size, which every row is read by, is 0.
+    #[error("code size {code_size} is not usable")]
+    CodeSize {
+        /// As stored.
+        code_size: i32,
+    },
     /// The queries have a different dimension than the file.
     #[error("queries have dimension {queries}, the file {file}")]
     DimensionMismatch {
@@ -74,6 +92,15 @@ pub enum Error {
         file: usize,
         /// The queries'.
         queries: usize,
+    },
+    /// Float32 queries for a binary file, or binary queries for another.
+    #[error("the file holds {file} vectors, but the queries are {queries}")]
+    QueryKind {
+        /// The file's vectors: `float32` (any non-binary storage, which
+        /// decodes to float32) or `binary`.
+        file: &'static str,
+        /// The queries'.
+        queries: &'static str,
     },
     /// The file's metric is neither L2 nor inner product.
     #[error("metric type {metric_type} is not L2 (1) or inner product (0)")]
@@ -123,12 +150,88 @@ pub enum Error {
 /// The crate's result type.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Query vectors, row-major float32.
+/// Query vectors: row-major float32, or packed bits for a binary file.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Queries {
+    /// Components of a float32 row, bits of a binary one.
     d: usize,
-    data: Vec<f32>,
+    data: QueryData,
 }
+
+#[derive(Debug, Clone, PartialEq)]
+enum QueryData {
+    Floats(Vec<f32>),
+    /// `d / 8` bytes per row.
+    Bits(Vec<u8>),
+}
+
+/// One query vector.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Query<'a> {
+    /// Float32 components, for float32, fp16, bf16, or byte storage.
+    Floats(&'a [f32]),
+    /// Packed bits, for binary storage.
+    Bits(&'a [u8]),
+}
+
+impl<'a> From<&'a [f32]> for Query<'a> {
+    fn from(q: &'a [f32]) -> Self {
+        Self::Floats(q)
+    }
+}
+
+impl<'a> From<&'a Vec<f32>> for Query<'a> {
+    fn from(q: &'a Vec<f32>) -> Self {
+        Self::Floats(q)
+    }
+}
+
+impl<'a, const N: usize> From<&'a [f32; N]> for Query<'a> {
+    fn from(q: &'a [f32; N]) -> Self {
+        Self::Floats(q)
+    }
+}
+
+impl<'a> From<&'a [u8]> for Query<'a> {
+    fn from(q: &'a [u8]) -> Self {
+        Self::Bits(q)
+    }
+}
+
+impl<'a> From<&'a Vec<u8>> for Query<'a> {
+    fn from(q: &'a Vec<u8>) -> Self {
+        Self::Bits(q)
+    }
+}
+
+impl<'a, const N: usize> From<&'a [u8; N]> for Query<'a> {
+    fn from(q: &'a [u8; N]) -> Self {
+        Self::Bits(q)
+    }
+}
+
+impl Query<'_> {
+    /// Its dimension: components, or bits.
+    #[must_use]
+    pub fn dimension(&self) -> usize {
+        match self {
+            Self::Floats(q) => q.len(),
+            Self::Bits(q) => q.len().saturating_mul(8),
+        }
+    }
+
+    /// `float32` or `binary`, as errors name the kinds.
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Floats(_) => FLOAT32,
+            Self::Bits(_) => BINARY,
+        }
+    }
+}
+
+/// The two kinds of vectors, as [`Error::QueryKind`] names them.
+const FLOAT32: &str = "float32";
+const BINARY: &str = "binary";
 
 impl Queries {
     /// Decodes little-endian float32 rows of dimension `d`.
@@ -175,32 +278,113 @@ impl Queries {
         if data.is_empty() {
             return Err(Error::NoQueries);
         }
-        Ok(Self { d, data })
+        Ok(Self {
+            d,
+            data: QueryData::Floats(data),
+        })
     }
 
-    /// The dimension.
+    /// Binary rows of dimension `d`, in bits: `d / 8` bytes each, the bits
+    /// packed as k-NN receives a binary vector.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `d` is not a positive multiple of 8, the
+    /// bytes do not hold whole rows, or there are none.
+    pub fn from_bits(bytes: &[u8], d: usize) -> Result<Self> {
+        Self::bits(d, bytes.to_vec())
+    }
+
+    fn bits(d: usize, data: Vec<u8>) -> Result<Self> {
+        if d == 0 || !d.is_multiple_of(8) {
+            return Err(Error::BinaryDimension { d });
+        }
+        let row = d / 8;
+        if !data.len().is_multiple_of(row) {
+            return Err(Error::QueriesLength {
+                len: data.len(),
+                d,
+                row,
+            });
+        }
+        if data.is_empty() {
+            return Err(Error::NoQueries);
+        }
+        Ok(Self {
+            d,
+            data: QueryData::Bits(data),
+        })
+    }
+
+    /// The dimension: components of a float32 row, bits of a binary one.
     #[must_use]
     pub fn d(&self) -> usize {
         self.d
     }
 
+    /// Whether the rows are packed bits.
+    #[must_use]
+    pub fn is_binary(&self) -> bool {
+        matches!(self.data, QueryData::Bits(_))
+    }
+
     /// Number of queries.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.data.len() / self.d
+        match &self.data {
+            QueryData::Floats(data) => data.len() / self.d,
+            QueryData::Bits(data) => data.len() / (self.d / 8),
+        }
     }
 
     /// Always false: an empty set does not construct.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.data.is_empty()
+        match &self.data {
+            QueryData::Floats(data) => data.is_empty(),
+            QueryData::Bits(data) => data.is_empty(),
+        }
     }
 
     /// The rows.
-    pub fn rows(&self) -> impl ExactSizeIterator<Item = &[f32]> {
-        self.data.chunks_exact(self.d)
+    pub fn rows(&self) -> impl ExactSizeIterator<Item = Query<'_>> {
+        match &self.data {
+            QueryData::Floats(data) => Rows::Floats(data.chunks_exact(self.d)),
+            QueryData::Bits(data) => Rows::Bits(data.chunks_exact(self.d / 8)),
+        }
+    }
+
+    /// `float32` or `binary`, as errors name the kinds.
+    fn kind(&self) -> &'static str {
+        if self.is_binary() { BINARY } else { FLOAT32 }
     }
 }
+
+/// [`Queries::rows`]: the rows of either kind.
+enum Rows<'a> {
+    Floats(std::slice::ChunksExact<'a, f32>),
+    Bits(std::slice::ChunksExact<'a, u8>),
+}
+
+impl<'a> Iterator for Rows<'a> {
+    type Item = Query<'a>;
+
+    fn next(&mut self) -> Option<Query<'a>> {
+        match self {
+            Self::Floats(rows) => rows.next().map(Query::Floats),
+            Self::Bits(rows) => rows.next().map(Query::Bits),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            Self::Floats(rows) => rows.size_hint(),
+            Self::Bits(rows) => rows.size_hint(),
+        }
+    }
+}
+
+impl ExactSizeIterator for Rows<'_> {}
 
 /// Which node each label in a result list refers to.
 #[derive(Debug, Clone)]
@@ -260,13 +444,13 @@ impl Labels {
 
 /// `count` distinct rows of `storage` as queries, chosen by a fixed
 /// generator from `seed`, with the rows they came from; scalar-quantized
-/// rows are decoded. The same seed and file give the same queries on every
-/// platform.
+/// rows are decoded, and binary rows stay packed bits. The same seed and
+/// file give the same queries on every platform.
 ///
 /// # Errors
 ///
-/// Returns an error when `count` is 0 or exceeds the vector count, or
-/// the dimension is unusable.
+/// Returns an error when `count` is 0 or exceeds the vector count, or the
+/// dimension, or the code size of binary storage, is unusable.
 pub fn sample_queries(
     storage: &Storage<'_>,
     count: usize,
@@ -294,11 +478,27 @@ pub fn sample_queries(
         moved.insert(j, vi);
     }
     let order: Vec<usize> = (0..count).map(|i| at(&moved, i)).collect();
-    let mut data = Vec::with_capacity(count.saturating_mul(d));
-    for &row in &order {
-        vectors.extend_row(row, &mut data);
-    }
-    Ok((Queries::from_rows(d, data)?, order))
+    let queries = if let Codes::Bits(codes) = vectors.codes {
+        let mut data = Vec::with_capacity(count.saturating_mul(d));
+        for &row in &order {
+            data.extend(row_of(codes, d, row).unwrap_or_default());
+        }
+        Queries::bits(vectors.dimension(), data)?
+    } else {
+        let mut data = Vec::with_capacity(count.saturating_mul(d));
+        for &row in &order {
+            vectors.extend_row(row, &mut data);
+        }
+        Queries::from_rows(d, data)?
+    };
+    Ok((queries, order))
+}
+
+/// Row `row` of `codes`, `len` elements each, or `None` when it is not
+/// stored in full.
+fn row_of<T>(codes: &[T], len: usize, row: usize) -> Option<&[T]> {
+    let start = row.checked_mul(len)?;
+    codes.get(start..start.checked_add(len)?)
 }
 
 /// `SplitMix64`: a small, well-distributed generator with no dependency.
@@ -310,11 +510,13 @@ fn splitmix64(state: &mut u64) -> u64 {
     z ^ (z >> 31)
 }
 
-/// Smaller is closer: squared L2, or the negated inner product.
+/// Smaller is closer: squared L2, the negated inner product, or the
+/// Hamming distance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Distance {
     L2,
     NegatedInnerProduct,
+    Hamming,
 }
 
 impl Distance {
@@ -322,10 +524,14 @@ impl Distance {
         match storage.header().metric() {
             Metric::L2 => Ok(Self::L2),
             Metric::InnerProduct => Ok(Self::NegatedInnerProduct),
+            Metric::Hamming => Ok(Self::Hamming),
             Metric::Other(metric_type) => Err(Error::Metric { metric_type }),
         }
     }
 
+    /// A float32 distance. Only binary storage has the Hamming metric, and
+    /// its codes go to [`hamming`] instead, so that arm never runs; NaN
+    /// would make the vector no one's neighbor.
     fn between<D: Decode>(self, v: &[D::Code], q: &[f32]) -> f32 {
         match self {
             Self::L2 => v
@@ -339,8 +545,21 @@ impl Distance {
             Self::NegatedInnerProduct => {
                 -v.iter().zip(q).map(|(&x, y)| D::value(x) * y).sum::<f32>()
             }
+            Self::Hamming => f32::NAN,
         }
     }
+}
+
+/// The bits in which two codes differ, as a float32, the way Faiss's
+/// `FlatHammingDis` returns the count for its HNSW search.
+fn hamming(v: &[u8], q: &[u8]) -> f32 {
+    let bits: u32 = v.iter().zip(q).map(|(&a, &b)| (a ^ b).count_ones()).sum();
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "Faiss converts the integer count to float the same way, rounding above 2^24"
+    )]
+    let distance = bits as f32;
+    distance
 }
 
 /// How one kind of storage decodes a stored component to float32.
@@ -409,7 +628,8 @@ impl Decode for Fp16 {
 /// The stored vectors as the distance code reads them.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Vectors<'a> {
-    /// The storage's dimension, at least 1.
+    /// Elements of `codes` per row, at least 1: the storage's dimension,
+    /// or for binary storage its code size in bytes.
     d: usize,
     codes: Codes<'a>,
 }
@@ -420,12 +640,26 @@ enum Codes<'a> {
     Fp16(&'a [U16]),
     Bf16(&'a [U16]),
     Byte(&'a [u8]),
+    /// Packed bits, `d` bytes per row.
+    Bits(&'a [u8]),
 }
 
 impl<'a> Vectors<'a> {
-    /// The storage's vectors, its dimension checked.
+    /// The storage's vectors, its dimension, or for binary storage its
+    /// code size, checked.
     fn of(storage: &Storage<'a>) -> Result<Self> {
         let header = storage.header();
+        if let Storage::Binary(s) = storage {
+            // Faiss reads every binary vector by the code size, so the
+            // rows are that long whatever the dimension says.
+            let d = s.code_size().ok_or(Error::CodeSize {
+                code_size: header.code_size().unwrap_or(0),
+            })?;
+            return Ok(Self {
+                d,
+                codes: Codes::Bits(s.codes),
+            });
+        }
         let d = usize::try_from(header.d)
             .ok()
             .filter(|&d| d > 0)
@@ -437,8 +671,25 @@ impl<'a> Vectors<'a> {
                 CodeFormat::Bf16 => Codes::Bf16(s.halves()),
                 CodeFormat::Byte => Codes::Byte(s.codes),
             },
+            Storage::Binary(s) => Codes::Bits(s.codes),
         };
         Ok(Self { d, codes })
+    }
+
+    /// The dimension queries must have: components, or bits.
+    fn dimension(&self) -> usize {
+        match self.codes {
+            Codes::Bits(_) => self.d.saturating_mul(8),
+            Codes::F32(_) | Codes::Fp16(_) | Codes::Bf16(_) | Codes::Byte(_) => self.d,
+        }
+    }
+
+    /// `float32` or `binary`, as errors name the kinds.
+    fn kind(&self) -> &'static str {
+        match self.codes {
+            Codes::Bits(_) => BINARY,
+            Codes::F32(_) | Codes::Fp16(_) | Codes::Bf16(_) | Codes::Byte(_) => FLOAT32,
+        }
     }
 
     /// Rows stored in full.
@@ -446,25 +697,27 @@ impl<'a> Vectors<'a> {
         match self.codes {
             Codes::F32(c) => c.len() / self.d,
             Codes::Fp16(c) | Codes::Bf16(c) => c.len() / self.d,
-            Codes::Byte(c) => c.len() / self.d,
+            Codes::Byte(c) | Codes::Bits(c) => c.len() / self.d,
         }
     }
 
     /// Row `row`'s distance from `q`, or `None` when the row is not
-    /// stored in full.
-    fn distance(&self, distance: Distance, row: usize, q: &[f32]) -> Option<f32> {
+    /// stored in full or `q` is of the other kind.
+    fn distance(&self, distance: Distance, row: usize, q: Query<'_>) -> Option<f32> {
         let start = row.checked_mul(self.d)?;
         let range = start..start.checked_add(self.d)?;
-        Some(match self.codes {
-            Codes::F32(c) => distance.between::<Float32>(c.get(range)?, q),
-            Codes::Fp16(c) => distance.between::<Fp16>(c.get(range)?, q),
-            Codes::Bf16(c) => distance.between::<Bf16>(c.get(range)?, q),
-            Codes::Byte(c) => distance.between::<Byte>(c.get(range)?, q),
+        Some(match (self.codes, q) {
+            (Codes::F32(c), Query::Floats(q)) => distance.between::<Float32>(c.get(range)?, q),
+            (Codes::Fp16(c), Query::Floats(q)) => distance.between::<Fp16>(c.get(range)?, q),
+            (Codes::Bf16(c), Query::Floats(q)) => distance.between::<Bf16>(c.get(range)?, q),
+            (Codes::Byte(c), Query::Floats(q)) => distance.between::<Byte>(c.get(range)?, q),
+            (Codes::Bits(c), Query::Bits(q)) => hamming(c.get(range)?, q),
+            _ => return None,
         })
     }
 
-    /// Appends row `row`, decoded, to `out`; nothing when it is not stored
-    /// in full.
+    /// Appends row `row`, decoded to float32, to `out`; nothing when it is
+    /// not stored in full, or holds bits, which have no float32 value.
     fn extend_row(&self, row: usize, out: &mut Vec<f32>) {
         let Some(start) = row.checked_mul(self.d) else {
             return;
@@ -478,6 +731,7 @@ impl<'a> Vectors<'a> {
             Codes::Fp16(c) => out.extend(decoded::<Fp16>(c.get(range))),
             Codes::Bf16(c) => out.extend(decoded::<Bf16>(c.get(range))),
             Codes::Byte(c) => out.extend(decoded::<Byte>(c.get(range))),
+            Codes::Bits(_) => {}
         }
     }
 }
@@ -505,16 +759,41 @@ impl Ord for Ordered {
     }
 }
 
-/// The file's vectors, their dimension checked against the queries'.
+/// The dimension queries for `storage` must have: its dimension, or for
+/// binary storage the bits of its code size, which Faiss reads every vector
+/// by.
+///
+/// # Errors
+///
+/// Returns an error when the dimension, or the code size of binary
+/// storage, is not usable.
+pub fn query_dimension(storage: &Storage<'_>) -> Result<usize> {
+    Vectors::of(storage).map(|v| v.dimension())
+}
+
+/// The file's vectors, their kind and dimension checked against the
+/// queries'.
 fn checked_vectors<'a>(storage: &Storage<'a>, queries: &Queries) -> Result<Vectors<'a>> {
     let vectors = Vectors::of(storage)?;
-    if vectors.d != queries.d() {
-        return Err(Error::DimensionMismatch {
-            file: vectors.d,
-            queries: queries.d(),
+    check_query(&vectors, queries.kind(), queries.d())?;
+    Ok(vectors)
+}
+
+/// A query of `kind` and dimension `d` against `vectors`.
+fn check_query(vectors: &Vectors<'_>, kind: &'static str, d: usize) -> Result<()> {
+    if vectors.kind() != kind {
+        return Err(Error::QueryKind {
+            file: vectors.kind(),
+            queries: kind,
         });
     }
-    Ok(vectors)
+    if vectors.dimension() != d {
+        return Err(Error::DimensionMismatch {
+            file: vectors.dimension(),
+            queries: d,
+        });
+    }
+    Ok(())
 }
 
 /// Per query, how close the k-th nearest stored vector is.
@@ -563,23 +842,33 @@ impl GroundTruth {
 ///
 /// # Errors
 ///
-/// Returns an error when `k` is 0, the file's dimension or metric is
-/// unusable, or the queries' dimension differs from the file's.
+/// Returns an error when `k` is 0, the file's dimension, code size, or
+/// metric is unusable, or the queries' kind or dimension differs from
+/// the file's.
 pub fn ground_truth(storage: &Storage<'_>, queries: &Queries, k: usize) -> Result<GroundTruth> {
     if k == 0 {
         return Err(Error::ZeroK);
     }
     let vectors = checked_vectors(storage, queries)?;
     let distance = Distance::of_storage(storage)?;
+    let d = vectors.d;
     let nearest_per_query = queries
         .rows()
         .collect::<Vec<_>>()
         .into_par_iter()
-        .map(|q| match vectors.codes {
-            Codes::F32(c) => nearest::<Float32>(c, vectors.d, distance, q, k),
-            Codes::Fp16(c) => nearest::<Fp16>(c, vectors.d, distance, q, k),
-            Codes::Bf16(c) => nearest::<Bf16>(c, vectors.d, distance, q, k),
-            Codes::Byte(c) => nearest::<Byte>(c, vectors.d, distance, q, k),
+        .map(|q| match (vectors.codes, q) {
+            (Codes::F32(c), Query::Floats(q)) => nearest::<Float32>(c, d, distance, q, k),
+            (Codes::Fp16(c), Query::Floats(q)) => nearest::<Fp16>(c, d, distance, q, k),
+            (Codes::Bf16(c), Query::Floats(q)) => nearest::<Bf16>(c, d, distance, q, k),
+            (Codes::Byte(c), Query::Floats(q)) => nearest::<Byte>(c, d, distance, q, k),
+            (Codes::Bits(c), Query::Bits(q)) => {
+                keep_nearest(c.chunks_exact(d).map(|v| hamming(v, q)), c.len() / d, k)
+            }
+            // checked_vectors matched the kinds.
+            _ => Nearest {
+                threshold: None,
+                found: 0,
+            },
         })
         .collect();
     Ok(GroundTruth {
@@ -597,12 +886,17 @@ fn nearest<D: Decode>(
     k: usize,
 ) -> Nearest {
     let rows = codes.chunks_exact(d);
+    let count = rows.len();
+    keep_nearest(rows.map(|v| distance.between::<D>(v, q)), count, k)
+}
+
+/// The k smallest finite distances of `rows` distances, as a [`Nearest`].
+fn keep_nearest(distances: impl Iterator<Item = f32>, rows: usize, k: usize) -> Nearest {
     // The k nearest so far, farthest on top. The heap never holds more
     // than k entries or more than there are vectors, whatever k the
     // caller asked for.
-    let mut nearest = BinaryHeap::with_capacity(k.min(rows.len()).saturating_add(1));
-    for v in rows {
-        let dist = distance.between::<D>(v, q);
+    let mut nearest = BinaryHeap::with_capacity(k.min(rows).saturating_add(1));
+    for dist in distances {
         if !dist.is_finite() {
             continue;
         }
@@ -657,7 +951,8 @@ pub struct Recall {
 /// # Errors
 ///
 /// Returns an error when the lists, the ground truth, and the queries do
-/// not pair up, or the file's dimension or metric is unusable.
+/// not pair up, the file's dimension, code size, or metric is unusable, or
+/// the queries' kind or dimension differs from the file's.
 pub fn score(
     storage: &Storage<'_>,
     labels: &Labels,

@@ -1,10 +1,10 @@
 # Native file format notes
 
-What a k-NN native file for a float, fp16, or bf16 HNSW field looks like
-on disk, confirmed byte by byte against the pinned sources and fixture
-files. The Rust parser in `knn-format` is checked against this document
-and the Python walker in `tools/walk_faiss.py`, which is a direct
-transcription of the Faiss read path.
+What a k-NN native file for a float, fp16, bf16, byte, or binary HNSW
+field looks like on disk, confirmed byte by byte against the pinned
+sources and fixture files. The Rust parser in `knn-format` is checked
+against this document and the Python walker in `tools/walk_faiss.py`,
+which is a direct transcription of the Faiss read path.
 
 ## Pinned versions
 
@@ -460,6 +460,151 @@ copy, such as `scan`'s, flips the top bit of every code, which is adding
 128 in two's complement, and looks for the result where the `.vemf`
 puts the field or, without a `.vemf`, only where Lucene can put vector
 data: at a multiple of 4, between the header and the footer.
+
+## Binary storage
+
+k-NN's `binary` data type on the Faiss engine builds a binary index. At
+tag 3.9.0.0, `AbstractFaissMethod` prefixes the index description with
+`B` for a binary field, giving `BHNSW16,Flat`, and the JNI
+`BinaryIndexService` passes it to `faiss::index_binary_factory`, which
+reads the `BHNSW16` and builds an `IndexBinaryHNSW` over an
+`IndexBinaryFlat`; the service wraps it in an `IndexBinaryIDMap` and
+writes it with `write_index_binary`. A binary field's dimension counts
+bits and must be a multiple of 8 ("Dimension should be multiply of 8 for
+binary vector data type"), each vector arrives as dimension / 8 signed
+bytes, and `hamming` is its only space type ("Space type [l2] is not
+supported with [binary] data type"), the default when none is given.
+
+The layout is `IBMp` > `IBHf` > `IBxF`. Each index starts with its
+fourcc and the binary header from `read_index_binary_header`, 21 bytes
+with no reserved fields and no metric argument:
+
+| Field | Type | Notes |
+|---|---|---|
+| `d` | int32 | dimension, in bits |
+| `code_size` | int32 | bytes per vector, `d / 8` |
+| `ntotal` | int64 | vector count |
+| `is_trained` | bool, 1 byte | |
+| `metric_type` | int32 | `1`, Faiss's default, which a binary index does not use |
+
+`IBMp` holds the header, the wrapped index, and the labels as a vector
+of int64, as `IxMp` does. `IBHf` holds the header, the graph exactly as
+`IHNf` does (`read_HNSW`), and the storage. `IBxF` holds the header and
+the codes as a byte vector: a uint64 count, `ntotal x code_size`, which
+Faiss's reader checks, then the bytes. The bits are stored as k-NN
+receives them, so the codes are the field's values byte for byte.
+
+A binary index computes the Hamming distance between codes, the bits in
+which they differ, whatever metric type its headers record: the HNSW
+search's distance computer (`FlatHammingDis` in `IndexBinaryHNSW.cpp` at
+`5616caa`) returns the popcount of the XOR of two codes as a float32,
+and `IndexBinaryHNSW::search` runs Faiss's float search over it with the
+L2 max-heaps (`HNSW::C`), rounding the distances to int32 at the end.
+Every node's code is `code_size` bytes, whatever the dimension says.
+Hamming distances are small integers, so they tie at every turn; Faiss
+1.15.1 breaks those ties as `5616caa` does, since both treat Hamming as
+L2, and on the fixtures every binary result list `knn-inspect recall`
+returns is the one faiss-cpu 1.15.1 wrote. The ties make those lists
+strict: reversing the search's two node-id tie-breaks changes all 500 of
+them. k-NN's patches to Faiss touch binary HNSW in five places, none of
+which changes an unfiltered search of a binary field or its layout: 0004
+lets `IndexBinaryHNSW`'s search take a parent-id grouper and search
+parameters, 0006 does the same for its CAGRA variant (`IBHc`), 0007
+makes its distance computer overridable for a subclass, 0010 lets a
+subclass skip the `d % 8 == 0` check in `IndexBinary`'s constructor, and
+0008 lets `write_index_binary` leave the storage out, writing `null` in
+place of its fourcc, which k-NN does only for the `on_disk` case below.
+
+The same layout serves a float field with k-NN's `binary` encoder
+(`QFrameBitEncoder`, `bits` 1, 2, or 4): the field's float32 vectors are
+quantized to `bits` per component by thresholds k-NN trains per segment,
+and the binary index over those bits has dimension `dimension x bits`
+padded to a multiple of 8 (`getDimensions` in k-NN's scalar quantization
+states), so a 12-dimensional field at 1 bit makes a 16-bit index of code
+size 2. Its `.vec` holds the float32 vectors and its `.vemf` records a
+float32 field; k-NN keeps the thresholds in the quantization state of
+the per-field format (`.osknnqstate`, beside its `.vec`), which
+`knn-inspect` does not read. So `scan` skips the `.vec` check for binary
+codes that no field holds when the `.vemf` records a float32 field of as
+many vectors whose bits, at 1, 2, or 4 a component, pack into the code
+size, and the quantization state lies beside it, or, without a `.vemf`,
+when the quantization state lies beside the `.vec`. The field keeps its
+float space type, and the binary index computes Hamming distance for it
+all the same; `verify` notes a float `--space` on binary storage instead
+of failing it.
+
+An `on_disk` float field of k-NN 3.9 writes a different file, as does a
+float field whose `sq` encoder keeps 1, 2, or 4 bits
+(`FaissSQEncoder.isSQCodedBits`), which is what `on_disk` mode resolves
+to. At 32x (the default), 16x, and 8x compression it builds a
+scalar-quantized graph (`MemOptimizedScalarQuantizedIndexBuildStrategy`)
+and writes it with patch 0008's flag: `IBMp` > `IBHf`, the `IBHf`
+header's code size the quantized bytes plus 16 bytes of correction
+factors (18 for 16 dimensions at 32x, 20 at 16x, 24 at 8x), then `null`
+where the storage would be. The quantized vectors stay in Lucene's files
+of the `Faiss1040ScalarQuantizedKnnVectorsFormat` (`.veq`, `.vemq`),
+beside the float32 ones in its `.vec` and `.vemf`. The parser refuses
+the file at the `null` fourcc, naming it: `verify` fails it, and `scan`,
+when its footer verifies, reports it as unsupported rather than failed.
+
+### Synthetic binary fixtures
+
+`tools/make_synthetic.py` writes three to `fixtures/synthetic-binary/`:
+`hamming-100x16-binary`, `hamming-1000x256-binary`, and
+`hamming-1000x8-ties-binary`, through `faiss.IndexBinaryHNSW(d, 16)`
+with efConstruction 100 and `faiss.IndexBinaryIDMap`. Each draws one
+standard normal component per bit and keeps its sign, packed eight bits
+to a byte, most significant first, as NumPy's `packbits` packs them;
+Faiss compares whole bytes, so the order within one changes no distance.
+The 8-bit case's 1,000 vectors take 251 distinct values, so many repeat
+and every one of its 100 baseline queries ties at the 10th place; 94 of
+the 16-bit case's and 73 of the 256-bit case's do too. The generator
+asserts that the storage holds the packed bits as given and that every
+header records code size `d / 8` and metric type 1. The files are
+15,643, 184,099, and 153,099 bytes. The recall baselines of a binary
+file draw each query byte from the bytes the file holds in that
+position, write them as packed bits (`*.queries.u8`), and take Faiss's
+own search and an `IndexBinaryFlat` brute force over them.
+
+`tools/walk_faiss.py` reads all three to the end with no trailing bytes.
+In `hamming-100x16-binary.faiss`: `IBHf` at 25, `IBxF` at 14,602, its
+code size at 14,610, the codes' byte count (200, for 100 vectors of 2
+bytes) at 14,627 and the codes at 14,635, the ID map's labels at 14,843,
+end at 15,643.
+
+Faiss Python returns a binary index from `deserialize_index_binary`
+that the downcast views of its parts do not own: the tools keep the
+deserialized index referenced while they read its graph and storage,
+since a dropped one is freed under them.
+
+### Real binary files from OpenSearch 3.9.0
+
+`tools/extract_opensearch.py --encoding binary --dim 128` indexes the
+signs of the `l2` space's 500 x 128 draw as a binary field of 128 bits,
+16 bytes a vector, into `fixtures/opensearch-3.9.0-binary/binary/hamming/`.
+The native file is `_2_165_vec.faiss`, 83,875 bytes, and walks to the
+end with a verifying footer: `IBMp` > `IBHf` > `IBxF`, every header with
+`d` 128, code size 16, and metric type 1, a codes count of 8,000 bytes,
+and efSearch 100. The codes are the bits indexed, byte for byte, and so
+is `vectors.u8`, which the extraction writes in place of `vectors.f32`.
+Lucene's copy, `_2_NativeEngines990KnnVectorsFormat_0.vec`, is a byte
+field of 16 dimensions whose `.vemf` records similarity 0 (`EUCLIDEAN`,
+which k-NN gives every binary field and does not use): it holds the
+codes byte for byte from offset 92, the 89-byte header padded to a
+multiple of 4, and is 92 + 8,000 + 16 = 8,108 bytes.
+
+`--encoding binary-encoder` indexes the `l2` draw itself, 500 x 16
+float32, into a float field with the binary encoder at `bits` 1
+(`binary-encoder/l2/`). Its native file, 76,875 bytes, is the same
+layout with `d` 16 and code size 2, 1,000 bytes of codes, and efSearch
+256; its `.vec` holds the 500 x 16 float32 vectors from offset 128, its
+`.vemf` records a float32 field, and its quantization state lies beside
+them as `_2_NativeEngines990KnnVectorsFormat_0.osknnqstate`.
+
+`--encoding on-disk` indexes the same draw into an `on_disk` float field
+(`on-disk/l2/`). Its native file, 75,846 bytes, has `IBHf`'s code size
+18 and `null` at offset 71,818, where the storage of the other two
+begins.
 
 ## Real files from OpenSearch 3.9.0
 

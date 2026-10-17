@@ -19,6 +19,8 @@ pub enum SpaceArg {
     /// Cosine similarity: inner product over unit vectors.
     #[value(alias = "cosinesimil")]
     Cosine,
+    /// Hamming distance between packed bits: binary fields only.
+    Hamming,
 }
 
 impl From<SpaceArg> for Space {
@@ -27,6 +29,7 @@ impl From<SpaceArg> for Space {
             SpaceArg::L2 => Self::L2,
             SpaceArg::Innerproduct => Self::InnerProduct,
             SpaceArg::Cosine => Self::Cosine,
+            SpaceArg::Hamming => Self::Hamming,
         }
     }
 }

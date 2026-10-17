@@ -9,9 +9,14 @@ Rust, read-only, and does not link Faiss or talk to a cluster.
 
 ## Status
 
-Early development: every planned command works on every fixture. See
-[docs/format-notes.md](docs/format-notes.md) for the file format and
-[docs/json.md](docs/json.md) for the JSON output of each command.
+Every command reads every layout listed under [Supported
+files](#supported-files), and is checked against Faiss Python and
+Lucene's own files on the fixtures, real OpenSearch 3.9.0 segments
+included. The JSON output of each command is documented in
+[docs/json.md](docs/json.md) with a stability rule: fields are only
+added. The library crates' APIs may still change between minor versions.
+[docs/format-notes.md](docs/format-notes.md) describes the file formats
+byte by byte.
 
 ## Install
 
@@ -29,35 +34,43 @@ cargo install --git https://github.com/userepo/knn-inspect --tag v0.6.1 knn-insp
 
 ```
 knn-inspect info <file.faiss> [--json]
-knn-inspect verify <file.faiss> [--space l2|innerproduct|cosine] [--max-findings N] [--json]
+knn-inspect verify <file.faiss> [--space l2|innerproduct|cosine|hamming] [--max-findings N] [--json]
 knn-inspect stats <file.faiss> [--json]
-knn-inspect recall <file.faiss> (--queries <q.f32> | --sample N [--seed S]) [--k N] [--ef-search N] [--json]
-knn-inspect recall <file.faiss> --queries <q.f32> --results <r.jsonl> [--k N] [--ids <ids.json>] [--json]
-knn-inspect scan <dir> [--space l2|innerproduct|cosine] [--max-findings N] [--json]
+knn-inspect recall <file.faiss> (--queries <q.f32|q.u8> | --sample N [--seed S]) [--k N] [--ef-search N] [--json]
+knn-inspect recall <file.faiss> --queries <q.f32|q.u8> --results <r.jsonl> [--k N] [--ids <ids.json>] [--json]
+knn-inspect scan <dir> [--space l2|innerproduct|cosine|hamming] [--max-findings N] [--json]
 ```
 
 `info` prints the envelope (footer offset and whether its CRC32
 verifies), the Faiss layout, dimension, vector count, metric, the scalar
-quantizer of fp16, bf16, or byte storage, HNSW parameters, level sizes,
-and the label range. Exit code 0 when the file parsed, 1 otherwise. A
-cosine field reports `inner_product`, because that is what the file
-records; k-NN normalizes the vectors instead.
+quantizer of fp16, bf16, or byte storage, the code size of binary
+storage, HNSW parameters, level sizes, and the label range. Exit code 0
+when the file parsed, 1 otherwise. A cosine field reports
+`inner_product`, because that is what the file records; k-NN normalizes
+the vectors instead. A binary file reports `hamming`, the distance a
+binary index computes, and its dimension in bits.
 
 `verify` runs every structural check and prints one line per check.
 Failures: footer checksum, truncation, an unsupported layout or scalar
-quantizer type, trailing bytes, disagreeing headers (for scalar-quantized
-storage, the quantizer's dimension and code size too), a `--space` that
-does not match the stored metric, non-monotonic neighbor offsets, node
-levels that contradict the slot counts, an invalid entry point, neighbor
-ids out of range, a neighbor listed on a level it is not on, a vector
-array or ID map of the wrong size. Warnings: an unexpected Lucene
-header, a Faiss header that says the index is not trained, trained
-values in a scalar quantizer, NaN or infinite components, duplicate
-neighbors, self-loops, byte storage checked as a cosine field (k-NN
-refuses to create one), and with `--space cosine`, zero or non-unit
-vectors. Exit code 0 when clean, 1 on any failure, 2 on warnings only.
-Where a finding points at bytes or a node, it names the file offset and
-node, so it can be looked up in a hex dump.
+quantizer type, trailing bytes, disagreeing headers (except in the
+metric type of binary headers, which a binary index does not use; for
+scalar-quantized storage, the quantizer's dimension and code size too;
+for binary storage, a dimension that is not a multiple of 8 or a code
+size other than its bytes), a `--space` that does not match the stored
+metric, non-monotonic neighbor offsets, node levels that contradict the
+slot counts, an invalid entry point, neighbor ids out of range, a
+neighbor listed on a level it is not on, a vector array or ID map of the
+wrong size. Warnings: an unexpected Lucene header, a Faiss header that
+says the index is not trained, trained values in a scalar quantizer, a
+binary header with a metric type k-NN never writes, NaN or infinite
+components, duplicate neighbors, self-loops, byte storage checked as a
+cosine field (k-NN refuses to create one), and with `--space cosine`,
+zero or non-unit vectors. Binary storage matches `--space hamming`, the
+only space k-NN takes for binary fields, and any other space is noted
+rather than failed: k-NN writes the same binary index for a float field
+with the binary encoder. Exit code 0 when clean, 1 on any failure, 2 on
+warnings only. Where a finding points at bytes or a node, it names the
+file offset and node, so it can be looked up in a hex dump.
 
 `stats` reports, per graph level, the node count, neighbor slots, edges,
 the out-degree histogram, and the nodes no search can reach. A node's
@@ -73,24 +86,28 @@ Faiss's search step for step (greedy descent through the upper levels,
 then a best-first search on level 0 with a candidate queue of
 `max(efSearch, k)`) at the Faiss commit k-NN 3.9.0 builds. On the
 fixtures it returns the result lists faiss-cpu 1.15.1 returns for the
-same queries and parameters, except three inner-product lists, where
-the two versions break exact ties differently (see below). This is also
-the search the k-NN plugin runs for a query without a filter or nested
-field: its JNI layer passes only efSearch and keeps Faiss's other
-search defaults.
+same queries and parameters, except three inner-product lists, where the
+two versions break exact ties differently (see below). This is also the
+search the k-NN plugin runs for a query without a filter or nested
+field: its JNI layer passes only efSearch and keeps Faiss's other search
+defaults.
 `--ef-search` overrides the efSearch stored in the file. As in Faiss, a
 search with efSearch below k can return fewer than k results; the report
 counts the empty slots as missing, and an `--ef-search` of at least k
 avoids them. `--queries` is the query vectors as row-major little-endian
-float32 in the file's dimension; `--sample N` takes N of the file's own
-vectors instead, chosen by `--seed`. For fp16, bf16, or byte storage the
-search and the brute force both work on the codes decoded to float32, as
-the Faiss that k-NN 3.9.0 builds does (newer Faiss on CPUs with
-AVX512-BF16 also rounds the query to bf16). Exact distance ties, which
-byte vectors can produce, are broken as that Faiss breaks them, toward
-the lower node. Faiss 1.15.1 breaks them toward the higher node in an
-inner-product index, which can change which results it returns, not
-only their order.
+float32 in the file's dimension, or for a binary file packed bits, as
+k-NN receives a binary vector, a row the bytes of the file's code size
+(its dimension / 8); `--sample N` takes N of the file's own vectors
+instead, chosen by `--seed`. For fp16, bf16, or byte storage the search
+and the brute force both work on the codes decoded to float32, as the
+Faiss that k-NN 3.9.0 builds does (newer Faiss on CPUs with AVX512-BF16
+also rounds the query to bf16); binary storage is compared by Hamming
+distance, the bits in which two vectors differ. Exact distance ties,
+which byte vectors can produce and binary vectors produce at every turn,
+are broken as that Faiss breaks them, toward the lower node. Faiss
+1.15.1 breaks them toward the higher node in an inner-product index,
+which can change which results it returns, not only their order; it
+breaks L2 and Hamming ties alike.
 
 With `--results`, the tool scores lists produced elsewhere (Faiss, or a
 live OpenSearch query): one line per query, in the same order, holding
@@ -110,10 +127,12 @@ otherwise.
 `scan` finds every `.faiss` and `.faissc` file under a directory,
 subdirectories included, and runs `verify` on each, printing one summary
 line per file (layout, dimension, count, metric, verdict) and the checks
-that failed or warned. Links to directories are not followed, so a link
-back up the tree cannot loop; a link to a native file is scanned like the
-file. A subdirectory that cannot be read is listed as not scanned, and
-the rest of the tree still is.
+that failed or warned. For a file in a layout this tool does not read,
+it prints the structure check's finding, which names the layout, as a
+note. Links to directories are not followed, so a link back up the tree
+cannot loop; a link to a native file is scanned like the file. A
+subdirectory that cannot be read is listed as not scanned, and the rest
+of the tree still is.
 
 `scan` also cross-checks each native file against the Lucene files of
 its segment. The `.vec` file holds the same vectors in the same order,
@@ -125,20 +144,28 @@ float32 vectors the codes were rounded from: each value must round to
 its code, on an exact tie either way one of Faiss's builds would round
 it (for bf16, also a subnormal value to zero, as Faiss's AVX512-BF16
 encoder does). A byte field's `.vec` holds the int8 values the codes are
-128 above, and must hold them all. Where the segment's `.vemf` lies
-beside the `.vec`, the vectors must be exactly where it records the
-field; without one, or with a sound one in a format this tool does not
-read, `scan` searches the `.vec` at every offset Lucene could have used.
-The `.si` file gives the segment's document count, and every label in
-the ID map, which k-NN sets to a doc id, must be one of the segment's
-doc ids. A `.vec`, `.vemf`, or `.si` that is there but cannot be read,
-or fails its own checksum, fails the native file too: the segment cannot
-be trusted as it stands. A sound `.si` in a format this tool does not
-read, as a newer Lucene may write, is skipped instead. `--space` applies
-to every file found; leave it out when the directory mixes space types.
-Exit code 0 when every file is clean, 1 if any failed (or would not
-open, a subdirectory could not be read, or none was found), 2 if the
-worst verdict was a warning.
+128 above, and must hold them all; a binary field's holds the packed
+bits byte for byte. A float field with the binary encoder writes a
+binary index over bits that quantize its float32 vectors, which its
+`.vec` holds; the check is skipped for it, since the bits cannot be
+compared with the floats without the field's quantization state. Where
+the segment's `.vemf` lies beside the `.vec`, the vectors must be
+exactly where it records the field; without one, or with a sound one in
+a format this tool does not read, `scan` searches the `.vec` at every
+offset Lucene could have used. The `.si` file gives the segment's
+document count, and every label in the ID map, which k-NN sets to a doc
+id, must be one of the segment's doc ids. A `.vec`, `.vemf`, or `.si`
+that is there but cannot be read, or fails its own checksum, fails the
+native file too: the segment cannot be trusted as it stands. A sound
+`.si` in a format this tool does not read, as a newer Lucene may write,
+is skipped instead. `--space` applies to every file found; leave it out
+when the directory mixes space types. A sound file in a layout this tool
+does not read, such as an `on_disk` field's, is reported as
+`unsupported` rather than failed: `verify` alone fails it, but a scan of
+a whole index must not read it as corruption. Exit code 0 when every
+file is clean, 1 if any failed (or would not open, a subdirectory could
+not be read, or none was found), 2 if the worst verdict was a warning or
+an unsupported file.
 
 ## Benchmarks
 
@@ -205,14 +232,21 @@ segment) for HNSW fields: an ID map wrapping HNSW with flat float32
 storage, or with fp16, bf16, or byte scalar-quantized storage (the `sq`
 encoder with `type: fp16` or `type: bf16`, and the `half_float` and
 `byte` data types), L2 or inner product (k-NN's `cosinesimil` is inner
-product over normalized vectors, and is refused for byte fields), with
-or without the Lucene footer. Every command reads all of them. Fixtures
-and format notes target OpenSearch 3.9.0.
+product over normalized vectors, and is refused for byte fields); and a
+binary ID map wrapping binary HNSW over packed bits, compared by Hamming
+distance (the `binary` data type, whose only space is `hamming`, and
+float fields with the binary encoder); with or without the Lucene
+footer. Every command reads all of them. Fixtures and format notes
+target OpenSearch 3.9.0.
 
-Not yet: other scalar-quantized storage, binary vectors, product
-quantization, and IVF. Their files are refused rather than misread, as
-an unsupported layout or scalar quantizer type. NMSLIB and Lucene-engine
-fields write no `.faiss` file, so `scan` does not see them.
+Not yet: other scalar-quantized storage, product quantization, IVF, and
+the graph without its vectors that k-NN 3.9 writes for an `on_disk`
+field or an `sq` encoder of 1, 2, or 4 bits, whose quantized vectors
+stay in Lucene's files. Their files are refused rather than misread, as
+an unsupported layout or scalar quantizer type: `verify` fails them, and
+`scan` reports those whose footer verifies as `unsupported`. NMSLIB and
+Lucene-engine fields write no `.faiss` file, so `scan` does not see
+them.
 
 ## Pinned versions
 
@@ -243,21 +277,32 @@ fixtures and baselines use faiss-cpu 1.15.1.
   32, rounded, and clipped to the byte range, with a byte field (the
   `byte` data type), for `l2` and `innerproduct` only: k-NN refuses
   `cosinesimil` for byte fields
+- `fixtures/synthetic-binary/` - three binary files, one of 8 bits whose
+  1,000 vectors take only 251 values, so distances nearly all tie, each
+  with an `.expected.json`
+- `fixtures/opensearch-3.9.0-binary/` - real segments of a binary field
+  of 128 bits, the signs of the `l2` vectors (`binary/hamming/`); of a
+  float field with the binary encoder, one bit per component
+  (`binary-encoder/l2/`); and of an `on_disk` float field, whose native
+  file this tool refuses (`on-disk/l2/`), and which has no baselines,
+  since Faiss Python cannot read it either
 - `*.stats.json` beside each synthetic fixture and `stats.json` beside
   each real one - the graph statistics Faiss Python computes from the
   same file, the baseline `stats` must match
 - `*.queries.f32`, `*.results.jsonl`, and `*.recall.json` beside each
   synthetic fixture (`queries.f32`, `results.jsonl`, `recall.json`
-  beside each real one) - 100 fixed queries, the labels Faiss's
-  HNSW search returns for them, and the recall@10 Faiss computes for
-  those results, the baseline `recall` must match
+  beside each real one) - 100 fixed queries, the labels Faiss's HNSW
+  search returns for them, and the recall@10 Faiss computes for those
+  results, the baseline `recall` must match; a binary file's queries are
+  packed bits, `*.queries.u8` (`queries.u8` beside a real one)
 - `fixtures/corrupted/` - one file per structural check, each derived
   from a clean fixture by a single mutation; `manifest.json` records the
   mutation and the check and severity it must trip
 
 Each real fixture directory also holds `vectors.f32`, the indexed vectors
-in doc-id order (row i is Faiss label i), and `manifest.json` with the
-versions, the index request, the file list, and `pos_of_doc`.
+in doc-id order (row i is Faiss label i), or for a binary field
+`vectors.u8`, the packed bits, and `manifest.json` with the versions, the
+index request, the file list, and `pos_of_doc`.
 
 ### Regenerating
 
@@ -285,6 +330,9 @@ docker compose -f tools\docker-compose.yml up -d
 .venv\Scripts\python tools\extract_opensearch.py --out fixtures\opensearch-3.9.0-fp16\half-float --encoding half-float
 .venv\Scripts\python tools\extract_opensearch.py --out fixtures\opensearch-3.9.0-bf16\sq-bf16 --encoding sq-bf16
 .venv\Scripts\python tools\extract_opensearch.py --out fixtures\opensearch-3.9.0-byte\byte --encoding byte
+.venv\Scripts\python tools\extract_opensearch.py --out fixtures\opensearch-3.9.0-binary\binary --encoding binary --dim 128
+.venv\Scripts\python tools\extract_opensearch.py --out fixtures\opensearch-3.9.0-binary\binary-encoder --encoding binary-encoder --spaces l2
+.venv\Scripts\python tools\extract_opensearch.py --out fixtures\opensearch-3.9.0-binary\on-disk --encoding on-disk --spaces l2
 docker compose -f tools\docker-compose.yml down -v
 ```
 
@@ -304,6 +352,7 @@ so rewrite them after regenerating either fixture set:
 
 - `tools/strip_envelope.py <file>` reports and verifies the Lucene footer;
   with `--out` it writes the bare Faiss payload for `faiss.read_index`
+  (`faiss.read_index_binary` for a binary file)
 - `tools/walk_faiss.py <file>` prints every Faiss field with its offset
 - `tools/graph_stats.py <file>` prints the graph statistics from the
   graph Faiss Python loads
@@ -311,8 +360,9 @@ so rewrite them after regenerating either fixture set:
 ## Fuzzing
 
 `fuzz/` holds a cargo-fuzz target that feeds arbitrary bytes to the
-parser, every check, the graph statistics, and the HNSW search; the rule
-is a result, never a panic. It needs nightly and Linux; see
+parser, every check, the graph statistics, the HNSW search, and the
+readers of Lucene's segment info and flat-vectors metadata; the rule is
+a result, never a panic. It needs nightly and Linux; see
 [fuzz/README.md](fuzz/README.md).
 
 ## Platform

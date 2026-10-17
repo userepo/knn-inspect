@@ -12,8 +12,10 @@
 //! scalar-quantized storage with `QT_fp16` (the `sq` encoder with
 //! `type: fp16`, and the `half_float` data type), `QT_bf16` (the `sq`
 //! encoder with `type: bf16`), or `QT_8bit_direct_signed` (the `byte`
-//! data type). See `docs/format-notes.md` in the repository for the
-//! byte-level description.
+//! data type); and an `IBMp` binary ID map wrapping an `IBHf` binary HNSW
+//! index over `IBxF` packed bits (the `binary` data type, and float
+//! fields with the `binary` encoder). See `docs/format-notes.md` in the
+//! repository for the byte-level description.
 //!
 //! [`segment_info`] reads one more Lucene file of the segment, as far as
 //! the document count: the segment info (`.si`). [`flat_vectors`] reads
