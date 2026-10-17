@@ -14,6 +14,7 @@ use knn_check::{Options, Severity, Space, Status};
 use knn_format::U16;
 use knn_format::envelope::Envelope;
 use knn_format::faiss::{CodeFormat, HalfRounding, Storage, bf16_rounds_to, byte_code};
+use knn_format::flat_vectors::{FlatField, FlatVectorsMeta};
 use knn_format::segment_info::SegmentInfo;
 use knn_format::{NativeFile, view_offset};
 use serde::Serialize;
@@ -141,9 +142,10 @@ enum CrossCheck {
     Match,
     /// The Lucene file is sound and the native file contradicts it.
     Mismatch,
-    /// The Lucene file exists but cannot be trusted: it could not be
-    /// opened or read, has no footer, or fails its footer checksum. The
-    /// segment cannot be trusted as it stands, so the file fails.
+    /// A Lucene file (a `.vec`, the `.vemf` beside it, or the `.si`)
+    /// exists but cannot be trusted: it could not be opened or read, has
+    /// no footer, or fails its footer checksum. The segment cannot be
+    /// trusted as it stands, so the file fails.
     Damaged,
     /// Not compared: the Lucene file is not beside the native file (a
     /// compound segment keeps its `.vec` inside the `.cfs`), is a sound
@@ -476,6 +478,48 @@ fn lucene_footer(bytes: &[u8]) -> Result<(), String> {
         .map_err(|_| "fails its footer checksum".to_owned())
 }
 
+/// The bytes to look for in a `.vec`, how else the `.vec` may hold them,
+/// and the stored vectors' shape; or why there is nothing to look for.
+fn stored_vectors<'a>(
+    bytes: &'a [u8],
+    parsed: &knn_format::Parsed<'a>,
+) -> Result<(&'a [u8], Sources<'a>, Shape), String> {
+    // Float32 storage as it lies in the file, or every whole code, which
+    // a half_float field's .vec holds byte for byte. The .vec of an sq
+    // fp16 or bf16 field holds the float32 vectors the codes were rounded
+    // from instead, so those codes are also looked for that way; a byte
+    // field's holds the int8 values the codes are 128 above, so byte codes
+    // are looked for that way only.
+    let all = &parsed.index.index.storage;
+    let (storage, sources) = match all {
+        Storage::Flat(flat) => {
+            let codes = flat.codes;
+            let Some(storage) = view_offset(bytes, codes).and_then(|start| {
+                bytes.get(start..start.checked_add(codes.len().checked_mul(4)?)?)
+            }) else {
+                return Err("the storage view could not be located in the file".to_owned());
+            };
+            (storage, Sources::None)
+        }
+        Storage::Sq(sq) => match sq.format {
+            CodeFormat::Fp16 | CodeFormat::Bf16 => (
+                sq.codes.get(..sq.codes.len() & !1).unwrap_or_default(),
+                Sources::Rounded(sq.halves(), sq.format),
+            ),
+            CodeFormat::Byte => (sq.codes, Sources::Int8),
+        },
+    };
+    if storage.is_empty() {
+        return Err("the native file holds no vectors".to_owned());
+    }
+    let shape = Shape {
+        rows: all.row_count(),
+        d: usize::try_from(all.header().d).unwrap_or(0),
+        component_size: all.component_size(),
+    };
+    Ok((storage, sources, shape))
+}
+
 /// Looks for the native file's stored vectors inside the `.vec` files of
 /// its segment.
 fn lucene_vectors(path: &Path, bytes: &[u8], parsed: &knn_format::Parsed<'_>) -> LuceneVectors {
@@ -493,34 +537,11 @@ fn lucene_vectors(path: &Path, bytes: &[u8], parsed: &knn_format::Parsed<'_>) ->
             "no .vec file of segment {segment} beside the native file (a compound segment keeps its .vec inside the .cfs)"
         ));
     }
-    // The bytes to look for: float32 storage as it lies in the file, or
-    // every whole code, which a half_float field's .vec holds byte for
-    // byte. The .vec of an sq fp16 or bf16 field holds the float32 vectors
-    // the codes were rounded from instead, so those codes are also looked
-    // for that way; a byte field's holds the int8 values the codes are 128
-    // above, so byte codes are looked for that way only.
-    let (storage, sources) = match &parsed.index.index.storage {
-        Storage::Flat(flat) => {
-            let codes = flat.codes;
-            let Some(storage) = view_offset(bytes, codes).and_then(|start| {
-                bytes.get(start..start.checked_add(codes.len().checked_mul(4)?)?)
-            }) else {
-                return skipped("the storage view could not be located in the file".to_owned());
-            };
-            (storage, Sources::None)
-        }
-        Storage::Sq(sq) => match sq.format {
-            CodeFormat::Fp16 | CodeFormat::Bf16 => (
-                sq.codes.get(..sq.codes.len() & !1).unwrap_or_default(),
-                Sources::Rounded(sq.halves(), sq.format),
-            ),
-            CodeFormat::Byte => (sq.codes, Sources::Int8),
-        },
+    let (storage, sources, shape) = match stored_vectors(bytes, parsed) {
+        Ok(stored) => stored,
+        Err(why) => return skipped(why),
     };
-    if storage.is_empty() {
-        return skipped("the native file holds no vectors".to_owned());
-    }
-    let rows = parsed.index.index.storage.row_count();
+    let rows = shape.rows;
 
     // .vec files read cleanly but not holding the vectors, those whose
     // values repeat too much to search, and those that could not be
@@ -539,9 +560,29 @@ fn lucene_vectors(path: &Path, bytes: &[u8], parsed: &knn_format::Parsed<'_>) ->
         };
         let vec = mapped.bytes();
         let sound = lucene_footer(vec);
-        let located = locate(vec, storage, sources);
-        if let Located::At(offset, how) = located {
-            let found = format!("{rows} vectors found {how} at offset {offset}");
+        // The .vemf beside the .vec says where each field's vectors lie, so
+        // they are looked for exactly there; without one, at every offset
+        // Lucene could have used.
+        let (located, why_not) = match field_table(candidate) {
+            Table::Fields(fields) => locate_by_meta(vec, storage, sources, &fields, shape),
+            Table::Absent => (locate(vec, storage, sources), None),
+            Table::Damaged(why) => {
+                untrusted.push(why);
+                continue;
+            }
+        };
+        if let Located::At {
+            offset,
+            how,
+            from_meta,
+        } = located
+        {
+            let via = if from_meta {
+                ", where the .vemf puts them"
+            } else {
+                ""
+            };
+            let found = format!("{rows} vectors found {how} at offset {offset}{via}");
             let (status, detail) = match sound {
                 Ok(()) => (CrossCheck::Match, found),
                 Err(why) => (CrossCheck::Damaged, format!("{found}, but the .vec {why}")),
@@ -557,19 +598,22 @@ fn lucene_vectors(path: &Path, bytes: &[u8], parsed: &knn_format::Parsed<'_>) ->
             Ok(()) if located == Located::GaveUp => {
                 repetitive.push(shown(candidate));
             }
-            Ok(()) => tried.push(shown(candidate)),
+            Ok(()) => tried.push(match why_not {
+                Some(why) => format!("{} ({why})", shown(candidate)),
+                None => shown(candidate),
+            }),
             Err(why) => untrusted.push(format!("{} {why}", shown(candidate))),
         }
     }
-    // Not found: a damaged .vec may be the reason, so it outranks a
-    // mismatch.
+    // Not found: a damaged .vec or .vemf may be the reason, so it outranks
+    // a mismatch.
     if !untrusted.is_empty() {
         return LuceneVectors {
             status: CrossCheck::Damaged,
             file: candidates.first().map(|c| shown(c)),
             offset: None,
             detail: format!(
-                "the stored vectors are in no sound .vec of the segment; {}",
+                "the stored vectors could not be matched against a sound .vec of the segment; {}",
                 untrusted.join("; ")
             ),
         };
@@ -626,15 +670,175 @@ fn segment_of(name: &str) -> &str {
     }
 }
 
+/// How a `.vec` was found to hold the vectors, as `detail` says.
+const BYTE_FOR_BYTE: &str = "byte for byte";
+const INT8_VALUES: &str = "as int8 values 128 below the stored codes";
+const ROUNDED_SOURCES: &str = "as float32 values that round to the stored codes";
+
 /// Where a `.vec` holds the native file's vectors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Located {
-    /// At this offset, found as described.
-    At(usize, &'static str),
+    /// At this offset, found as described, at the place the `.vemf`
+    /// records or by searching the file.
+    At {
+        offset: usize,
+        how: &'static str,
+        from_meta: bool,
+    },
     /// Not in the file.
     Absent,
     /// A search gave up on values that repeat too much.
     GaveUp,
+}
+
+/// The stored vectors' shape: whole rows, the dimension, and the bytes
+/// per stored component.
+#[derive(Debug, Clone, Copy)]
+struct Shape {
+    rows: usize,
+    d: usize,
+    component_size: usize,
+}
+
+/// What the `.vemf` beside a `.vec` says, if there is one to say it.
+enum Table {
+    /// Its fields.
+    Fields(Vec<FlatField>),
+    /// No `.vemf` lies beside the `.vec`, or it is in a format this tool
+    /// does not read.
+    Absent,
+    /// A `.vemf` lies there but cannot be trusted; the text says why.
+    Damaged(String),
+}
+
+/// Reads the `.vemf` beside a `.vec`. A sound one in a format this tool
+/// does not read, as a newer Lucene may write, counts as absent: the
+/// `.vec` is then searched instead.
+fn field_table(vec_path: &Path) -> Table {
+    let meta_path = vec_path.with_extension("vemf");
+    if !meta_path.is_file() {
+        return Table::Absent;
+    }
+    let mapped = match NativeFile::open(&meta_path) {
+        Ok(m) => m,
+        Err(e) => {
+            return Table::Damaged(format!("{} could not be opened: {e}", shown(&meta_path)));
+        }
+    };
+    let bytes = mapped.bytes();
+    if let Err(why) = lucene_footer(bytes) {
+        return Table::Damaged(format!("{} {why}", shown(&meta_path)));
+    }
+    match FlatVectorsMeta::parse(bytes) {
+        Ok(meta) => Table::Fields(meta.fields),
+        // A codec header this tool does not know, on a file whose footer
+        // verifies, is a newer format, not damage; a file with no header
+        // at all is damage.
+        Err(knn_format::Error::UnexpectedCodec { .. }) if has_codec_header(bytes) => Table::Absent,
+        Err(e) => Table::Damaged(format!("{} could not be read: {e}", shown(&meta_path))),
+    }
+}
+
+/// Looks for the stored vectors exactly where the `.vemf` puts a field of
+/// their shape, and nowhere else; with the vectors not found, says why,
+/// for the report.
+fn locate_by_meta(
+    vec: &[u8],
+    storage: &[u8],
+    sources: Sources<'_>,
+    fields: &[FlatField],
+    shape: Shape,
+) -> (Located, Option<String>) {
+    let Shape {
+        rows,
+        d,
+        component_size,
+    } = shape;
+    let mut reason = format!("no field of {rows} vectors of dimension {d} in its .vemf");
+    for field in fields {
+        if usize::try_from(field.dimension) != Ok(d) || usize::try_from(field.count) != Ok(rows) {
+            continue;
+        }
+        let Some(expected) = field.vector_bytes() else {
+            reason = format!(
+                "the .vemf's field of {rows} vectors of dimension {d} is larger than any file"
+            );
+            continue;
+        };
+        if field.data_length != expected {
+            reason = format!(
+                "the .vemf records {} bytes for its field of {rows} vectors of dimension {d}, not {expected}",
+                field.data_length
+            );
+            continue;
+        }
+        let Some(held) = usize::try_from(field.data_offset).ok().and_then(|offset| {
+            vec.get(offset..offset.checked_add(usize::try_from(expected).ok()?)?)
+        }) else {
+            reason = format!(
+                "the .vemf puts its field of {rows} vectors of dimension {d} at offset {}, past the end of the .vec",
+                field.data_offset
+            );
+            continue;
+        };
+        let whole = rows.saturating_mul(d);
+        let how = match (sources, field.component_bytes) {
+            (Sources::Int8, 1) => storage
+                .get(..whole)
+                .is_some_and(|codes| holds(held, codes, |c| byte_code(i8::from_ne_bytes([c]))))
+                .then_some(INT8_VALUES),
+            (Sources::Rounded(codes, format), 4) => codes
+                .get(..whole)
+                .is_some_and(|codes| holds_rounded(held, codes, format))
+                .then_some(ROUNDED_SOURCES),
+            (_, bytes) if usize::try_from(bytes) == Ok(component_size) => storage
+                .get(..whole.saturating_mul(component_size))
+                .is_some_and(|stored| holds(held, stored, |b| b))
+                .then_some(BYTE_FOR_BYTE),
+            (_, bytes) => {
+                reason = format!(
+                    "the .vemf's field of {rows} vectors of dimension {d} holds {bytes}-byte components, not {component_size}-byte ones"
+                );
+                continue;
+            }
+        };
+        match how {
+            Some(how) => {
+                return (
+                    Located::At {
+                        offset: usize::try_from(field.data_offset).unwrap_or(usize::MAX),
+                        how,
+                        from_meta: true,
+                    },
+                    None,
+                );
+            }
+            None => {
+                reason = format!(
+                    "the field the .vemf puts at offset {} holds other values",
+                    field.data_offset
+                );
+            }
+        }
+    }
+    (Located::Absent, Some(reason))
+}
+
+/// Whether `held`, bytes of a `.vec`, is `stored` with every byte mapped
+/// by `to_vec`.
+fn holds(held: &[u8], stored: &[u8], to_vec: impl Fn(u8) -> u8) -> bool {
+    held.len() == stored.len() && held.iter().zip(stored).all(|(&v, &b)| to_vec(b) == v)
+}
+
+/// Whether `held`, bytes of a `.vec`, is float32 values that round, one by
+/// one, to `codes` in `format`.
+fn holds_rounded(held: &[u8], codes: &[U16], format: CodeFormat) -> bool {
+    let (words, rest) = held.as_chunks::<4>();
+    rest.is_empty()
+        && words.len() == codes.len()
+        && words.iter().zip(codes).all(|(w, c)| {
+            Target::of(format, c.get()).is_some_and(|t| t.hit(f32::from_le_bytes(*w)))
+        })
 }
 
 /// What a `.vec` holds in place of the stored vectors, besides possibly
@@ -664,20 +868,18 @@ fn locate(vec: &[u8], storage: &[u8], sources: Sources<'_>) -> Located {
         let found = find_bytes(vec, region, storage, |code| {
             byte_code(i8::from_ne_bytes([code]))
         });
-        return found.located("as int8 values 128 below the stored codes");
+        return found.located(INT8_VALUES);
     }
     let exact = find_bytes(vec, region.clone(), storage, |b| b);
-    if let Search::Found(offset) = exact {
-        return Located::At(offset, "byte for byte");
+    if let Search::Found(_) = exact {
+        return exact.located(BYTE_FOR_BYTE);
     }
     let rounded = match sources {
         Sources::Rounded(codes, format) => find_rounded(vec, region, codes, format),
         Sources::None | Sources::Int8 => Search::Missing,
     };
     match (exact, rounded) {
-        (_, Search::Found(_)) => {
-            rounded.located("as float32 values that round to the stored codes")
-        }
+        (_, Search::Found(_)) => rounded.located(ROUNDED_SOURCES),
         (Search::GaveUp, _) | (_, Search::GaveUp) => Located::GaveUp,
         _ => Located::Absent,
     }
@@ -717,7 +919,11 @@ enum Search {
 impl Search {
     fn located(self, how: &'static str) -> Located {
         match self {
-            Self::Found(offset) => Located::At(offset, how),
+            Self::Found(offset) => Located::At {
+                offset,
+                how,
+                from_meta: false,
+            },
             Self::Missing => Located::Absent,
             Self::GaveUp => Located::GaveUp,
         }

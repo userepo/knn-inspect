@@ -1306,19 +1306,25 @@ fn scan_reads_fp16_segments() {
         } else {
             "as float32 values that round to the stored codes"
         };
-        assert!(lv["detail"].as_str().unwrap().contains(how), "{f}");
+        let detail = lv["detail"].as_str().unwrap();
+        assert!(detail.contains(how), "{f}");
+        assert!(detail.ends_with(", where the .vemf puts them"), "{f}");
         assert_eq!(f["lucene_docs"]["status"], "match", "{f}");
     }
 }
 
-/// A copy of a real fp16, bf16, or byte segment's native file and `.vec`,
-/// with the offset of the native codes. The `.vec`'s vector data starts
-/// at 128 in these fixtures, except a byte field's, which starts at 92.
+/// A copy of a real fp16, bf16, or byte segment's native file, `.vec`,
+/// and `.vemf`, with the offset of the native codes. The `.vec`'s vector
+/// data starts at 128 in these fixtures, except a byte field's, which
+/// starts at 92. With `meta` set to `None`, the `.vemf` is left out, and
+/// `scan` searches the `.vec` instead of comparing where the `.vemf` puts
+/// the field.
 struct SqSegment {
     scratch: Scratch,
     native: Vec<u8>,
     vec_name: &'static str,
     vec: Vec<u8>,
+    meta: Option<Vec<u8>>,
     codes: usize,
 }
 
@@ -1337,6 +1343,7 @@ impl SqSegment {
             "_2_NativeEngines990KnnVectorsFormat_0.vec"
         };
         let vec = std::fs::read(dir.join(vec_name)).unwrap();
+        let meta = std::fs::read(dir.join(vec_name).with_extension("vemf")).unwrap();
         let codes = {
             let parsed = knn_format::parse(&native).unwrap();
             let storage = parsed.index.index.storage;
@@ -1347,14 +1354,22 @@ impl SqSegment {
             native,
             vec_name,
             vec,
+            meta: Some(meta),
             codes,
         }
     }
 
-    /// Writes both files under their names in the segment and scans.
+    /// Writes the files under their names in the segment and scans.
     fn scan(&self) -> serde_json::Value {
         std::fs::write(self.scratch.0.join("_2_165_vec.faiss"), &self.native).unwrap();
         std::fs::write(self.scratch.0.join(self.vec_name), &self.vec).unwrap();
+        let meta = self.scratch.0.join(self.vec_name).with_extension("vemf");
+        match &self.meta {
+            Some(bytes) => std::fs::write(&meta, bytes).unwrap(),
+            None => {
+                let _ = std::fs::remove_file(&meta);
+            }
+        }
         let o = run(&["scan", self.scratch.0.to_str().unwrap(), "--json"]);
         let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
         v["files"][0]["lucene_vectors"].clone()
@@ -1452,9 +1467,8 @@ fn scan_compares_half_float_codes_byte_for_byte() {
 #[test]
 fn scan_gives_up_on_repetitive_float32_data() {
     // Native codes all zero but the last, and a sound .vec whose data is
-    // all zeros: every aligned offset matches far into the codes. The
-    // search must stop within its budget and say it could not tell,
-    // rather than run in quadratic time or claim a mismatch.
+    // all zeros. Where the .vemf puts the field, the last value does not
+    // round to its code: a mismatch, decided at once.
     let mut seg = SqSegment::new("fp16-zeros", "sq-fp16");
     let codes = 500 * 16;
     let (start, end) = (seg.codes, seg.codes + 2 * codes);
@@ -1463,6 +1477,13 @@ fn scan_gives_up_on_repetitive_float32_data() {
     reseal(&mut seg.native);
     seg.vec[128..128 + 4 * codes].fill(0);
     reseal(&mut seg.vec);
+    let lv = seg.scan();
+    assert_eq!(lv["status"], "mismatch", "{lv}");
+
+    // Without the .vemf, every aligned offset matches far into the codes.
+    // The search must stop within its budget and say it could not tell,
+    // rather than run in quadratic time or claim a mismatch.
+    seg.meta = None;
     let started = std::time::Instant::now();
     let lv = seg.scan();
     assert_eq!(lv["status"], "skipped", "{lv}");
@@ -1529,13 +1550,9 @@ fn bf16_files_are_read() {
         let lv = &f["lucene_vectors"];
         assert_eq!(lv["status"], "match", "{f}");
         assert_eq!(lv["offset"], 128, "{f}");
-        assert!(
-            lv["detail"]
-                .as_str()
-                .unwrap()
-                .contains("round to the stored codes"),
-            "{f}"
-        );
+        let detail = lv["detail"].as_str().unwrap();
+        assert!(detail.contains("round to the stored codes"), "{f}");
+        assert!(detail.ends_with(", where the .vemf puts them"), "{f}");
     }
 }
 
@@ -1598,9 +1615,10 @@ fn byte_files_are_read() {
     let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
     assert_eq!(v["recall"], 0.902);
 
-    // scan finds every segment's int8 values in its .vec at 92, the first
-    // multiple of 4 after the 89-byte header, where Lucene starts byte
-    // data (float32 data starts at the first multiple of 64, 128).
+    // scan finds every segment's int8 values in its .vec at 92, where its
+    // .vemf puts them: the first multiple of 4 after the 89-byte header,
+    // where Lucene starts byte data (float32 data starts at the first
+    // multiple of 64, 128).
     let o = run(&["scan", dir.to_str().unwrap(), "--json"]);
     assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
     let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
@@ -1614,10 +1632,190 @@ fn byte_files_are_read() {
         assert_eq!(lv["offset"], 92, "{f}");
         assert_eq!(
             lv["detail"],
-            "500 vectors found as int8 values 128 below the stored codes at offset 92",
+            "500 vectors found as int8 values 128 below the stored codes at offset 92, where the .vemf puts them",
             "{f}"
         );
     }
+}
+
+/// A copy of the real float l2 segment's native file, `.vec`, and `.vemf`.
+struct FloatSegment {
+    scratch: Scratch,
+    native: Vec<u8>,
+    vec: Vec<u8>,
+    meta: Option<Vec<u8>>,
+}
+
+impl FloatSegment {
+    const VEC: &'static str = "_2_NativeEngines990KnnVectorsFormat_0.vec";
+    const META: &'static str = "_2_NativeEngines990KnnVectorsFormat_0.vemf";
+
+    fn new(name: &str) -> Self {
+        let dir = fixtures().join("opensearch-3.9.0/nocfs/l2");
+        Self {
+            scratch: Scratch::new(name),
+            native: std::fs::read(dir.join("_2_165_vec.faiss")).unwrap(),
+            vec: std::fs::read(dir.join(Self::VEC)).unwrap(),
+            meta: Some(std::fs::read(dir.join(Self::META)).unwrap()),
+        }
+    }
+
+    fn scan(&self) -> serde_json::Value {
+        let dir = &self.scratch.0;
+        std::fs::write(dir.join("_2_165_vec.faiss"), &self.native).unwrap();
+        std::fs::write(dir.join(Self::VEC), &self.vec).unwrap();
+        let meta = dir.join(Self::META);
+        match &self.meta {
+            Some(bytes) => std::fs::write(&meta, bytes).unwrap(),
+            None => {
+                let _ = std::fs::remove_file(&meta);
+            }
+        }
+        let o = run(&["scan", dir.to_str().unwrap(), "--json"]);
+        let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+        v["files"][0]["lucene_vectors"].clone()
+    }
+
+    /// Scans, and asserts a mismatch whose detail ends with `reason`.
+    fn expect_reason(&self, reason: &str) {
+        let lv = self.scan();
+        assert_eq!(lv["status"], "mismatch", "{lv}");
+        assert!(lv["detail"].as_str().unwrap().ends_with(reason), "{lv}");
+    }
+}
+
+#[test]
+fn scan_checks_where_the_vemf_puts_the_vectors() {
+    // The real segment: the .vemf records the field's 500 vectors of
+    // dimension 16 at offset 128, and the .vec holds them there.
+    let mut seg = FloatSegment::new("vemf-exact");
+    let lv = seg.scan();
+    assert_eq!(lv["status"], "match", "{lv}");
+    assert_eq!(lv["offset"], 128, "{lv}");
+    assert_eq!(
+        lv["detail"], "500 vectors found byte for byte at offset 128, where the .vemf puts them",
+        "{lv}"
+    );
+
+    // The native vectors shifted by one float: a zero in front, the last
+    // dropped. The .vec's 39 zero bytes of padding before 128 make the
+    // shifted store appear at 124, an offset Lucene could have used but
+    // did not. The .vemf says where the field is, so this is a mismatch.
+    let codes = {
+        let parsed = knn_format::parse(&seg.native).unwrap();
+        knn_format::view_offset(&seg.native, parsed.index.index.storage.code_bytes()).unwrap()
+    };
+    let bytes = 500 * 16 * 4;
+    let mut shifted = vec![0_u8; 4];
+    shifted.extend_from_slice(&seg.native[codes..codes + bytes - 4]);
+    seg.native[codes..codes + bytes].copy_from_slice(&shifted);
+    reseal(&mut seg.native);
+    seg.expect_reason("(the field the .vemf puts at offset 128 holds other values)");
+
+    // Without the .vemf, the search finds the shifted store in the padding
+    // and cannot tell: the metadata is what closes that gap.
+    seg.meta = None;
+    let lv = seg.scan();
+    assert_eq!(lv["status"], "match", "{lv}");
+    assert_eq!(lv["offset"], 124, "{lv}");
+    assert_eq!(
+        lv["detail"], "500 vectors found byte for byte at offset 124",
+        "{lv}"
+    );
+}
+
+#[test]
+fn scan_says_why_the_vemf_field_was_not_matched() {
+    // The .vemf's record: field number, encoding, and similarity (4 bytes
+    // each) from 89, then the offset as a vlong at 101 (0x80 0x01 = 128),
+    // the length at 103, the dimension at 106, and the count at 107.
+    let mut seg = FloatSegment::new("vemf-reasons");
+    let meta = seg.meta.as_mut().unwrap();
+    meta[101..103].copy_from_slice(&[0x84, 0x01]);
+    reseal(meta);
+    seg.expect_reason("(the field the .vemf puts at offset 132 holds other values)");
+    let meta = seg.meta.as_mut().unwrap();
+    meta[101..103].copy_from_slice(&[0x80, 0x01]);
+    meta[107..111].copy_from_slice(&499_i32.to_le_bytes());
+    reseal(meta);
+    seg.expect_reason("(no field of 500 vectors of dimension 16 in its .vemf)");
+
+    // The length (0x80 0xFA 0x01 = 32,000 at 103) one byte more.
+    let meta = seg.meta.as_mut().unwrap();
+    meta[107..111].copy_from_slice(&500_i32.to_le_bytes());
+    assert_eq!(meta[103..106], [0x80, 0xFA, 0x01]);
+    meta[103] = 0x81;
+    reseal(meta);
+    seg.expect_reason(
+        "(the .vemf records 32001 bytes for its field of 500 vectors of dimension 16, not 32000)",
+    );
+
+    // An offset past the end of the .vec: 16,383 is the largest two-byte
+    // vlong.
+    let meta = seg.meta.as_mut().unwrap();
+    meta[103] = 0x80;
+    meta[101..103].copy_from_slice(&[0xFF, 0x7F]);
+    reseal(meta);
+    seg.expect_reason("(the .vemf puts its field of 500 vectors of dimension 16 at offset 16383, past the end of the .vec)");
+
+    // The encoding (1, FLOAT32, at 93) changed to BYTE, and the length to
+    // the 8,000 bytes a byte field of that shape takes, as a three-byte
+    // vlong so the record keeps its size: one-byte components, where the
+    // native file stores four.
+    let meta = seg.meta.as_mut().unwrap();
+    meta[101..103].copy_from_slice(&[0x80, 0x01]);
+    assert_eq!(meta[93..97], 1_i32.to_le_bytes());
+    meta[93..97].copy_from_slice(&0_i32.to_le_bytes());
+    meta[103..106].copy_from_slice(&[0xC0, 0xBE, 0x00]);
+    reseal(meta);
+    seg.expect_reason("(the .vemf's field of 500 vectors of dimension 16 holds 1-byte components, not 4-byte ones)");
+
+    // A codec version this tool does not read (at 34, after the magic and
+    // the codec name), on a sound .vemf: a newer Lucene may write one, so
+    // the .vec is searched as if there were no .vemf.
+    let meta = seg.meta.as_mut().unwrap();
+    meta[93..97].copy_from_slice(&1_i32.to_le_bytes());
+    meta[103..106].copy_from_slice(&[0x80, 0xFA, 0x01]);
+    assert_eq!(meta[34..38], 0_i32.to_be_bytes());
+    meta[34..38].copy_from_slice(&1_i32.to_be_bytes());
+    reseal(meta);
+    let lv = seg.scan();
+    assert_eq!(lv["status"], "match", "{lv}");
+    assert_eq!(
+        lv["detail"], "500 vectors found byte for byte at offset 128",
+        "{lv}"
+    );
+
+    // No codec header at all, on a file whose footer verifies: damage,
+    // not a newer format.
+    let meta = seg.meta.as_mut().unwrap();
+    meta[34..38].copy_from_slice(&0_i32.to_be_bytes());
+    let magic: [u8; 4] = meta[..4].try_into().unwrap();
+    meta[..4].fill(0);
+    reseal(meta);
+    let lv = seg.scan();
+    assert_eq!(lv["status"], "damaged", "{lv}");
+    assert!(
+        lv["detail"]
+            .as_str()
+            .unwrap()
+            .contains(".vemf could not be read: no codec header"),
+        "{lv}"
+    );
+
+    // A .vemf that fails its checksum cannot be trusted, so the native
+    // file fails as damaged, as it would for a damaged .vec.
+    let meta = seg.meta.as_mut().unwrap();
+    meta[..4].copy_from_slice(&magic);
+    let lv = seg.scan();
+    assert_eq!(lv["status"], "damaged", "{lv}");
+    assert!(
+        lv["detail"]
+            .as_str()
+            .unwrap()
+            .ends_with(".vemf fails its footer checksum"),
+        "{lv}"
+    );
 }
 
 #[test]
@@ -1641,8 +1839,9 @@ fn scan_flags_byte_values_that_differ_from_the_lucene_copy() {
 
     // Native codes shifted by 1 to 3 bytes, a zero value pushed in front:
     // the .vec holds the shifted values in its 3 bytes of zero padding and
-    // its data, at 89 to 91. Lucene never starts data there, so all three
-    // are mismatches.
+    // its data, at 89 to 91, not at 92 where the .vemf puts the field.
+    // Without the .vemf, the search must not take them either: Lucene
+    // never starts data there.
     for shift in 1..=3 {
         let mut seg = SqSegment::new("byte-shift", "byte");
         let codes = seg.codes..seg.codes + 500 * 16;
@@ -1653,6 +1852,9 @@ fn scan_flags_byte_values_that_differ_from_the_lucene_copy() {
         seg.native[codes].copy_from_slice(&shifted);
         let lv = seg.scan();
         assert_eq!(lv["status"], "mismatch", "shift {shift}: {lv}");
+        seg.meta = None;
+        let lv = seg.scan();
+        assert_eq!(lv["status"], "mismatch", "shift {shift}, searched: {lv}");
     }
 
     // A .vec holding the codes themselves has every value 128 off; it is

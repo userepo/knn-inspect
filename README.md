@@ -115,7 +115,7 @@ back up the tree cannot loop; a link to a native file is scanned like the
 file. A subdirectory that cannot be read is listed as not scanned, and
 the rest of the tree still is.
 
-`scan` also cross-checks each native file against two Lucene files of
+`scan` also cross-checks each native file against the Lucene files of
 its segment. The `.vec` file holds the same vectors in the same order,
 and the native file's storage must appear in it byte for byte; a
 compound segment keeps its `.vec` inside the `.cfs`, so this check is
@@ -125,16 +125,20 @@ float32 vectors the codes were rounded from: each value must round to
 its code, on an exact tie either way one of Faiss's builds would round
 it (for bf16, also a subnormal value to zero, as Faiss's AVX512-BF16
 encoder does). A byte field's `.vec` holds the int8 values the codes are
-128 above, and must hold them all. The `.si` file gives the segment's
-document count, and every label in the ID map, which k-NN sets to a doc
-id, must be one of the segment's doc ids. A `.vec` or `.si` that is
-there but cannot be read, or fails its own checksum, fails the native
-file too: the segment cannot be trusted as it stands. A sound `.si` in a
-format this tool does not read, as a newer Lucene may write, is skipped
-instead. `--space` applies to every file found; leave it out when the
-directory mixes space types. Exit code 0 when every file is clean, 1 if
-any failed (or would not open, a subdirectory could not be read, or none
-was found), 2 if the worst verdict was a warning.
+128 above, and must hold them all. Where the segment's `.vemf` lies
+beside the `.vec`, the vectors must be exactly where it records the
+field; without one, or with a sound one in a format this tool does not
+read, `scan` searches the `.vec` at every offset Lucene could have used.
+The `.si` file gives the segment's document count, and every label in
+the ID map, which k-NN sets to a doc id, must be one of the segment's
+doc ids. A `.vec`, `.vemf`, or `.si` that is there but cannot be read,
+or fails its own checksum, fails the native file too: the segment cannot
+be trusted as it stands. A sound `.si` in a format this tool does not
+read, as a newer Lucene may write, is skipped instead. `--space` applies
+to every file found; leave it out when the directory mixes space types.
+Exit code 0 when every file is clean, 1 if any failed (or would not
+open, a subdirectory could not be read, or none was found), 2 if the
+worst verdict was a warning.
 
 ## Benchmarks
 

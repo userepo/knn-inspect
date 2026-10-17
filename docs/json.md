@@ -142,17 +142,21 @@ fails the file.
   `half_float` field holds the codes byte for byte); for byte storage it
   looks only for the int8 values the codes are 128 above, which is what
   a byte field's `.vec` holds (since 0.6.0). `detail` says which way
-  they were found. Since 0.6.0 it looks only where Lucene can put vector
-  data: at a multiple of 4 bytes, between the `.vec`'s header and
-  footer. When the vectors are found in a `.vec` that is damaged,
-  `offset` still says where. It is skipped when no loose `.vec` lies
-  beside the native file, as in a compound segment, where the `.vec` is
-  inside the `.cfs`, or when the values of a sound `.vec` repeat too
-  much to search for the stored vectors in bounded time (since 0.4.0
-  for fp16 and 0.5.0 for bf16, the first versions to read them, and
-  since 0.6.0 for every storage). Before 0.3.0, a `.vec` that could not
-  be opened was reported as `mismatch`, and a failing checksum was only
-  mentioned in `detail`.
+  they were found. Since 0.6.1 it reads the `.vemf` beside the `.vec`,
+  which records where each field's vectors lie, and compares there only,
+  which `detail` also says; without a `.vemf`, or with a sound one in a
+  format this tool does not read, it searches the `.vec` where Lucene
+  can put vector data (since 0.6.0: at a multiple of 4 bytes, between
+  the header and the footer), and a `.vemf` that cannot be read or fails
+  its checksum makes the check `damaged`. When the vectors are found in
+  a `.vec` that is damaged, `offset` still says where. It is skipped
+  when no loose `.vec` lies beside the native file, as in a compound
+  segment, where the `.vec` is inside the `.cfs`, or when the values of
+  a sound `.vec` repeat too much to search for the stored vectors in
+  bounded time (since 0.4.0 for fp16 and 0.5.0 for bf16, the first
+  versions to read them, and since 0.6.0 for every storage). Before
+  0.3.0, a `.vec` that could not be opened was reported as `mismatch`,
+  and a failing checksum was only mentioned in `detail`.
 - `lucene_docs` reads the document count from the segment's `.si` and
   checks that every label in the ID map, which k-NN sets to a doc id,
   lies in `0..doc_count`, with no more labels than documents. The `.si`

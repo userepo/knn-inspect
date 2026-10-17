@@ -457,8 +457,9 @@ data at the next multiple of 4 for byte data and of 64 for float32 data
 bytes here, 39 before the float32 fixtures' data at 128. The file is
 92 + 8,000 + 16 (the footer) = 8,108 bytes. A check against Lucene's
 copy, such as `scan`'s, flips the top bit of every code, which is adding
-128 in two's complement, and looks for the result only where Lucene can
-put vector data: at a multiple of 4, between the header and the footer.
+128 in two's complement, and looks for the result where the `.vemf`
+puts the field or, without a `.vemf`, only where Lucene can put vector
+data: at a multiple of 4, between the header and the footer.
 
 ## Real files from OpenSearch 3.9.0
 
@@ -512,6 +513,48 @@ Any other codec name or version is not read. In a `.si` whose footer
 checksum verifies, `scan` reports it as a format this tool does not
 read and skips the check, since a newer Lucene may write one; without a
 verifying footer, the file is reported as damaged.
+
+### Flat-vectors metadata (`.vemf`)
+
+Beside each `.vec` lies a `.vemf` of the same name, which says where in
+the `.vec` each field's vectors start and how many bytes they take.
+`scan` reads it (since 0.6.1) and compares the native file's vectors
+exactly there instead of searching the `.vec`. Two formats write it.
+Lucene's `Lucene99FlatVectorsFormat` (`writeMeta` in
+`Lucene99FlatVectorsWriter` at Lucene 10.5.1), codec name
+`Lucene99FlatVectorsFormatMeta`, version 0, describes float32 and byte
+fields; k-NN's `KNN1040HalfFloatFlatVectorsFormat` (tag 3.9.0.0), codec
+name `KNN1040HalfFloatFlatVectorsFormatMeta`, version 0, describes
+`half_float` fields with the same record without the similarity
+function. After the big-endian `CodecUtil` index header (89 bytes in the
+Lucene fixtures, 106 in the half-float ones, whose codec name and
+segment suffix are longer) the records are little-endian, one per field:
+
+| Field | Type | Fixtures |
+| --- | --- | --- |
+| field number | int32 | 6 |
+| vector encoding | int32 | 0 (`BYTE`) for byte fields, 1 (`FLOAT32`) otherwise |
+| similarity function | int32, Lucene's format only | 0 (`EUCLIDEAN`) for `l2`, 3 (`MAXIMUM_INNER_PRODUCT`) for `innerproduct`, 2 (`COSINE`) for `cosinesimil` |
+| vector data offset | vlong | 128; 92 for byte fields |
+| vector data length | vlong | 32,000 for float32, 16,000 for half-float, 8,000 for byte |
+| dimension | vint | 16 |
+| vector count | int32 | 500 |
+| docs-with-field offset | int64 | -1: every document has a vector |
+| docs-with-field length | int64 | 0 |
+| jump table entry count | int16 | -1 |
+| dense rank power | int8 | -1 |
+
+When the docs-with-field offset is 0 or more, some documents lack a
+vector, and the `.vec` holds a docs-with-field bit set and an ord-to-doc
+table after the vectors (`OrdToDocDISIReaderConfiguration`). The record
+then goes on with the table's offset (int64), its block shift (vint, 2
+to 22), one 21-byte entry per block of 2 to the shift vectors (a
+`DirectMonotonicWriter` block: minimum, int64; average increment,
+float32; offset, int64; bits per value, int8), and its length (int64).
+A field number of -1 ends the records, and the footer follows. Every
+fixture's `.vemf` holds one field: 150 bytes in Lucene's format, 162 in
+k-NN's, and 148 for byte fields, whose offset and length are shorter
+vlongs.
 
 ### Bytes
 

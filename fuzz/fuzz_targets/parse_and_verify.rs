@@ -1,10 +1,10 @@
-//! Any byte string must parse to `Ok` or `Err`, never panic, both as a
-//! native file and as a segment info file, and every check, the graph
-//! statistics, and an HNSW search must run over whatever parsed. Panics,
-//! including failed bounds checks, fail the run; AddressSanitizer covers
-//! the unsafe code inside dependencies (zerocopy's casts, crc32fast's
-//! SIMD). The memory map is not exercised: the harness parses bytes, not
-//! files.
+//! Any byte string must parse to `Ok` or `Err`, never panic, as a native
+//! file, a segment info file, and a flat-vectors metadata file, and every
+//! check, the graph statistics, and an HNSW search must run over whatever
+//! parsed. Panics, including failed bounds checks, fail the run;
+//! AddressSanitizer covers the unsafe code inside dependencies
+//! (zerocopy's casts, crc32fast's SIMD). The memory map is not exercised:
+//! the harness parses bytes, not files.
 
 #![no_main]
 
@@ -12,8 +12,15 @@ use knn_check::{Options, Space};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    // The segment info reader takes the same untrusted bytes.
+    // The segment info and flat-vectors metadata readers take the same
+    // untrusted bytes.
     let _ = knn_format::segment_info::SegmentInfo::parse(data);
+    if let Ok(meta) = knn_format::flat_vectors::FlatVectorsMeta::parse(data) {
+        let _ = meta.format.codec();
+        for field in &meta.fields {
+            let _ = field.vector_bytes();
+        }
+    }
     // The parser alone, and then every check, under each space option:
     // the cosine path has the only float math.
     if let Ok(parsed) = knn_format::parse(data) {

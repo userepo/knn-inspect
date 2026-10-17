@@ -73,6 +73,21 @@ pub enum Error {
         value: i64,
     },
 
+    /// Bytes lie where a structure has ended and only the footer may
+    /// follow.
+    #[error(
+        "{count} unexpected {} at offset {offset} {what}",
+        if *.count == 1 { "byte" } else { "bytes" }
+    )]
+    TrailingBytes {
+        /// Where they start.
+        offset: usize,
+        /// What they follow.
+        what: &'static str,
+        /// How many there are.
+        count: usize,
+    },
+
     /// A Lucene file's codec header names a codec or version this crate
     /// does not read.
     #[error("{found} at offset {offset}; expected {expected}")]
@@ -132,6 +147,7 @@ impl Error {
             | Self::UnsupportedQuantizer { offset, .. }
             | Self::CountTooLarge { offset, .. }
             | Self::InvalidValue { offset, .. }
+            | Self::TrailingBytes { offset, .. }
             | Self::UnexpectedCodec { offset, .. }
             | Self::UnknownChecksumAlgorithm { offset, .. }
             | Self::InvalidChecksum { offset, .. }
