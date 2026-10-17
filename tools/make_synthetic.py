@@ -6,19 +6,23 @@ field: an `IndexIDMap` wrapping `IndexHNSWFlat` with flat float32
 storage, added with explicit labels, in `fixtures/synthetic/`; and the
 same over `IndexHNSWSQ` with fp16 storage (`QT_fp16`, the native layout
 k-NN writes for its `sq` encoder with `type: fp16` and its `half_float`
-data type) in `fixtures/synthetic-fp16/`, and with bf16 storage
-(`QT_bf16`, for the `sq` encoder with `type: bf16`) in
-`fixtures/synthetic-bf16/`.
+data type) in `fixtures/synthetic-fp16/`, with bf16 storage (`QT_bf16`,
+for the `sq` encoder with `type: bf16`) in `fixtures/synthetic-bf16/`,
+and with byte storage (`QT_8bit_direct_signed`, for the `byte` data
+type) in `fixtures/synthetic-byte/`.
 Next to every `.faiss` file an `.expected.json` records the values the
 Rust parser must report, read back from the same in-memory index. An
-fp16 or bf16 case draws the same vectors as the float case of the same
-shape.
+fp16, bf16, or byte case draws the same vectors as the float case of the
+same shape; a byte case scales them (by 32, or by 1 for the ties case),
+rounds them, and clips them to [-128, 127], the only values a byte field
+takes.
 
 Faiss is pinned to one thread so the graph is reproducible run to run.
 
 Usage:
     python tools/make_synthetic.py [--out fixtures/synthetic]
         [--fp16-out fixtures/synthetic-fp16] [--bf16-out fixtures/synthetic-bf16]
+        [--byte-out fixtures/synthetic-byte]
 """
 
 from __future__ import annotations
@@ -62,6 +66,21 @@ BF16_CASES = [
     ("l2-100x4-bf16", 100, 4, "l2"),
     ("l2-1000x32-bf16", 1000, 32, "l2"),
     ("ip-1000x32-bf16", 1000, 32, "ip"),
+]
+
+# And with byte storage: name, count, dimension, metric, and the factor
+# the draw is scaled by before it is rounded and clipped. The ip case
+# holds integer vectors, not unit ones: a byte field is never a cosine
+# field. The ties case scales by 1, so its 1,000 vectors take a few
+# values per component and repeat: nearly every distance ties, which
+# exercises how the search breaks ties. It is L2 because Faiss 1.15.1,
+# which writes the baselines, breaks L2 ties as the Faiss that k-NN 3.9.0
+# builds does, and inner-product ties the other way.
+BYTE_CASES = [
+    ("l2-100x4-byte", 100, 4, "l2", 32),
+    ("l2-1000x32-byte", 1000, 32, "l2", 32),
+    ("ip-1000x32-byte", 1000, 32, "ip", 32),
+    ("l2-1000x4-ties-byte", 1000, 4, "l2", 1),
 ]
 
 # k-NN's defaults for the hnsw method.
@@ -316,23 +335,103 @@ def build_bf16(name: str, count: int, dim: int, metric: str, out: pathlib.Path) 
     return expected
 
 
+def build_byte(name: str, count: int, dim: int, metric: str, scale: int, out: pathlib.Path) -> dict:
+    rng = np.random.default_rng(SEED)
+    vectors = rng.standard_normal((count, dim), dtype=np.float32)
+    # A byte field takes integers in [-128, 127], and k-NN never
+    # normalizes them (its Faiss engine refuses cosinesimil for byte
+    # fields), so the ip case is not scaled to unit length.
+    vectors = np.clip(np.rint(vectors * scale), -128, 127).astype(np.float32)
+
+    faiss_metric, metric_name = METRICS[metric]
+    hnsw = faiss.IndexHNSWSQ(dim, faiss.ScalarQuantizer.QT_8bit_direct_signed, M, faiss_metric)
+    hnsw.hnsw.efConstruction = EF_CONSTRUCTION
+    index = faiss.IndexIDMap(hnsw)
+    labels = np.arange(count, dtype=np.int64) + LABEL_OFFSET
+    index.add_with_ids(vectors, labels)
+
+    path = out / f"{name}.faiss"
+    faiss.write_index(index, str(path))
+
+    graph = hnsw.hnsw
+    levels = faiss.vector_to_array(graph.levels)
+    storage = faiss.downcast_index(hnsw.storage)
+    sq = storage.sq
+    codes = faiss.vector_to_array(storage.codes)
+    # Each code is one byte, the value plus 128
+    # (`Quantizer8bitDirectSigned`): decoding takes the 128 back, and
+    # gives what Faiss reconstructs.
+    assert np.array_equal(codes, (vectors.reshape(-1) + 128).astype(np.uint8))
+    decoded = (codes.astype(np.float32) - 128).reshape(count, dim)
+    assert np.array_equal(decoded, storage.reconstruct_n(0, count))
+    assert int(sq.code_size) == dim and sq.trained.size() == 0
+    expected = {
+        "file": path.name,
+        "size": path.stat().st_size,
+        "faiss_version": faiss.__version__,
+        "seed": SEED,
+        "layout": ["IxMp", "IHNs", "IxSQ"],
+        "dimension": dim,
+        "count": count,
+        "metric": metric_name,
+        "faiss_metric_type": int(faiss_metric),
+        "hnsw": {
+            "m": M,
+            "ef_construction": graph.efConstruction,
+            "ef_search": graph.efSearch,
+            "max_level": graph.max_level,
+            "entry_point": graph.entry_point,
+            "level_counts": [int((levels > i).sum()) for i in range(graph.max_level + 1)],
+            "levels_len": int(graph.levels.size()),
+            "offsets_len": int(graph.offsets.size()),
+            "neighbors_len": int(graph.neighbors.size()),
+            "levels_crc32": crc32_of(levels),
+        },
+        "sq": {
+            "qtype": int(sq.qtype),
+            "qtype_name": "QT_8bit_direct_signed",
+            "rangestat": int(sq.rangestat),
+            "rangestat_arg": float(sq.rangestat_arg),
+            "d": int(sq.d),
+            "code_size": int(sq.code_size),
+            "trained_len": int(sq.trained.size()),
+        },
+        "ids": {
+            "len": int(count),
+            "first": int(labels[0]),
+            "last": int(labels[-1]),
+            "crc32": crc32_of(faiss.vector_to_array(index.id_map)),
+        },
+        "codes": {
+            "bytes": int(codes.size),
+            "crc32": crc32_of(codes),
+            "first_decoded": decoded[0].tolist(),
+        },
+    }
+    with open(out / f"{name}.expected.json", "w", encoding="utf-8", newline="\n") as f:
+        json.dump(expected, f, indent=2)
+        f.write("\n")
+    return expected
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument("--out", type=pathlib.Path, default=pathlib.Path("fixtures/synthetic"))
     parser.add_argument("--fp16-out", type=pathlib.Path, default=pathlib.Path("fixtures/synthetic-fp16"))
     parser.add_argument("--bf16-out", type=pathlib.Path, default=pathlib.Path("fixtures/synthetic-bf16"))
+    parser.add_argument("--byte-out", type=pathlib.Path, default=pathlib.Path("fixtures/synthetic-byte"))
     args = parser.parse_args()
 
     level = faiss.SIMDConfig.get_level_name()
     if level != "NONE":
         raise SystemExit(f"Faiss runs its {level} code; use a portable build")
     faiss.omp_set_num_threads(1)
-    args.out.mkdir(parents=True, exist_ok=True)
-    args.fp16_out.mkdir(parents=True, exist_ok=True)
-    args.bf16_out.mkdir(parents=True, exist_ok=True)
+    for out in (args.out, args.fp16_out, args.bf16_out, args.byte_out):
+        out.mkdir(parents=True, exist_ok=True)
     built = [build(n, c, d, m, args.out) for n, c, d, m in CASES]
     built += [build_fp16(n, c, d, m, args.fp16_out) for n, c, d, m in FP16_CASES]
     built += [build_bf16(n, c, d, m, args.bf16_out) for n, c, d, m in BF16_CASES]
+    built += [build_byte(n, c, d, m, s, args.byte_out) for n, c, d, m, s in BYTE_CASES]
     for e in built:
         print(
             f"{e['file']:<22} {e['size']:>9} bytes  d={e['dimension']:<4} n={e['count']:<5} "

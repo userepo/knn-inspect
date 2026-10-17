@@ -272,7 +272,7 @@
   {
     "file": "fp16-unsupported-qtype.faiss",
     "source": "fixtures/synthetic-fp16/l2-100x4-fp16.faiss",
-    "mutation": "quantizer type set to 8 (QT_8bit_direct_signed)",
+    "mutation": "quantizer type set to 5 (QT_8bit_direct, unsigned bytes, which k-NN never writes)",
     "space": null,
     "expect": {
       "check": "structure",
@@ -347,6 +347,26 @@
     "expect": {
       "check": "vector_values",
       "severity": "warning"
+    }
+  },
+  {
+    "file": "byte-quantizer-code-size.faiss",
+    "source": "fixtures/synthetic-byte/l2-100x4-byte.faiss",
+    "mutation": "quantizer code size set to 8 for dimension 4, where byte storage has one byte per component",
+    "space": null,
+    "expect": {
+      "check": "headers",
+      "severity": "failure"
+    }
+  },
+  {
+    "file": "byte-codes-short.faiss",
+    "source": "fixtures/synthetic-byte/l2-100x4-byte.faiss",
+    "mutation": "last vector's 4 code bytes removed and the byte count lowered to match",
+    "space": null,
+    "expect": {
+      "check": "vector_count",
+      "severity": "failure"
     }
   }
 ]

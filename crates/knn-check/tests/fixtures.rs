@@ -63,23 +63,29 @@ fn options(space: Option<Space>) -> Options {
 #[test]
 fn synthetic_fixtures_are_clean() {
     let mut seen = 0;
-    let entries = ["synthetic", "synthetic-fp16", "synthetic-bf16"]
-        .into_iter()
-        .flat_map(|d| fs::read_dir(fixtures().join(d)).unwrap());
+    let entries = [
+        "synthetic",
+        "synthetic-fp16",
+        "synthetic-bf16",
+        "synthetic-byte",
+    ]
+    .into_iter()
+    .flat_map(|d| fs::read_dir(fixtures().join(d)).unwrap());
     for entry in entries {
         let path = entry.unwrap().path();
         if path.extension().is_none_or(|e| e != "faiss") {
             continue;
         }
         let bytes = fs::read(&path).unwrap();
-        // ip-* fixtures hold unit vectors, so they are clean as cosine too.
-        let space = path
-            .file_name()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .starts_with("ip-")
-            .then_some(Space::Cosine);
+        // ip-* fixtures hold unit vectors, so they are clean as cosine too;
+        // the byte one holds integers, and is the inner-product field it
+        // can only be.
+        let name = path.file_name().unwrap().to_str().unwrap();
+        let space = match (name.starts_with("ip-"), name.contains("byte")) {
+            (false, _) => None,
+            (true, false) => Some(Space::Cosine),
+            (true, true) => Some(Space::InnerProduct),
+        };
         let report = knn_check::verify(&bytes, &options(space));
         assert_eq!(
             report.status,
@@ -94,8 +100,90 @@ fn synthetic_fixtures_are_clean() {
         seen += 1;
     }
     assert_eq!(
-        seen, 11,
-        "five float, three fp16, and three bf16 synthetic fixtures"
+        seen, 15,
+        "five float, three fp16, three bf16, and four byte synthetic fixtures"
+    );
+}
+
+#[test]
+fn byte_storage_in_a_cosine_field_warns_and_skips_norms() {
+    // k-NN's Faiss engine refuses cosinesimil for byte fields, since it
+    // cannot normalize bytes. A byte file checked as one gets a metric
+    // warning at its quantizer, and no norms check: its vectors were never
+    // normalized. No byte code is NaN or infinite either, so the values
+    // check is skipped for every byte file.
+    let bytes = fs::read(fixtures().join("synthetic-byte/ip-1000x32-byte.faiss")).unwrap();
+    let report = knn_check::verify(&bytes, &options(Some(Space::Cosine)));
+    assert_eq!(report.status, Status::Warnings, "{report:#?}");
+    let metric = report.result(Check::Metric).unwrap();
+    assert_eq!(metric.severity, Some(Severity::Warning), "{metric:#?}");
+    assert_eq!(metric.count, 1);
+    assert!(
+        metric.findings[0]
+            .message
+            .contains("refuses cosinesimil for byte fields"),
+        "{metric:#?}"
+    );
+    let parsed = knn_format::parse(&bytes).unwrap();
+    let knn_format::faiss::Storage::Sq(sq) = parsed.index.index.storage else {
+        panic!("byte storage");
+    };
+    assert_eq!(metric.findings[0].offset, Some(sq.quantizer.offset));
+    let norms = report.result(Check::Norms).unwrap();
+    assert!(
+        norms
+            .skipped
+            .as_deref()
+            .is_some_and(|why| why.contains("never normalized")),
+        "{norms:#?}"
+    );
+    let values = report.result(Check::VectorValues).unwrap();
+    assert!(
+        values
+            .skipped
+            .as_deref()
+            .is_some_and(|why| why.contains("finite")),
+        "{values:#?}"
+    );
+
+    // As the inner-product field it is, the file is clean, and the values
+    // check is still skipped.
+    let report = knn_check::verify(&bytes, &options(Some(Space::InnerProduct)));
+    assert_eq!(report.status, Status::Clean, "{report:#?}");
+    assert!(
+        report
+            .result(Check::VectorValues)
+            .unwrap()
+            .skipped
+            .is_some()
+    );
+}
+
+#[test]
+fn an_l2_byte_file_checked_as_cosine_fails_once_with_the_byte_note() {
+    // One finding, which text output shows: a second one, the byte note
+    // alone, would be hidden behind the failure.
+    let bytes = fs::read(fixtures().join("synthetic-byte/l2-100x4-byte.faiss")).unwrap();
+    let report = knn_check::verify(&bytes, &options(Some(Space::Cosine)));
+    let metric = report.result(Check::Metric).unwrap();
+    assert_eq!(metric.severity, Some(Severity::Failure), "{metric:#?}");
+    assert_eq!(metric.count, 1, "{metric:#?}");
+    assert_eq!(
+        metric.findings[0].message,
+        "file records metric l2, but a cosinesimil field needs inner_product; \
+         k-NN's Faiss engine refuses cosinesimil for byte fields, since it cannot normalize bytes"
+    );
+}
+
+#[test]
+fn a_byte_quantizer_needs_one_byte_per_component() {
+    let bytes = fs::read(fixtures().join("corrupted/byte-quantizer-code-size.faiss")).unwrap();
+    let report = knn_check::verify(&bytes, &options(None));
+    let headers = report.result(Check::Headers).unwrap();
+    assert_eq!(headers.count, 1, "{headers:#?}");
+    assert_eq!(
+        headers.findings[0].message,
+        "quantizer code size 8 is not 1 byte per component; dimension 4 needs 4"
     );
 }
 
@@ -108,6 +196,7 @@ fn real_fixtures_are_clean_with_their_space() {
         "opensearch-3.9.0-fp16/sq-fp16",
         "opensearch-3.9.0-fp16/half-float",
         "opensearch-3.9.0-bf16/sq-bf16",
+        "opensearch-3.9.0-byte/byte",
     ] {
         for entry in fs::read_dir(fixtures().join(set)).unwrap() {
             let dir = entry.unwrap().path();
@@ -134,8 +223,8 @@ fn real_fixtures_are_clean_with_their_space() {
         }
     }
     assert_eq!(
-        seen, 15,
-        "six float, six fp16, and three bf16 real fixtures"
+        seen, 17,
+        "six float, six fp16, three bf16, and two byte real fixtures"
     );
 }
 

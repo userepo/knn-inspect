@@ -14,9 +14,12 @@ the file list, and `pos_of_doc`, the insertion position of each doc).
 
 `--encoding` picks how the field stores its vectors: `float` (the
 default), `sq-fp16` (the `sq` encoder with `type: fp16`, `bits: 16`),
-`sq-bf16` (the same with `type: bf16`), or `half-float` (the
-`half_float` data type). The vectors indexed are the same for every
-encoding.
+`sq-bf16` (the same with `type: bf16`), `half-float` (the `half_float`
+data type), or `byte` (the `byte` data type). The vectors indexed are
+the same for every encoding, except that `byte` scales them by 32,
+rounds them, and clips them to [-128, 127], the only values a byte field
+takes. k-NN's Faiss engine refuses `cosinesimil` for byte fields, so
+`byte` indexes `l2` and `innerproduct` only.
 
 Usage:
     docker compose -f tools/docker-compose.yml up -d
@@ -25,6 +28,7 @@ Usage:
     python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-fp16/sq-fp16 --encoding sq-fp16
     python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-fp16/half-float --encoding half-float
     python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-bf16/sq-bf16 --encoding sq-bf16
+    python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-byte/byte --encoding byte
 """
 
 from __future__ import annotations
@@ -42,7 +46,11 @@ import numpy as np
 import requests
 
 SPACES = ["l2", "innerproduct", "cosinesimil"]
-ENCODINGS = ["float", "sq-fp16", "sq-bf16", "half-float"]
+# Faiss has no cosine metric; k-NN serves cosinesimil as inner product
+# over normalized vectors, and cannot normalize bytes, so it refuses the
+# space for byte fields at mapping time.
+BYTE_SPACES = ["l2", "innerproduct"]
+ENCODINGS = ["float", "sq-fp16", "sq-bf16", "half-float", "byte"]
 M = 16
 EF_CONSTRUCTION = 100
 SEED = 20261013
@@ -84,6 +92,8 @@ def create_index(host: str, index: str, space: str, dim: int, compound: bool, en
     field: dict = {"type": "knn_vector", "dimension": dim}
     if encoding == "half-float":
         field["data_type"] = "half_float"
+    elif encoding == "byte":
+        field["data_type"] = "byte"
     field["space_type"] = space
     field["method"] = {"name": "hnsw", "engine": "faiss", "parameters": parameters}
     body = {
@@ -190,12 +200,16 @@ def main() -> None:
     parser.add_argument("--compound", action="store_true", help="enable Lucene compound files")
     parser.add_argument("--count", type=int, default=500)
     parser.add_argument("--dim", type=int, default=16)
-    parser.add_argument("--spaces", nargs="+", default=SPACES, choices=SPACES)
+    parser.add_argument("--spaces", nargs="+", choices=SPACES, help="default: every space the encoding allows")
     parser.add_argument("--batches", type=int, default=2, help="bulk batches before the force merge")
     parser.add_argument("--encoding", default="float", choices=ENCODINGS, help="how the field stores its vectors")
     args = parser.parse_args()
     if args.count > MAX_RESULT_WINDOW:
         parser.error(f"--count above {MAX_RESULT_WINDOW} exceeds index.max_result_window, which doc_order reads in one page")
+    allowed = BYTE_SPACES if args.encoding == "byte" else SPACES
+    spaces = args.spaces or allowed
+    if refused := [s for s in spaces if s not in allowed]:
+        parser.error(f"k-NN's Faiss engine refuses {', '.join(refused)} for {args.encoding} fields")
 
     info = wait_for_cluster(args.host, timeout=180)
     os_version = info["version"]["number"]
@@ -209,8 +223,12 @@ def main() -> None:
     # whether or not the other spaces are requested in this run.
     rng = np.random.default_rng(SEED)
     draws = {space: rng.standard_normal((args.count, args.dim), dtype=np.float32) for space in SPACES}
-    for space in args.spaces:
+    for space in spaces:
         vectors = draws[space]
+        if args.encoding == "byte":
+            # The same draw as the other encodings, scaled, rounded, and
+            # clipped to the byte range: a byte field takes integers only.
+            vectors = np.clip(np.rint(vectors * 32), -128, 127).astype(np.int8)
         # Float indexes keep the names they had before `--encoding` existed.
         index = f"knn-{space}" if args.encoding == "float" else f"knn-{space}-{args.encoding}"
         dest = args.out / space
@@ -230,7 +248,10 @@ def main() -> None:
             sys.exit(f"{index}: compound files {'present' if has_cfs else 'absent'} but --compound={args.compound}; files: {names}")
 
         # Row i is document i, which is also Faiss label i in the native file.
-        vectors[pos_of_doc].tofile(dest / "vectors.f32")
+        vectors[pos_of_doc].astype(np.float32).tofile(dest / "vectors.f32")
+        vectors_note = "row-major little-endian float32 in doc-id order: row i is document i, the Faiss label i; pos_of_doc[i] is its insertion position and its _id"
+        if args.encoding == "byte":
+            vectors_note += "; every value is an integer in [-128, 127], as the byte field received it"
         manifest = {
             "opensearch_version": os_version,
             "knn_plugin_version": knn_version,
@@ -244,7 +265,7 @@ def main() -> None:
             "dimension": args.dim,
             "seed": SEED,
             "vectors_file": "vectors.f32",
-            "vectors_note": "row-major little-endian float32 in doc-id order: row i is document i, the Faiss label i; pos_of_doc[i] is its insertion position and its _id",
+            "vectors_note": vectors_note,
             "pos_of_doc": pos_of_doc,
             "request": body,
             "files": files,

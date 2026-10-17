@@ -18,8 +18,8 @@ Usage:
     python tools/graph_stats.py --fixtures fixtures   rewrite the baselines
 
 The baselines are `<name>.stats.json` next to each synthetic fixture and
-`stats.json` next to each real fixture's manifest, float, fp16, and bf16
-alike.
+`stats.json` next to each real fixture's manifest, float, fp16, bf16, and
+byte alike.
 Rewrite them whenever the fixtures are regenerated: real fixtures get new
 neighbor arrays on every extraction.
 """
@@ -30,11 +30,15 @@ import argparse
 import collections
 import json
 import pathlib
+import sys
 
 import faiss
 import numpy as np
 
-from strip_envelope import parse_footer, parse_header
+# The tools import each other; `python -I` leaves the script's own
+# directory off the path, so it is put back.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from strip_envelope import parse_footer, parse_header  # noqa: E402
 
 
 def load_graph(path: pathlib.Path) -> dict:
@@ -137,12 +141,12 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.fixtures:
-        for synthetic in ("synthetic", "synthetic-fp16", "synthetic-bf16"):
+        for synthetic in ("synthetic", "synthetic-fp16", "synthetic-bf16", "synthetic-byte"):
             for path in sorted((args.fixtures / synthetic).glob("*.faiss")):
                 write(graph_stats(path), path.with_suffix(".stats.json"))
         for manifest in sorted(
             m
-            for real in ("opensearch-3.9.0", "opensearch-3.9.0-fp16", "opensearch-3.9.0-bf16")
+            for real in ("opensearch-3.9.0", "opensearch-3.9.0-fp16", "opensearch-3.9.0-bf16", "opensearch-3.9.0-byte")
             for m in (args.fixtures / real).glob("*/*/manifest.json")
         ):
             files = json.loads(manifest.read_text(encoding="utf-8"))["files"]

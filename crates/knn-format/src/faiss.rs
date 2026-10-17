@@ -1,12 +1,13 @@
 //! The Faiss payload: `IxMp` wrapping `IHNf` over flat float32 storage,
-//! or `IHNs` over fp16 or bf16 scalar-quantized storage, as
+//! or `IHNs` over fp16, bf16, or byte scalar-quantized storage, as
 //! `faiss/impl/index_read.cpp` reads it.
 //!
 //! Every array is a view into the file's bytes. Element types are the
 //! unaligned little-endian wrappers from `zerocopy`; call `.get()` on an
 //! element for its native value. Scalar-quantized codes are the
-//! exception, raw bytes as Faiss counts them: [`SqStorage::vector`] views
-//! a row as `U16`, and [`CodeFormat::decode`] decodes a component.
+//! exception, raw bytes as Faiss counts them: [`SqStorage::row`] views a
+//! row's bytes, [`SqStorage::halves`] the 16-bit codes of fp16 or bf16
+//! storage, and [`CodeFormat::decode`] decodes a component.
 
 use std::fmt;
 
@@ -303,8 +304,13 @@ pub const QT_FP16: i32 = 4;
 /// a float32.
 pub const QT_BF16: i32 = 7;
 
+/// `ScalarQuantizer::QT_8bit_direct_signed`: each component one byte, the
+/// value plus 128. What k-NN writes for its `byte` data type.
+pub const QT_8BIT_DIRECT_SIGNED: i32 = 8;
+
 /// How a scalar quantizer this crate reads stores a component: two bytes,
-/// little-endian, in one of two 16-bit float formats.
+/// little-endian, in one of two 16-bit float formats, or one byte holding
+/// an integer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CodeFormat {
     /// IEEE 754 half precision (`QT_fp16`): k-NN's `sq` encoder with
@@ -312,6 +318,9 @@ pub enum CodeFormat {
     Fp16,
     /// bfloat16 (`QT_bf16`): k-NN's `sq` encoder with `type: bf16`.
     Bf16,
+    /// An integer in -128..=127 stored as itself plus 128
+    /// (`QT_8bit_direct_signed`): k-NN's `byte` data type.
+    Byte,
 }
 
 impl CodeFormat {
@@ -321,6 +330,7 @@ impl CodeFormat {
         match qtype {
             QT_FP16 => Some(Self::Fp16),
             QT_BF16 => Some(Self::Bf16),
+            QT_8BIT_DIRECT_SIGNED => Some(Self::Byte),
             _ => None,
         }
     }
@@ -331,24 +341,39 @@ impl CodeFormat {
         match self {
             Self::Fp16 => QT_FP16,
             Self::Bf16 => QT_BF16,
+            Self::Byte => QT_8BIT_DIRECT_SIGNED,
         }
     }
 
-    /// `fp16` or `bf16`.
+    /// `fp16`, `bf16`, or `byte`.
     #[must_use]
     pub fn name(self) -> &'static str {
         match self {
             Self::Fp16 => "fp16",
             Self::Bf16 => "bf16",
+            Self::Byte => "byte",
         }
     }
 
-    /// Decodes one stored component, exactly.
+    /// Bytes per stored component: 2, 2, or 1. Faiss derives the
+    /// quantizer's code size as this times the dimension.
     #[must_use]
-    pub fn decode(self, bits: u16) -> f32 {
+    pub fn component_size(self) -> usize {
         match self {
-            Self::Fp16 => f16_to_f32(bits),
-            Self::Bf16 => bf16_to_f32(bits),
+            Self::Fp16 | Self::Bf16 => 2,
+            Self::Byte => 1,
+        }
+    }
+
+    /// Decodes one stored component from its [`Self::component_size`]
+    /// bytes, exactly; `None` when `bytes` is not exactly that long.
+    #[must_use]
+    pub fn decode(self, bytes: &[u8]) -> Option<f32> {
+        match (self, bytes) {
+            (Self::Fp16, &[lo, hi]) => Some(f16_to_f32(u16::from_le_bytes([lo, hi]))),
+            (Self::Bf16, &[lo, hi]) => Some(bf16_to_f32(u16::from_le_bytes([lo, hi]))),
+            (Self::Byte, &[code]) => Some(byte_to_f32(code)),
+            _ => None,
         }
     }
 }
@@ -496,25 +521,41 @@ pub fn bf16_rounds_to(x: f32, code: u16) -> bool {
     code == f32_to_bf16(x) || u32::from(code) == other
 }
 
+/// Decodes a byte code as Faiss's `Quantizer8bitDirectSigned` does: the
+/// code is the value plus 128, so this takes the 128 back. Exact.
+#[must_use]
+pub fn byte_to_f32(code: u8) -> f32 {
+    f32::from(code) - 128.0
+}
+
+/// Encodes a byte value as Faiss's `Quantizer8bitDirectSigned` does: the
+/// value plus 128 in one byte, which flips the top bit of its
+/// two's-complement form. k-NN's `byte` data type takes integers in
+/// -128..=127 only, so this is the whole encoder.
+#[must_use]
+pub fn byte_code(value: i8) -> u8 {
+    u8::from_ne_bytes(value.to_ne_bytes()) ^ 0x80
+}
+
 /// A scalar quantizer's parameters (`read_ScalarQuantizer`).
 #[derive(Debug, Clone, Copy)]
 pub struct ScalarQuantizer<'a> {
     /// File offset of `qtype`, the first field.
     pub offset: usize,
-    /// `QuantizerType` as stored; the parser accepts only [`QT_FP16`] and
-    /// [`QT_BF16`].
+    /// `QuantizerType` as stored; the parser accepts only [`QT_FP16`],
+    /// [`QT_BF16`], and [`QT_8BIT_DIRECT_SIGNED`].
     pub qtype: i32,
-    /// `RangeStat` as stored; neither fp16 nor bf16 uses it.
+    /// `RangeStat` as stored; none of the three formats uses it.
     pub rangestat: i32,
-    /// The range statistic's argument; neither fp16 nor bf16 uses it.
+    /// The range statistic's argument; none of the three formats uses it.
     pub rangestat_arg: f32,
     /// The dimension, as the quantizer stores it.
     pub d: u64,
     /// Bytes per vector as stored. Faiss ignores it on load and derives
     /// the code size from `qtype` and `d`: two bytes per component for
-    /// fp16 and bf16.
+    /// fp16 and bf16, one for byte.
     pub code_size: u64,
-    /// Trained values; fp16 and bf16 need none.
+    /// Trained values; none of the three formats needs any.
     pub trained: &'a [F32],
 }
 
@@ -537,9 +578,9 @@ impl<'a> ScalarQuantizer<'a> {
     }
 }
 
-/// Scalar-quantized storage with two-byte codes (`IndexScalarQuantizer`
-/// with `QT_fp16` or `QT_bf16`): each component a 16-bit float,
-/// little-endian.
+/// Scalar-quantized storage (`IndexScalarQuantizer` with `QT_fp16`,
+/// `QT_bf16`, or `QT_8bit_direct_signed`): each component a 16-bit float,
+/// little-endian, or one byte.
 #[derive(Debug, Clone, Copy)]
 pub struct SqStorage<'a> {
     /// The storage index's own header.
@@ -548,35 +589,62 @@ pub struct SqStorage<'a> {
     pub quantizer: ScalarQuantizer<'a>,
     /// The codes' format, from the quantizer type.
     pub format: CodeFormat,
-    /// All codes, row-major, two bytes per component. Faiss stores their
-    /// length in bytes, so a damaged file can hold an odd number.
+    /// All codes, row-major, [`CodeFormat::component_size`] bytes per
+    /// component. Faiss stores their length in bytes, so a damaged file
+    /// can hold part of a component or row.
     pub codes: &'a [u8],
 }
 
 impl<'a> SqStorage<'a> {
-    /// Vector `i` as code bits, or `None` when it is not entirely inside
-    /// `codes`. [`CodeFormat::decode`] decodes a component.
+    /// Bytes per row: the dimension times the component size, or `None`
+    /// for a dimension that is not a positive count. A file of dimension 0
+    /// holds no rows, so it has no row size to count them by.
+    fn row_bytes(&self) -> Option<usize> {
+        usize::try_from(self.header.d)
+            .ok()?
+            .checked_mul(self.format.component_size())
+            .filter(|&row| row > 0)
+    }
+
+    /// Vector `i` as its code bytes, or `None` when it is not entirely
+    /// inside `codes`, as for every `i` at dimension 0.
     #[must_use]
-    pub fn vector(&self, i: usize) -> Option<&'a [U16]> {
-        let row = usize::try_from(self.header.d).ok()?.checked_mul(2)?;
+    pub fn row(&self, i: usize) -> Option<&'a [u8]> {
+        let row = self.row_bytes()?;
         let start = i.checked_mul(row)?;
-        let bytes = self.codes.get(start..start.checked_add(row)?)?;
-        <[U16]>::ref_from_bytes(bytes).ok()
+        self.codes.get(start..start.checked_add(row)?)
+    }
+
+    /// Vector `i` decoded to float32, component by component, or `None`
+    /// when it is not entirely inside `codes`. The iterator borrows the
+    /// file's bytes, not this value.
+    #[must_use]
+    pub fn decoded(&self, i: usize) -> Option<impl Iterator<Item = f32> + use<'a>> {
+        let format = self.format;
+        let row = self.row(i)?;
+        // Every chunk is a whole component, so `decode` never fails; the
+        // fallback only satisfies the type.
+        Some(
+            row.chunks_exact(format.component_size())
+                .map(move |c| format.decode(c).unwrap_or(f32::NAN)),
+        )
     }
 
     /// Rows that `codes` holds in full.
     #[must_use]
     pub fn row_count(&self) -> usize {
-        match usize::try_from(self.header.d) {
-            Ok(d) if d > 0 => self.codes.len() / d.saturating_mul(2),
-            _ => 0,
-        }
+        self.row_bytes().map_or(0, |row| self.codes.len() / row)
     }
 
-    /// Every whole component as code bits, row-major. The odd trailing
-    /// byte a damaged file can hold is left out.
+    /// Every whole 16-bit component of fp16 or bf16 storage as code bits,
+    /// row-major; the odd trailing byte a damaged file can hold is left
+    /// out. Empty for byte storage, whose components are the bytes of
+    /// [`Self::codes`] themselves.
     #[must_use]
-    pub fn components(&self) -> &'a [U16] {
+    pub fn halves(&self) -> &'a [U16] {
+        if self.format.component_size() != 2 {
+            return &[];
+        }
         let whole = self.codes.len() & !1;
         self.codes
             .get(..whole)
@@ -590,7 +658,7 @@ impl<'a> SqStorage<'a> {
 pub enum Storage<'a> {
     /// Float32, under `IHNf`.
     Flat(FlatStorage<'a>),
-    /// fp16 or bf16, under `IHNs`.
+    /// fp16, bf16, or byte, under `IHNs`.
     Sq(SqStorage<'a>),
 }
 
@@ -631,12 +699,13 @@ impl<'a> Storage<'a> {
         }
     }
 
-    /// Bytes per stored component: 4 for float32, 2 for fp16 or bf16.
+    /// Bytes per stored component: 4 for float32, 2 for fp16 or bf16, 1
+    /// for byte.
     #[must_use]
     pub fn component_size(&self) -> usize {
         match self {
             Self::Flat(_) => 4,
-            Self::Sq(_) => 2,
+            Self::Sq(s) => s.format.component_size(),
         }
     }
 
@@ -661,11 +730,10 @@ impl<'a> Storage<'a> {
         match self {
             Self::Flat(s) => s.codes.get(i).map(|v| v.get()),
             Self::Sq(s) => {
-                let start = i.checked_mul(2)?;
-                let pair = s.codes.get(start..start.checked_add(2)?)?;
-                U16::read_from_bytes(pair)
-                    .ok()
-                    .map(|v| s.format.decode(v.get()))
+                let size = s.format.component_size();
+                let start = i.checked_mul(size)?;
+                s.format
+                    .decode(s.codes.get(start..start.checked_add(size)?)?)
             }
         }
     }
@@ -674,7 +742,7 @@ impl<'a> Storage<'a> {
 /// An HNSW index: the graph plus its storage.
 #[derive(Debug, Clone, Copy)]
 pub struct HnswIndex<'a> {
-    /// `IHNf` over float32 storage, or `IHNs` over fp16 or bf16.
+    /// `IHNf` over float32 storage, or `IHNs` over fp16, bf16, or byte.
     pub fourcc: FourCc,
     /// The HNSW index's own header.
     pub header: IndexHeader,
@@ -714,9 +782,10 @@ impl IdMapIndex<'_> {
 /// # Errors
 ///
 /// Returns an error for any fourcc or HNSW and storage pairing outside the
-/// supported layouts, a scalar quantizer type other than `QT_fp16` or
-/// `QT_bf16`, a negative dimension or count, a count beyond what Faiss
-/// accepts, or a structure running past the data.
+/// supported layouts, a scalar quantizer type other than `QT_fp16`,
+/// `QT_bf16`, or `QT_8bit_direct_signed`, a negative dimension or count,
+/// a count beyond what Faiss accepts, or a structure running past the
+/// data.
 pub fn parse(payload: &[u8], base: usize) -> Result<IdMapIndex<'_>> {
     let mut cur = Cursor::new(payload, base);
 

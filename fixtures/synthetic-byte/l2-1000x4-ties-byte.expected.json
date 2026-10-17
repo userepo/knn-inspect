@@ -1,0 +1,56 @@
+{
+  "file": "l2-1000x4-ties-byte.faiss",
+  "size": 156171,
+  "faiss_version": "1.15.1",
+  "seed": 20261013,
+  "layout": [
+    "IxMp",
+    "IHNs",
+    "IxSQ"
+  ],
+  "dimension": 4,
+  "count": 1000,
+  "metric": "l2",
+  "faiss_metric_type": 1,
+  "hnsw": {
+    "m": 16,
+    "ef_construction": 100,
+    "ef_search": 16,
+    "max_level": 2,
+    "entry_point": 592,
+    "level_counts": [
+      1000,
+      57,
+      3
+    ],
+    "levels_len": 1000,
+    "offsets_len": 1001,
+    "neighbors_len": 32960,
+    "levels_crc32": 330177091
+  },
+  "sq": {
+    "qtype": 8,
+    "qtype_name": "QT_8bit_direct_signed",
+    "rangestat": 0,
+    "rangestat_arg": 0.0,
+    "d": 4,
+    "code_size": 4,
+    "trained_len": 0
+  },
+  "ids": {
+    "len": 1000,
+    "first": 1000,
+    "last": 1999,
+    "crc32": 3986414682
+  },
+  "codes": {
+    "bytes": 4000,
+    "crc32": 1317536136,
+    "first_decoded": [
+      0.0,
+      -1.0,
+      0.0,
+      0.0
+    ]
+  }
+}

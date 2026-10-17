@@ -85,11 +85,14 @@ pub enum Check {
     Structure,
     /// No bytes between the index and the footer.
     Trailing,
-    /// The three Faiss headers agree and hold supported values; for fp16
-    /// and bf16 storage, the quantizer's dimension and code size match them
-    /// and it holds no trained values.
+    /// The three Faiss headers agree and hold supported values; for
+    /// scalar-quantized storage, the quantizer's dimension and code size
+    /// match them and it holds no trained values.
     Headers,
-    /// `--space` matches the metric the file records.
+    /// `--space` matches the metric the file records. With `--space
+    /// cosine`, byte storage is also reported, as a warning or, when the
+    /// metric does not match either, in the failure: k-NN refuses
+    /// cosinesimil for byte fields.
     Metric,
     /// Neighbor offsets are monotonic and end at the neighbor array.
     Offsets,
@@ -103,17 +106,21 @@ pub enum Check {
     /// that steps to one that is not reads the wrong node's slots.
     NeighborLevels,
     /// The storage holds exactly `count x dimension` components: float32
-    /// elements, or two bytes each of fp16 or bf16 codes.
+    /// elements, two bytes each of fp16 or bf16 codes, or one byte each of
+    /// byte codes.
     VectorCount,
     /// The ID map holds one label per node.
     IdMapLength,
-    /// No NaN or infinite vector components.
+    /// No NaN or infinite vector components. Skipped for byte storage,
+    /// where no code is either.
     VectorValues,
     /// No node lists the same neighbor twice on one level.
     DuplicateNeighbors,
     /// No node lists itself as a neighbor.
     SelfLoops,
-    /// With `--space cosine`: every vector has unit length.
+    /// With `--space cosine`: every vector has unit length. Skipped for
+    /// byte storage, which k-NN never normalizes, since it refuses
+    /// cosinesimil for byte fields; the metric check reports that instead.
     Norms,
 }
 

@@ -4,6 +4,7 @@
 
 use std::fmt::Write as _;
 use std::fs;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -12,7 +13,7 @@ use clap::Args;
 use knn_check::{Options, Severity, Space, Status};
 use knn_format::U16;
 use knn_format::envelope::Envelope;
-use knn_format::faiss::{CodeFormat, HalfRounding, Storage, bf16_rounds_to};
+use knn_format::faiss::{CodeFormat, HalfRounding, Storage, bf16_rounds_to, byte_code};
 use knn_format::segment_info::SegmentInfo;
 use knn_format::{NativeFile, view_offset};
 use serde::Serialize;
@@ -147,8 +148,8 @@ enum CrossCheck {
     /// Not compared: the Lucene file is not beside the native file (a
     /// compound segment keeps its `.vec` inside the `.cfs`), is a sound
     /// file in a format this tool does not read, repeats its values too
-    /// much to search for scalar-quantized codes' float32 sources in
-    /// bounded time, or there was nothing to compare. `detail` says which.
+    /// much to search for the stored vectors in bounded time, or there was
+    /// nothing to compare. `detail` says which.
     Skipped,
 }
 
@@ -495,8 +496,9 @@ fn lucene_vectors(path: &Path, bytes: &[u8], parsed: &knn_format::Parsed<'_>) ->
     // The bytes to look for: float32 storage as it lies in the file, or
     // every whole code, which a half_float field's .vec holds byte for
     // byte. The .vec of an sq fp16 or bf16 field holds the float32 vectors
-    // the codes were rounded from instead, so codes are also looked for
-    // that way.
+    // the codes were rounded from instead, so those codes are also looked
+    // for that way; a byte field's holds the int8 values the codes are 128
+    // above, so byte codes are looked for that way only.
     let (storage, sources) = match &parsed.index.index.storage {
         Storage::Flat(flat) => {
             let codes = flat.codes;
@@ -505,12 +507,15 @@ fn lucene_vectors(path: &Path, bytes: &[u8], parsed: &knn_format::Parsed<'_>) ->
             }) else {
                 return skipped("the storage view could not be located in the file".to_owned());
             };
-            (storage, None)
+            (storage, Sources::None)
         }
-        Storage::Sq(sq) => (
-            sq.codes.get(..sq.codes.len() & !1).unwrap_or_default(),
-            Some((sq.components(), sq.format)),
-        ),
+        Storage::Sq(sq) => match sq.format {
+            CodeFormat::Fp16 | CodeFormat::Bf16 => (
+                sq.codes.get(..sq.codes.len() & !1).unwrap_or_default(),
+                Sources::Rounded(sq.halves(), sq.format),
+            ),
+            CodeFormat::Byte => (sq.codes, Sources::Int8),
+        },
     };
     if storage.is_empty() {
         return skipped("the native file holds no vectors".to_owned());
@@ -572,7 +577,7 @@ fn lucene_vectors(path: &Path, bytes: &[u8], parsed: &knn_format::Parsed<'_>) ->
     // A search that gave up cannot say the vectors are not there.
     if !repetitive.is_empty() {
         return skipped(format!(
-            "the float32 values of {} repeat too much to search for the codes' sources in bounded time",
+            "the values of {} repeat too much to search for the stored vectors in bounded time",
             repetitive.join(", ")
         ));
     }
@@ -621,16 +626,6 @@ fn segment_of(name: &str) -> &str {
     }
 }
 
-/// The first offset at which `needle` occurs in `haystack`, in time
-/// linear in their lengths. A naive search goes quadratic on long runs of
-/// one byte value, and zero-filled pages are what a crash leaves behind.
-fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() {
-        return None;
-    }
-    memchr::memmem::find(haystack, needle)
-}
-
 /// Where a `.vec` holds the native file's vectors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Located {
@@ -638,23 +633,191 @@ enum Located {
     At(usize, &'static str),
     /// Not in the file.
     Absent,
-    /// The search for the codes' float32 sources gave up.
+    /// A search gave up on values that repeat too much.
     GaveUp,
 }
 
-/// Looks for `storage` byte for byte, then, for scalar-quantized codes
-/// (`sources`), for the float32 values they were rounded from.
-fn locate(vec: &[u8], storage: &[u8], sources: Option<(&[U16], CodeFormat)>) -> Located {
-    if let Some(offset) = find(vec, storage) {
+/// What a `.vec` holds in place of the stored vectors, besides possibly
+/// the same bytes.
+#[derive(Debug, Clone, Copy)]
+enum Sources<'a> {
+    /// Nothing else: float32 storage, which a `.vec` holds as it is.
+    None,
+    /// The float32 values these 16-bit codes were rounded from, which the
+    /// `.vec` of an `sq` fp16 or bf16 field holds; a `half_float` field's
+    /// holds the codes themselves.
+    Rounded(&'a [U16], CodeFormat),
+    /// The int8 values the byte codes are 128 above, which the `.vec` of
+    /// a byte field holds. The codes themselves never appear in it, so a
+    /// byte-for-byte hit would be a `.vec` whose every value is 128 off
+    /// and is not looked for.
+    Int8,
+}
+
+/// Looks in `vec` for `storage` byte for byte, then for its `sources`;
+/// for byte storage, for its int8 values only.
+fn locate(vec: &[u8], storage: &[u8], sources: Sources<'_>) -> Located {
+    let region = data_region(vec);
+    if let Sources::Int8 = sources {
+        // Flipping the top bit is its own inverse, so `byte_code` also
+        // maps a code back to its value's byte.
+        let found = find_bytes(vec, region, storage, |code| {
+            byte_code(i8::from_ne_bytes([code]))
+        });
+        return found.located("as int8 values 128 below the stored codes");
+    }
+    let exact = find_bytes(vec, region.clone(), storage, |b| b);
+    if let Search::Found(offset) = exact {
         return Located::At(offset, "byte for byte");
     }
-    match sources.map(|(codes, format)| find_rounded(vec, codes, format)) {
-        Some(Rounded::Found(offset)) => {
-            Located::At(offset, "as float32 values that round to the stored codes")
+    let rounded = match sources {
+        Sources::Rounded(codes, format) => find_rounded(vec, region, codes, format),
+        Sources::None | Sources::Int8 => Search::Missing,
+    };
+    match (exact, rounded) {
+        (_, Search::Found(_)) => {
+            rounded.located("as float32 values that round to the stored codes")
         }
-        Some(Rounded::GaveUp) => Located::GaveUp,
-        Some(Rounded::Missing) | None => Located::Absent,
+        (Search::GaveUp, _) | (_, Search::GaveUp) => Located::GaveUp,
+        _ => Located::Absent,
     }
+}
+
+/// Lucene starts a field's vector data at a file offset that is a
+/// multiple of this, so no search tries another. Lucene 10.5.1 aligns
+/// byte data to 4 bytes and float32 data to 64 (`alignOutput` in
+/// `Lucene99FlatVectorsWriter`), earlier versions all data to 4, and
+/// k-NN's half-float writer to 64: every `.vec` a k-NN segment can hold
+/// starts its vectors at a multiple of 4.
+const DATA_ALIGNMENT: usize = 4;
+
+/// The part of a `.vec` that can hold vector data: from the end of its
+/// codec header to the start of its footer. A `.vec` whose envelope does
+/// not parse is searched whole.
+fn data_region(vec: &[u8]) -> Range<usize> {
+    let Ok(envelope) = Envelope::parse(vec) else {
+        return 0..vec.len();
+    };
+    let end = envelope.footer.map_or(vec.len(), |f| f.offset);
+    let start = envelope.header.map_or(0, |h| h.length).min(end);
+    start..end
+}
+
+/// How a search of a `.vec` ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Search {
+    /// The vectors start at this offset.
+    Found(usize),
+    /// They are not in the file.
+    Missing,
+    /// The file repeats its values too much to search in bounded time.
+    GaveUp,
+}
+
+impl Search {
+    fn located(self, how: &'static str) -> Located {
+        match self {
+            Self::Found(offset) => Located::At(offset, how),
+            Self::Missing => Located::Absent,
+            Self::GaveUp => Located::GaveUp,
+        }
+    }
+}
+
+/// Bytes of the stored vectors a search matches with `memmem` before
+/// following each hit through the rest by hand, and compares at the end
+/// of a candidate before its middle: enough to make false hits rare on
+/// ordinary data, small enough to copy for any file.
+const HEAD: usize = 4096;
+
+/// How many passes over a `.vec` and the stored vectors a search may make
+/// before it gives up. Four allow for the false hits ordinary data throws
+/// up. Sixteen more allow for the aligned offsets inside the up to 63
+/// bytes of zero padding Lucene 10.5.1 puts before float32 data, each of
+/// which a store of mostly zero vectors can match almost to its end
+/// before the true start is tried. Past that, data repeats too much to
+/// search in time linear in the file's size.
+const PASSES: usize = 20;
+
+/// The work a search of `vec` for `stored` may do, in byte or value
+/// compares.
+fn search_budget(vec: usize, stored: usize) -> usize {
+    vec.saturating_add(stored).saturating_mul(PASSES)
+}
+
+/// Looks in `vec`'s data `region` for `stored`, every byte mapped by
+/// `to_vec` to the byte the `.vec` holds for it: the identity for storage
+/// a `.vec` holds as it is, a top-bit flip for byte codes. Only offsets
+/// Lucene can write are accepted: inside the region, at a multiple of
+/// [`DATA_ALIGNMENT`]. The mapped first [`HEAD`] bytes are searched for,
+/// and each hit is followed through the rest without copying it: the
+/// last [`HEAD`] bytes first, then the middle, so a store that differs
+/// only near its end, such as zero vectors but the last, rejects a false
+/// hit at once. Hits are taken one offset at a time, since on periodic
+/// data the true start can lie inside a false hit's span. On data that
+/// repeats long runs, following every hit would take quadratic time, so
+/// the work is capped (see [`PASSES`]), counting the head compare behind
+/// each hit as well as the follow-up; past that the search gives up.
+fn find_bytes(
+    vec: &[u8],
+    region: Range<usize>,
+    stored: &[u8],
+    to_vec: impl Fn(u8) -> u8,
+) -> Search {
+    let Some(data) = vec.get(..region.end) else {
+        return Search::Missing;
+    };
+    if stored.is_empty() || stored.len() > region.len() {
+        return Search::Missing;
+    }
+    let head: Vec<u8> = stored.iter().take(HEAD).map(|&b| to_vec(b)).collect();
+    let rest = stored.get(head.len()..).unwrap_or_default();
+    let Some((middle, tail)) = rest.split_at_checked(rest.len().saturating_sub(HEAD)) else {
+        return Search::Missing;
+    };
+    let mut budget = search_budget(vec.len(), stored.len());
+    let finder = memchr::memmem::Finder::new(&head);
+    let mut from = region.start;
+    while let Some(hit) = data.get(from..).and_then(|haystack| finder.find(haystack)) {
+        let offset = from.saturating_add(hit);
+        // The finder compared the whole head to report the hit.
+        let Some(left) = budget.checked_sub(head.len()) else {
+            return Search::GaveUp;
+        };
+        budget = left;
+        from = offset.saturating_add(1);
+        if !offset.is_multiple_of(DATA_ALIGNMENT) {
+            continue;
+        }
+        let after = offset.saturating_add(head.len());
+        // Past here, nothing has room for the rest.
+        let Some((in_middle, in_tail)) = data
+            .get(after..after.saturating_add(rest.len()))
+            .and_then(|candidate| candidate.split_at_checked(middle.len()))
+        else {
+            return Search::Missing;
+        };
+        let holds = |held: &[u8], wanted: &[u8], budget: &mut usize| -> Option<bool> {
+            for (&v, &b) in held.iter().zip(wanted) {
+                *budget = budget.checked_sub(1)?;
+                if to_vec(b) != v {
+                    return Some(false);
+                }
+            }
+            Some(true)
+        };
+        match holds(in_tail, tail, &mut budget) {
+            None => return Search::GaveUp,
+            Some(false) => continue,
+            Some(true) => {}
+        }
+        match holds(in_middle, middle, &mut budget) {
+            None => return Search::GaveUp,
+            Some(false) => {}
+            Some(true) => return Search::Found(offset),
+        }
+    }
+    Search::Missing
 }
 
 /// What a float32 value must round to: a code, by its format's rule.
@@ -669,11 +832,13 @@ enum Target {
 impl Target {
     /// The target of `code`, or `None` for an fp16 infinity or NaN, which
     /// `HalfRounding` does not match: k-NN rejects fp16 values beyond
-    /// ±65504, so it stores neither.
+    /// ±65504, so it stores neither. Byte codes have no float32 sources
+    /// and never get here.
     fn of(format: CodeFormat, code: u16) -> Option<Self> {
         match format {
             CodeFormat::Fp16 => HalfRounding::of(code).map(Self::Fp16),
             CodeFormat::Bf16 => Some(Self::Bf16(code)),
+            CodeFormat::Byte => None,
         }
     }
 
@@ -685,34 +850,42 @@ impl Target {
     }
 }
 
-/// How a search for scalar-quantized codes' float32 sources ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Rounded {
-    /// The sources start at this offset.
-    Found(usize),
-    /// They are not in the file.
-    Missing,
-    /// The file repeats its values too much to search in bounded time.
-    GaveUp,
-}
-
-/// Looks in `vec` for float32 values that round, one by one, to `codes`
-/// in `format`. Lucene starts float32 vector data at a multiple of 4
-/// bytes (Lucene 10.5.1 at a multiple of 64), so only those offsets are
-/// tried. Each offset whose first value rounds to the first code is
-/// followed until a value does not. On data that repeats long runs,
-/// following every such offset would take quadratic time, so the
-/// follow-up work is capped at about four passes over the file; past that
-/// the search gives up. Nothing is allocated.
-fn find_rounded(vec: &[u8], codes: &[U16], format: CodeFormat) -> Rounded {
+/// Looks in `vec`'s data `region` for float32 values that round, one by
+/// one, to `codes` in `format`, at offsets Lucene can write (see
+/// [`DATA_ALIGNMENT`]). Each offset whose first value rounds to the first
+/// code is followed until a value does not: the last values first (as
+/// many as [`HEAD`] bytes hold), then the middle, as in [`find_bytes`].
+/// On data that repeats long runs, following every such offset would take
+/// quadratic time, so the follow-up work is capped (see [`PASSES`]); past
+/// that the search gives up. Nothing is allocated.
+fn find_rounded(vec: &[u8], region: Range<usize>, codes: &[U16], format: CodeFormat) -> Search {
     let Some(first) = codes.first().and_then(|c| Target::of(format, c.get())) else {
-        return Rounded::Missing;
+        return Search::Missing;
     };
-    let (words, _) = vec.as_chunks::<4>();
+    // DATA_ALIGNMENT is the width of a float32, so the aligned offsets
+    // are the starts of the region's whole words.
+    let start = region.start.next_multiple_of(DATA_ALIGNMENT);
+    let Some(data) = vec.get(start..region.end) else {
+        return Search::Missing;
+    };
+    let (words, _) = data.as_chunks::<4>();
     if codes.len() > words.len() {
-        return Rounded::Missing;
+        return Search::Missing;
     }
-    let mut budget = words.len().saturating_add(codes.len()).saturating_mul(4);
+    let rest = codes.get(1..).unwrap_or_default();
+    let Some((middle, tail)) = rest.split_at_checked(rest.len().saturating_sub(HEAD / 4)) else {
+        return Search::Missing;
+    };
+    let mut budget = search_budget(words.len(), codes.len());
+    let rounds = |held: &[[u8; 4]], wanted: &[U16], budget: &mut usize| -> Option<bool> {
+        for (w, code) in held.iter().zip(wanted) {
+            *budget = budget.checked_sub(1)?;
+            if !Target::of(format, code.get()).is_some_and(|t| t.hit(f32::from_le_bytes(*w))) {
+                return Some(false);
+            }
+        }
+        Some(true)
+    };
     for (index, window) in words.windows(codes.len()).enumerate() {
         if !window
             .first()
@@ -720,22 +893,24 @@ fn find_rounded(vec: &[u8], codes: &[U16], format: CodeFormat) -> Rounded {
         {
             continue;
         }
-        let mut all = true;
-        for (w, code) in window.iter().zip(codes).skip(1) {
-            let Some(left) = budget.checked_sub(1) else {
-                return Rounded::GaveUp;
-            };
-            budget = left;
-            if !Target::of(format, code.get()).is_some_and(|t| t.hit(f32::from_le_bytes(*w))) {
-                all = false;
-                break;
-            }
+        let Some((in_middle, in_tail)) = window
+            .get(1..)
+            .and_then(|after| after.split_at_checked(middle.len()))
+        else {
+            continue;
+        };
+        match rounds(in_tail, tail, &mut budget) {
+            None => return Search::GaveUp,
+            Some(false) => continue,
+            Some(true) => {}
         }
-        if all {
-            return Rounded::Found(index.saturating_mul(4));
+        match rounds(in_middle, middle, &mut budget) {
+            None => return Search::GaveUp,
+            Some(false) => {}
+            Some(true) => return Search::Found(start.saturating_add(index.saturating_mul(4))),
         }
     }
-    Rounded::Missing
+    Search::Missing
 }
 
 fn text(out: &Output) -> String {
@@ -814,5 +989,189 @@ fn cross_tag(status: CrossCheck) -> &'static str {
         CrossCheck::Match => "pass",
         CrossCheck::Mismatch | CrossCheck::Damaged => "FAIL",
         CrossCheck::Skipped => "skip",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `.vec`'s int8 bytes for byte codes, and back.
+    fn flip(b: u8) -> u8 {
+        byte_code(i8::from_ne_bytes([b]))
+    }
+
+    fn codes_of(values: &[u8]) -> Vec<u8> {
+        values.iter().map(|&v| flip(v)).collect()
+    }
+
+    #[test]
+    fn byte_search_tries_the_offset_after_a_false_hit() {
+        // Values that repeat every 8 bytes until a last one that breaks
+        // the pattern, placed one period into a .vec that starts with one
+        // period of the pattern: at offset 0 the head matches and the tail
+        // does not, and the true start, 8, lies inside that false hit.
+        let period = 8;
+        let mut values: Vec<u8> = (0..6000_usize)
+            .map(|i| u8::try_from(i % period).unwrap())
+            .collect();
+        *values.last_mut().unwrap() = 100;
+        let codes = codes_of(&values);
+        let mut vec = values[..period].to_vec();
+        vec.extend_from_slice(&values);
+        let all = 0..vec.len();
+        assert_eq!(find_bytes(&vec, all, &codes, flip), Search::Found(period));
+
+        // The same values elsewhere, and not at all.
+        let mut vec = vec![0_u8; 1000];
+        vec.extend_from_slice(&values);
+        vec.extend_from_slice(&[0; 16]);
+        let all = 0..vec.len();
+        assert_eq!(
+            find_bytes(&vec, all.clone(), &codes, flip),
+            Search::Found(1000)
+        );
+        vec[1000 + 5000] ^= 1;
+        assert_eq!(find_bytes(&vec, all.clone(), &codes, flip), Search::Missing);
+        assert_eq!(
+            find_bytes(&values[..100], 0..100, &codes, flip),
+            Search::Missing
+        );
+        assert_eq!(find_bytes(&vec, all, &[], flip), Search::Missing);
+
+        // A zero-filled region against codes that start with a head's
+        // worth of one value: a hit at every offset, each costing a head
+        // compare, so the search gives up rather than take thousands of
+        // passes over the file.
+        let zeros = vec![0_u8; 1 << 16];
+        let mut run = vec![flip(0); HEAD];
+        run.extend_from_slice(&[1, 2, 3, 4]);
+        assert_eq!(
+            find_bytes(&zeros, 0..zeros.len(), &run, flip),
+            Search::GaveUp
+        );
+    }
+
+    #[test]
+    fn searches_accept_only_offsets_lucene_can_write() {
+        // An 89-byte header, 3 bytes of padding, data at 92, and a footer
+        // that starts with zeros, as Lucene lays out a byte field's .vec.
+        // The data is one int8 vector [0, 5, 6, 7]; the native codes say
+        // [0, 0, 0, 0].
+        let mut vec = vec![b'h'; 89];
+        vec.extend_from_slice(&[0; 3]);
+        vec.extend_from_slice(&[0, 5, 6, 7]);
+        let footer = vec.len();
+        vec.extend_from_slice(&[0; 16]);
+        let region = 89..footer;
+        let zeros = codes_of(&[0; 4]);
+        // Searched whole at every offset, as before, [0, 0, 0, 0] is found
+        // in the padding and the data's first byte, a false match.
+        assert_eq!(memchr::memmem::find(&vec, &[0; 4]), Some(89));
+        // At 89 it is unaligned, and the footer is outside the region.
+        assert_eq!(
+            find_bytes(&vec, region.clone(), &zeros, flip),
+            Search::Missing
+        );
+        // The vector the .vec does hold is found where Lucene put it, and
+        // so are codes shorter than the head.
+        let held = codes_of(&[0, 5, 6, 7]);
+        assert_eq!(
+            find_bytes(&vec, region.clone(), &held, flip),
+            Search::Found(92)
+        );
+        assert_eq!(
+            find_bytes(&vec, region.clone(), &held[..2], flip),
+            Search::Found(92)
+        );
+        // [5, 6, 7, 0] lies at 93, unaligned, and runs into the footer.
+        assert_eq!(
+            find_bytes(&vec, region, &codes_of(&[5, 6, 7, 0]), flip),
+            Search::Missing
+        );
+    }
+
+    /// A float32 field's .vec as Lucene 10.5.1 lays it out: an 89-byte
+    /// header, 39 bytes of zero padding, the data at 128, and a footer.
+    fn float_vec(data: &[u8]) -> (Vec<u8>, Range<usize>) {
+        let mut vec = vec![b'h'; 89];
+        vec.extend_from_slice(&[0; 39]);
+        vec.extend_from_slice(data);
+        let end = vec.len();
+        vec.extend_from_slice(&[0; 16]);
+        (vec, 89..end)
+    }
+
+    #[test]
+    fn mostly_zero_stores_are_found_behind_the_padding() {
+        // Zero vectors but one value, at the end, which the tail compare
+        // catches at once, or far enough before the tail that no false
+        // start's shift (4 to 36 bytes) carries it into the tail compare:
+        // then every aligned offset in the padding matches nearly the
+        // whole store, and the true start, 128, is still reached.
+        for (vectors, d) in [(500_usize, 16_usize), (500, 128), (10_000, 16)] {
+            let len = vectors * d * 4;
+            for at in [len - 4, len - HEAD - 132] {
+                let mut stored = vec![0_u8; len];
+                stored[at..at + 4].copy_from_slice(&1.0_f32.to_le_bytes());
+                let (vec, region) = float_vec(&stored);
+                assert_eq!(
+                    find_bytes(&vec, region, &stored, |b| b),
+                    Search::Found(128),
+                    "{vectors}x{d}, one at {at}"
+                );
+            }
+        }
+
+        // The same for fp16 codes against the float32 values they were
+        // rounded from: zero codes but one 1.0, last or far enough before
+        // the last 1,024 values, the rounded search's tail compare.
+        let components = 10_000 * 16;
+        for at in [components - 1, components - HEAD / 4 - 33] {
+            let mut codes = vec![U16::new(0); components];
+            codes[at] = U16::new(0x3c00);
+            let mut floats = vec![0_u8; components * 4];
+            floats[at * 4..at * 4 + 4].copy_from_slice(&1.0_f32.to_le_bytes());
+            let (vec, region) = float_vec(&floats);
+            assert_eq!(
+                find_rounded(&vec, region, &codes, CodeFormat::Fp16),
+                Search::Found(128),
+                "fp16, one at {at}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_data_region_is_between_header_and_footer() {
+        let real = Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            "../../fixtures/opensearch-3.9.0-byte/byte/l2/_2_NativeEngines990KnnVectorsFormat_0.vec",
+        );
+        let vec = fs::read(real).unwrap();
+        assert_eq!(data_region(&vec), 89..vec.len() - 16);
+        // Without an envelope, the whole file.
+        assert_eq!(data_region(&[1, 2, 3]), 0..3);
+    }
+
+    #[test]
+    fn rounded_search_stays_in_the_region() {
+        // Two float32 words that round to the fp16 code of 1.0: one at 0,
+        // before the region, and one at 8, inside it.
+        let one = 1.0_f32.to_le_bytes();
+        let mut vec = one.to_vec();
+        vec.extend_from_slice(&[0; 4]);
+        vec.extend_from_slice(&one);
+        let codes = [U16::new(0x3c00)];
+        assert_eq!(
+            find_rounded(&vec, 0..vec.len(), &codes, CodeFormat::Fp16),
+            Search::Found(0)
+        );
+        assert_eq!(
+            find_rounded(&vec, 1..vec.len(), &codes, CodeFormat::Fp16),
+            Search::Found(8)
+        );
+        assert_eq!(
+            find_rounded(&vec, 1..8, &codes, CodeFormat::Fp16),
+            Search::Missing
+        );
     }
 }

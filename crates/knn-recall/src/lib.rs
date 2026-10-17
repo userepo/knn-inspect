@@ -2,11 +2,11 @@
 //!
 //! [`ground_truth`] finds, for every query, how far away its k-th nearest
 //! stored vector is, by exhaustive search in parallel over the queries.
-//! Storage is float32, or fp16 or bf16 decoded exactly to float32 as
-//! Faiss decodes it. [`score`] then counts, per query, how many labels of
-//! an externally produced result list are at least that close. A tie with
-//! the k-th neighbor counts, so a result list that is exactly right scores
-//! 1.0 even when the top k is not unique.
+//! Storage is float32, or fp16, bf16, or byte codes decoded exactly to
+//! float32 as Faiss decodes them. [`score`] then counts, per query, how
+//! many labels of an externally produced result list are at least that
+//! close. A tie with the k-th neighbor counts, so a result list that is
+//! exactly right scores 1.0 even when the top k is not unique.
 //!
 //! Result lists carry the file's own labels (the ID map's) unless the
 //! caller supplies [`Labels`] built from ids of its own, such as the
@@ -15,13 +15,22 @@
 //! Faiss's; [`sample_queries`] draws queries from the file's vectors.
 //!
 //! Distances are float32 sums in element order. That is how Faiss's
-//! portable scalar-quantizer code computes fp16 and bf16 distances; its
+//! portable scalar-quantizer code computes scalar-quantized distances; its
 //! float32 code, and its SIMD builds' scalar-quantizer code, regroup the
 //! sums, so two neighbors a last bit apart can order differently here
 //! than in Faiss. Faiss from `c000190` on (1.14.3), running its
 //! `AVX512_SPR` code, also rounds the query to bf16 for bf16 distances;
 //! this crate, like `5616caa`, the Faiss that k-NN 3.9.0 builds, keeps it
 //! float32.
+//!
+//! Exact distance ties are broken as `5616caa` breaks them, toward the
+//! lower node: that Faiss searches an inner-product index over negated
+//! distances with the same max-heaps it uses for L2. Faiss 1.15.1 searches
+//! it with min-heaps over the similarities instead, which break ties
+//! toward the higher node in the candidate queue and the results alike,
+//! so a tie can change which results it returns, not only their order.
+//! Both break L2 ties alike. Exact ties are rare with float data and
+//! happen with byte vectors and integer queries.
 
 mod hnsw;
 
@@ -31,7 +40,7 @@ use std::sync::LazyLock;
 
 pub use hnsw::{Hit, Searcher, result_labels, search_all};
 
-use knn_format::faiss::{CodeFormat, Metric, Storage, bf16_to_f32, f16_to_f32};
+use knn_format::faiss::{CodeFormat, Metric, Storage, bf16_to_f32, byte_to_f32, f16_to_f32};
 use knn_format::{F32, I64, U16};
 use rayon::prelude::*;
 use serde::Serialize;
@@ -250,7 +259,7 @@ impl Labels {
 }
 
 /// `count` distinct rows of `storage` as queries, chosen by a fixed
-/// generator from `seed`, with the rows they came from; fp16 and bf16
+/// generator from `seed`, with the rows they came from; scalar-quantized
 /// rows are decoded. The same seed and file give the same queries on every
 /// platform.
 ///
@@ -363,6 +372,16 @@ impl Decode for Bf16 {
     }
 }
 
+/// Byte codes, their 128 taken back.
+struct Byte;
+
+impl Decode for Byte {
+    type Code = u8;
+    fn value(code: u8) -> f32 {
+        byte_to_f32(code)
+    }
+}
+
 /// Every half float decoded, indexed by its bits. Brute force decodes each
 /// stored component once per query, and a lookup is cheaper than the bit
 /// work in [`f16_to_f32`]: about 1.75 times faster over a whole file.
@@ -400,6 +419,7 @@ enum Codes<'a> {
     F32(&'a [F32]),
     Fp16(&'a [U16]),
     Bf16(&'a [U16]),
+    Byte(&'a [u8]),
 }
 
 impl<'a> Vectors<'a> {
@@ -413,8 +433,9 @@ impl<'a> Vectors<'a> {
         let codes = match storage {
             Storage::Flat(s) => Codes::F32(s.codes),
             Storage::Sq(s) => match s.format {
-                CodeFormat::Fp16 => Codes::Fp16(s.components()),
-                CodeFormat::Bf16 => Codes::Bf16(s.components()),
+                CodeFormat::Fp16 => Codes::Fp16(s.halves()),
+                CodeFormat::Bf16 => Codes::Bf16(s.halves()),
+                CodeFormat::Byte => Codes::Byte(s.codes),
             },
         };
         Ok(Self { d, codes })
@@ -425,6 +446,7 @@ impl<'a> Vectors<'a> {
         match self.codes {
             Codes::F32(c) => c.len() / self.d,
             Codes::Fp16(c) | Codes::Bf16(c) => c.len() / self.d,
+            Codes::Byte(c) => c.len() / self.d,
         }
     }
 
@@ -437,6 +459,7 @@ impl<'a> Vectors<'a> {
             Codes::F32(c) => distance.between::<Float32>(c.get(range)?, q),
             Codes::Fp16(c) => distance.between::<Fp16>(c.get(range)?, q),
             Codes::Bf16(c) => distance.between::<Bf16>(c.get(range)?, q),
+            Codes::Byte(c) => distance.between::<Byte>(c.get(range)?, q),
         })
     }
 
@@ -454,6 +477,7 @@ impl<'a> Vectors<'a> {
             Codes::F32(c) => out.extend(decoded::<Float32>(c.get(range))),
             Codes::Fp16(c) => out.extend(decoded::<Fp16>(c.get(range))),
             Codes::Bf16(c) => out.extend(decoded::<Bf16>(c.get(range))),
+            Codes::Byte(c) => out.extend(decoded::<Byte>(c.get(range))),
         }
     }
 }
@@ -555,6 +579,7 @@ pub fn ground_truth(storage: &Storage<'_>, queries: &Queries, k: usize) -> Resul
             Codes::F32(c) => nearest::<Float32>(c, vectors.d, distance, q, k),
             Codes::Fp16(c) => nearest::<Fp16>(c, vectors.d, distance, q, k),
             Codes::Bf16(c) => nearest::<Bf16>(c, vectors.d, distance, q, k),
+            Codes::Byte(c) => nearest::<Byte>(c, vectors.d, distance, q, k),
         })
         .collect();
     Ok(GroundTruth {

@@ -14,7 +14,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use knn_format::faiss::{FlatStorage, FourCc, HnswGraph, HnswIndex, IndexHeader, Storage};
+use knn_format::faiss::{FlatStorage, FourCc, HnswGraph, HnswIndex, IndexHeader, Metric, Storage};
 use knn_format::{F32, F64, I32, U64};
 use knn_recall::{
     Error, Labels, Queries, Searcher, ground_truth, result_labels, score, search_all,
@@ -38,7 +38,12 @@ struct Baseline {
 
 fn baselines() -> Vec<PathBuf> {
     let mut out = Vec::new();
-    for synthetic in ["synthetic", "synthetic-fp16", "synthetic-bf16"] {
+    for synthetic in [
+        "synthetic",
+        "synthetic-fp16",
+        "synthetic-bf16",
+        "synthetic-byte",
+    ] {
         for entry in fs::read_dir(fixtures().join(synthetic)).unwrap() {
             let p = entry.unwrap().path();
             if p.to_string_lossy().ends_with(".recall.json") {
@@ -52,6 +57,7 @@ fn baselines() -> Vec<PathBuf> {
         "opensearch-3.9.0-fp16/sq-fp16",
         "opensearch-3.9.0-fp16/half-float",
         "opensearch-3.9.0-bf16/sq-bf16",
+        "opensearch-3.9.0-byte/byte",
     ] {
         for entry in fs::read_dir(fixtures().join(set)).unwrap() {
             out.push(entry.unwrap().path().join("recall.json"));
@@ -78,6 +84,7 @@ fn own_search_matches_faiss() {
     let mut seen = 0;
     let mut lists = 0;
     let mut identical = 0;
+    let mut inner_product_differences = 0;
     for baseline in baselines() {
         let dir = baseline.parent().unwrap();
         let b: Baseline = serde_json::from_slice(&fs::read(&baseline).unwrap()).unwrap();
@@ -116,24 +123,46 @@ fn own_search_matches_faiss() {
         );
         assert_eq!(r.missing, 0, "{}: every list is full", b.file);
 
+        let inner_product = index.index.storage.header().metric() == Metric::InnerProduct;
         for (ours, theirs) in own.iter().zip(&faiss) {
             lists += 1;
             if ours == theirs {
                 identical += 1;
+                continue;
             }
+            // Only an inner-product list may differ: see below.
+            assert!(
+                inner_product,
+                "{}: an L2 list differs from Faiss's: {ours:?} vs {theirs:?}",
+                b.file
+            );
+            inner_product_differences += 1;
         }
         seen += 1;
     }
-    assert_eq!(seen, 26, "11 synthetic and 15 real baselines");
-    // The search follows Faiss step for step, and on these fixtures every
-    // list comes out identical, fp16 and bf16 ones included. A last-bit
-    // difference in a distance sum (this crate sums in order; Faiss's
-    // float32 code and its SIMD builds' scalar-quantizer code regroup)
-    // could legitimately change a list on other data; here, a mismatch
-    // means a changed search, so the check is exact.
+    assert_eq!(seen, 32, "15 synthetic and 17 real baselines");
+    // The search follows Faiss step for step. Every L2 list comes out
+    // identical to the ones faiss-cpu 1.15.1 wrote, fp16, bf16, and byte
+    // ones included, and so do the nearly all-tied lists of the byte ties
+    // case, which pin how the search breaks exact distance ties: reversing
+    // both of its node-id tie-breaks, the candidate queue's and the result
+    // heap's, changes 103 of the L2 lists. A last-bit difference in a
+    // distance sum (this crate sums in order; Faiss's float32 code and its
+    // SIMD builds' scalar-quantizer code regroup) could legitimately change
+    // a list on other data; here, any mismatch means a changed search, so
+    // the check is exact.
+    //
+    // In an inner-product index, 1.15.1 breaks exact ties by node id the
+    // other way from `5616caa`, the Faiss that k-NN 3.9.0 builds and this
+    // crate follows, in the candidate queue as well as the results. With
+    // integer byte vectors and queries some ties fall where that changes a
+    // list: its order, which tied node fills the last place, or where the
+    // traversal goes. With both tie-breaks reversed to 1.15.1's, every
+    // inner-product list here comes out identical to Faiss's, so these
+    // differences are the tie rule and nothing else.
     assert_eq!(
-        identical, lists,
-        "{identical} of {lists} result lists identical to Faiss's"
+        inner_product_differences, 3,
+        "{identical} of {lists} identical"
     );
 }
 
@@ -467,6 +496,7 @@ fn scalar_quantized_samples_are_the_decoded_rows() {
     for file in [
         "synthetic-fp16/l2-1000x32-fp16.faiss",
         "synthetic-bf16/l2-1000x32-bf16.faiss",
+        "synthetic-byte/l2-1000x32-byte.faiss",
     ] {
         let bytes = fs::read(fixtures().join(file)).unwrap();
         let parsed = knn_format::parse(&bytes).unwrap();
@@ -479,12 +509,7 @@ fn scalar_quantized_samples_are_the_decoded_rows() {
         // rows as from the float file of the same shape.
         assert_eq!(&rows[..8], &[487, 727, 212, 720, 842, 285, 158, 580]);
         for (q, &row) in q.rows().zip(&rows) {
-            let v: Vec<f32> = sq
-                .vector(row)
-                .unwrap()
-                .iter()
-                .map(|h| sq.format.decode(h.get()))
-                .collect();
+            let v: Vec<f32> = sq.decoded(row).unwrap().collect();
             assert_eq!(q, &v[..], "{file}");
         }
     }

@@ -1,6 +1,6 @@
-# Every push and pull request: format and lints on Linux, the test suite
-# on Linux and Windows, and the dependency policy. The toolchain comes
-# from rust-toolchain.toml.
+# Every push and pull request: format and lints on Linux (the fuzz target
+# included), the test suite on Linux and Windows, and the dependency
+# policy. The toolchain comes from rust-toolchain.toml.
 name: CI
 
 on:
@@ -31,6 +31,11 @@ jobs:
       - name: Clippy
         if: runner.os == 'Linux'
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # The fuzz crate is outside the workspace, so the steps above never
+      # build it; running it needs nightly, but compiling it does not.
+      - name: Clippy (fuzz target)
+        if: runner.os == 'Linux'
+        run: cargo clippy --manifest-path fuzz/Cargo.toml --locked -- -D warnings
       - name: Test
         run: cargo test --workspace --locked
 

@@ -19,11 +19,11 @@ map's values, which k-NN sets to Lucene doc ids.
 | `envelope.footer` | object, nullable | Lucene footer: `offset`, `algorithm`, `checksum` (hex string), `verified` (whether the CRC32 matches) |
 | `payload.offset`, `payload.length` | integer | Where the Faiss payload lies |
 | `payload.trailing_bytes` | integer | Bytes between the end of the index and the footer; 0 in a well-formed file |
-| `layout` | array of strings | The Faiss fourccs, outermost first: `IxMp`, then `IHNf` and `IxF2` or `IxFI` (float32 storage), or `IHNs` and `IxSQ` (fp16 or bf16 storage) |
+| `layout` | array of strings | The Faiss fourccs, outermost first: `IxMp`, then `IHNf` and `IxF2` or `IxFI` (float32 storage), or `IHNs` and `IxSQ` (fp16, bf16, or byte storage) |
 | `dimension` | integer | Vector dimension |
 | `count` | integer | Vector count from the ID map's header |
 | `metric` | string | `l2` or `inner_product` as the file records it; a cosine field reads `inner_product` |
-| `quantizer` | object, optional | For fp16 or bf16 storage, the scalar quantizer as stored: `qtype` (4 or 7), `name` (`QT_fp16` or `QT_bf16`), `dimension`, `code_size` (bytes per vector), `trained` (number of trained values; neither format uses any). Since 0.4.0; bf16 since 0.5.0 |
+| `quantizer` | object, optional | For scalar-quantized storage, the quantizer as stored: `qtype` (4, 7, or 8), `name` (`QT_fp16`, `QT_bf16`, or `QT_8bit_direct_signed`), `dimension`, `code_size` (bytes per vector: twice the dimension for fp16 and bf16, the dimension for byte), `trained` (number of trained values; none of the three formats uses any). Since 0.4.0; bf16 since 0.5.0; byte since 0.6.0 |
 | `hnsw.m` | integer, nullable | Neighbor slots per node on the upper levels; `null` if the level table is too short to say |
 | `hnsw.ef_construction`, `hnsw.ef_search` | integer | As stored |
 | `hnsw.max_level`, `hnsw.entry_point` | integer | As stored; `-1` for an empty graph |
@@ -139,15 +139,20 @@ fails the file.
   hold the same vectors in the same order. For fp16 or bf16 storage it
   also looks for float32 values that round to the stored codes, which is
   what the `.vec` of k-NN's `sq` encoder holds (the `.vec` of a
-  `half_float` field holds the codes byte for byte); `detail` says which
-  way they were found. When the vectors are found in a `.vec` that is
-  damaged, `offset` still says where. It is skipped when no loose `.vec`
-  lies beside the native file, as in a compound segment, where the `.vec`
-  is inside the `.cfs`, or when the float32 values of a sound `.vec`
-  repeat too much to search for the codes' sources in bounded time (since
-  0.4.0, the first version to read fp16 files). Before 0.3.0, a `.vec`
-  that could not be opened was reported as `mismatch`, and a failing
-  checksum was only mentioned in `detail`.
+  `half_float` field holds the codes byte for byte); for byte storage it
+  looks only for the int8 values the codes are 128 above, which is what
+  a byte field's `.vec` holds (since 0.6.0). `detail` says which way
+  they were found. Since 0.6.0 it looks only where Lucene can put vector
+  data: at a multiple of 4 bytes, between the `.vec`'s header and
+  footer. When the vectors are found in a `.vec` that is damaged,
+  `offset` still says where. It is skipped when no loose `.vec` lies
+  beside the native file, as in a compound segment, where the `.vec` is
+  inside the `.cfs`, or when the values of a sound `.vec` repeat too
+  much to search for the stored vectors in bounded time (since 0.4.0
+  for fp16 and 0.5.0 for bf16, the first versions to read them, and
+  since 0.6.0 for every storage). Before 0.3.0, a `.vec` that could not
+  be opened was reported as `mismatch`, and a failing checksum was only
+  mentioned in `detail`.
 - `lucene_docs` reads the document count from the segment's `.si` and
   checks that every label in the ID map, which k-NN sets to a doc id,
   lies in `0..doc_count`, with no more labels than documents. The `.si`

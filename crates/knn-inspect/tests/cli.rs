@@ -1311,9 +1311,9 @@ fn scan_reads_fp16_segments() {
     }
 }
 
-/// A copy of a real fp16 or bf16 segment's native file and `.vec`, with
-/// the offset of the native codes. The `.vec`'s vector data starts at 128
-/// in these fixtures.
+/// A copy of a real fp16, bf16, or byte segment's native file and `.vec`,
+/// with the offset of the native codes. The `.vec`'s vector data starts
+/// at 128 in these fixtures, except a byte field's, which starts at 92.
 struct SqSegment {
     scratch: Scratch,
     native: Vec<u8>,
@@ -1324,10 +1324,10 @@ struct SqSegment {
 
 impl SqSegment {
     fn new(name: &str, encoding: &str) -> Self {
-        let set = if encoding == "sq-bf16" {
-            "opensearch-3.9.0-bf16"
-        } else {
-            "opensearch-3.9.0-fp16"
+        let set = match encoding {
+            "sq-bf16" => "opensearch-3.9.0-bf16",
+            "byte" => "opensearch-3.9.0-byte",
+            _ => "opensearch-3.9.0-fp16",
         };
         let dir = fixtures().join(set).join(encoding).join("l2");
         let native = std::fs::read(dir.join("_2_165_vec.faiss")).unwrap();
@@ -1537,6 +1537,132 @@ fn bf16_files_are_read() {
             "{f}"
         );
     }
+}
+
+#[test]
+fn byte_files_are_read() {
+    let dir = fixtures().join("opensearch-3.9.0-byte/byte");
+    let real = dir.join("l2/_2_165_vec.faiss");
+    let path = real.to_str().unwrap();
+    let o = run(&["info", path]);
+    assert_eq!(o.status.code(), Some(0));
+    let text = stdout(&o);
+    assert!(text.contains("IxMp > IHNs > IxSQ"), "{text}");
+    assert!(
+        text.contains(
+            "quantizer       QT_8bit_direct_signed (type 8), dimension 16, code size 16, trained values 0"
+        ),
+        "{text}"
+    );
+    let o = run(&["info", "--json", path]);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(
+        v["quantizer"],
+        serde_json::json!({"qtype": 8, "name": "QT_8bit_direct_signed", "dimension": 16, "code_size": 16, "trained": 0})
+    );
+
+    let o = run(&["verify", path, "--space", "l2"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+    let text = stdout(&o);
+    assert!(text.contains("skip  vector_values"), "{text}");
+    assert!(text.contains("every byte code is a finite value"), "{text}");
+    let o = run(&["stats", path]);
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+
+    // k-NN refuses cosinesimil for byte fields: checked as one, the
+    // inner-product file warns and skips the norms check.
+    let ip = dir.join("innerproduct/_2_165_vec.faiss");
+    let o = run(&["verify", ip.to_str().unwrap(), "--space", "cosinesimil"]);
+    assert_eq!(o.status.code(), Some(2), "{}", stdout(&o));
+    let text = stdout(&o);
+    assert!(text.contains("WARN  metric"), "{text}");
+    assert!(
+        text.contains("refuses cosinesimil for byte fields"),
+        "{text}"
+    );
+    assert!(text.contains("skip  norms"), "{text}");
+    assert!(text.contains("byte vectors are never normalized"), "{text}");
+
+    // The tool's own search over byte codes reproduces Faiss's recall.
+    let synthetic = fixtures().join("synthetic-byte");
+    let file = synthetic.join("l2-1000x32-byte.faiss");
+    let queries = synthetic.join("l2-1000x32-byte.queries.f32");
+    let o = run(&[
+        "recall",
+        file.to_str().unwrap(),
+        "--queries",
+        queries.to_str().unwrap(),
+        "--json",
+    ]);
+    assert_eq!(o.status.code(), Some(0));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["recall"], 0.902);
+
+    // scan finds every segment's int8 values in its .vec at 92, the first
+    // multiple of 4 after the 89-byte header, where Lucene starts byte
+    // data (float32 data starts at the first multiple of 64, 128).
+    let o = run(&["scan", dir.to_str().unwrap(), "--json"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(
+        v["summary"],
+        serde_json::json!({"files": 2, "clean": 2, "warnings": 0, "failed": 0})
+    );
+    for f in v["files"].as_array().unwrap() {
+        let lv = &f["lucene_vectors"];
+        assert_eq!(lv["status"], "match", "{f}");
+        assert_eq!(lv["offset"], 92, "{f}");
+        assert_eq!(
+            lv["detail"],
+            "500 vectors found as int8 values 128 below the stored codes at offset 92",
+            "{f}"
+        );
+    }
+}
+
+#[test]
+fn scan_flags_byte_values_that_differ_from_the_lucene_copy() {
+    let mut seg = SqSegment::new("byte-flip", "byte");
+    let data = 92;
+    assert_eq!(seg.scan()["status"], "match");
+
+    // One value changed by one: the int8 values are at no offset.
+    seg.vec[data + 1000] = seg.vec[data + 1000].wrapping_add(1);
+    reseal(&mut seg.vec);
+    let lv = seg.scan();
+    assert_eq!(lv["status"], "mismatch", "{lv}");
+    assert!(
+        lv["detail"]
+            .as_str()
+            .unwrap()
+            .starts_with("the stored vectors appear in none of the segment's .vec files"),
+        "{lv}"
+    );
+
+    // Native codes shifted by 1 to 3 bytes, a zero value pushed in front:
+    // the .vec holds the shifted values in its 3 bytes of zero padding and
+    // its data, at 89 to 91. Lucene never starts data there, so all three
+    // are mismatches.
+    for shift in 1..=3 {
+        let mut seg = SqSegment::new("byte-shift", "byte");
+        let codes = seg.codes..seg.codes + 500 * 16;
+        let shifted: Vec<u8> = std::iter::repeat_n(0x80, shift)
+            .chain(seg.native[codes.clone()].iter().copied())
+            .take(500 * 16)
+            .collect();
+        seg.native[codes].copy_from_slice(&shifted);
+        let lv = seg.scan();
+        assert_eq!(lv["status"], "mismatch", "shift {shift}: {lv}");
+    }
+
+    // A .vec holding the codes themselves has every value 128 off; it is
+    // not taken for a byte-for-byte match.
+    let mut seg = SqSegment::new("byte-codes", "byte");
+    for b in &mut seg.vec[data..data + 500 * 16] {
+        *b ^= 0x80;
+    }
+    reseal(&mut seg.vec);
+    assert_eq!(seg.scan()["status"], "mismatch");
 }
 
 #[test]

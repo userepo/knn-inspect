@@ -24,6 +24,10 @@ const FP16_UNIT_NORM_TOLERANCE: f64 = 1e-3;
 /// stored length is within about 3.9e-3 of 1.
 const BF16_UNIT_NORM_TOLERANCE: f64 = 8e-3;
 
+/// Why byte storage cannot belong to a cosine field.
+const BYTE_COSINE: &str =
+    "k-NN's Faiss engine refuses cosinesimil for byte fields, since it cannot normalize bytes";
+
 /// Runs every check over `bytes`.
 #[must_use]
 pub fn verify(bytes: &[u8], options: &Options) -> Report {
@@ -198,8 +202,8 @@ fn check_headers(col: &mut Collector, bytes: &[u8], idx: &IdMapIndex<'_>) {
     }
 }
 
-/// The fp16 or bf16 quantizer's own fields: its dimension and code size
-/// must match the index, and it has nothing to train.
+/// The quantizer's own fields: its dimension and code size must match the
+/// index and the format's component size, and it has nothing to train.
 fn check_quantizer(col: &mut Collector, bytes: &[u8], storage: &SqStorage<'_>, d: i32) {
     let q = &storage.quantizer;
     // qtype, rangestat, and rangestat_arg take 4 bytes each.
@@ -213,13 +217,18 @@ fn check_quantizer(col: &mut Collector, bytes: &[u8], storage: &SqStorage<'_>, d
             None,
         );
     }
-    let expected = u64::try_from(d).ok().and_then(|d| d.checked_mul(2));
+    let size = storage.format.component_size();
+    let expected = u64::try_from(d)
+        .ok()
+        .zip(u64::try_from(size).ok())
+        .and_then(|(d, size)| d.checked_mul(size));
     if expected != Some(q.code_size) {
         col.fail(
             Check::Headers,
             format!(
-                "quantizer code size {} is not 2 bytes per component; dimension {d} needs {}",
+                "quantizer code size {} is not {size} byte{} per component; dimension {d} needs {}",
                 q.code_size,
+                if size == 1 { "" } else { "s" },
                 expected.map_or_else(|| "none".to_owned(), |e| e.to_string())
             ),
             code_size_at,
@@ -251,16 +260,35 @@ fn check_metric(col: &mut Collector, idx: &IdMapIndex<'_>, space: Option<Space>)
         Space::L2 => Metric::L2,
         Space::InnerProduct | Space::Cosine => Metric::InnerProduct,
     };
+    // Faiss has no cosine metric; k-NN serves cosinesimil as inner product
+    // over normalized vectors, cannot normalize bytes, and refuses the
+    // space for byte fields when the mapping is created.
+    let byte_cosine = match &idx.index.storage {
+        Storage::Sq(s) if space == Space::Cosine && s.format == CodeFormat::Byte => {
+            Some(s.quantizer.offset)
+        }
+        _ => None,
+    };
     if metric != wanted {
+        // One finding, so text output, which shows a check's first, keeps
+        // the byte note with the failure.
+        let note = byte_cosine.map_or(String::new(), |_| format!("; {BYTE_COSINE}"));
         col.fail(
             Check::Metric,
             format!(
-                "file records metric {}, but a {} field needs {}",
+                "file records metric {}, but a {} field needs {}{note}",
                 metric.name(),
                 space.name(),
                 wanted.name()
             ),
             Some(idx.index.storage.header().offset),
+            None,
+        );
+    } else if let Some(at) = byte_cosine {
+        col.warn(
+            Check::Metric,
+            format!("byte storage in a cosine field: {BYTE_COSINE}"),
+            Some(at),
             None,
         );
     }
@@ -524,13 +552,18 @@ fn node_of_slot(graph: &HnswGraph<'_>, slot: usize) -> Option<usize> {
 fn check_vector_count(col: &mut Collector, idx: &IdMapIndex<'_>) {
     let storage = &idx.index.storage;
     // Counted as the file counts them: float32 elements, or bytes of
-    // two-byte codes.
+    // codes.
     let (held, per_component, unit) = match storage {
         Storage::Flat(s) => (s.codes.len(), 1, "floats".to_owned()),
         Storage::Sq(s) => (
             s.codes.len(),
-            2,
-            format!("bytes of {} codes", s.format.name()),
+            s.format.component_size(),
+            match s.format {
+                CodeFormat::Byte => "byte codes".to_owned(),
+                CodeFormat::Fp16 | CodeFormat::Bf16 => {
+                    format!("bytes of {} codes", s.format.name())
+                }
+            },
         ),
     };
     let expected = usize::try_from(idx.header.ntotal)
@@ -571,6 +604,12 @@ fn check_id_map_length(col: &mut Collector, bytes: &[u8], idx: &IdMapIndex<'_>) 
 
 fn check_vector_values(col: &mut Collector, bytes: &[u8], idx: &IdMapIndex<'_>) {
     let storage = &idx.index.storage;
+    if let Storage::Sq(s) = storage
+        && s.format == CodeFormat::Byte
+    {
+        col.skip(Check::VectorValues, "every byte code is a finite value");
+        return;
+    }
     // Vectors numbered as the storage counts them, as in the norms check.
     let d = usize::try_from(storage.header().d).unwrap_or(0).max(1);
     let size = storage.component_size();
@@ -659,6 +698,16 @@ fn check_norms(col: &mut Collector, bytes: &[u8], idx: &IdMapIndex<'_>, space: O
         Storage::Sq(s) => match s.format {
             CodeFormat::Fp16 => FP16_UNIT_NORM_TOLERANCE,
             CodeFormat::Bf16 => BF16_UNIT_NORM_TOLERANCE,
+            // k-NN cannot normalize byte vectors, so no byte field is a
+            // cosine field and no byte vector has to be a unit vector;
+            // the metric check reports the space instead.
+            CodeFormat::Byte => {
+                col.skip(
+                    Check::Norms,
+                    "byte vectors are never normalized: k-NN refuses cosinesimil for byte fields",
+                );
+                return;
+            }
         },
     };
     // Rows as the storage counts them, by its own header's dimension.

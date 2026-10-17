@@ -166,8 +166,8 @@ walker's dimension, count, metric, level counts, entry point, and
 ## Scalar-quantized storage (fp16)
 
 `knn-inspect` reads these files with every command. Any quantizer type
-other than `QT_fp16` and `QT_bf16` (see the next section) is reported as
-unsupported.
+other than `QT_fp16`, `QT_bf16`, and `QT_8bit_direct_signed` (see the
+next two sections) is reported as unsupported.
 
 k-NN stores fp16 vectors through Faiss's scalar quantizer with `QT_fp16`
 in two ways: the `sq` encoder with `type: fp16` (and `bits: 16`, which
@@ -348,6 +348,117 @@ that k-NN 3.9.0 builds, at `5616caa`, has only `encode_bf16`.
 `fixtures/synthetic-bf16/`, the shapes of the fp16 ones, and asserts
 that every code is `encode_bf16` of its vector and decodes to Faiss's
 own reconstruction.
+
+## Scalar-quantized storage (byte)
+
+k-NN's `byte` data type on the Faiss engine stores vectors through
+Faiss's scalar quantizer with `QT_8bit_direct_signed`, type 8. At tag
+3.9.0.0, `AbstractFaissMethod.adjustIndexDescription` rewrites the
+storage part of the index description, `HNSW16,Flat`, to
+`HNSW16,SQ8_direct_signed`, and the JNI `ByteIndexService` casts the
+int8 vectors to float32 in batches of 1000 and adds them to the index.
+The native layout is the fp16 one above with that type and one byte per
+component: `IxMp` > `IHNs` > `IxSQ`, a `code_size` of d, no trained
+values (`ScalarQuantizer::train` has nothing to do for this type, and
+`IndexScalarQuantizer` is created trained).
+
+Before indexing, k-NN checks every component
+(`KNNValidationUtil.validateByteVectorValue`): it must be finite, have
+no fractional part, and lie in [-128, 127], or the document is rejected.
+A byte field takes the space types `l2` and `innerproduct` only. Faiss
+has no cosine metric; k-NN serves `cosinesimil` as inner product over
+normalized vectors, cannot normalize bytes, and refuses the pair when
+the mapping is created ("Faiss engine does not support cosine
+similarity with byte vectors"). A byte file is therefore never a cosine
+field: `verify --space cosine` on one warns in the metric check and
+skips the norms check, and since no byte code is NaN or infinite, the
+values check is skipped for every byte file.
+
+The encoder (`Quantizer8bitDirectSigned` in
+`faiss/impl/ScalarQuantizer.cpp` at `5616caa`) stores `x + 128` in one
+byte and decodes `code - 128`. For the integers k-NN admits this is
+exact, so, unlike fp16 and bf16, byte storage has no rounding rule and
+no build-dependent encoder: every byte is a code, and the same one in
+every build. Faiss computes a query's distance to byte codes over the
+decoded float32 values with the query kept float32
+(`DCTemplate<Quantizer8bitDirectSigned<SIMDWIDTH>>`); its portable build
+sums in component order, its SIMD builds decode 8 or 16 codes at a time
+and add the lanes at the end. The integer distance computer
+`DistanceComputerByte` exists only for the unsigned `QT_8bit_direct`.
+k-NN passes a byte query to Faiss cast to float32.
+
+Integer vectors and queries can tie exactly, which float data almost
+never does, and Faiss breaks such ties differently by version. At
+`5616caa`, `IndexHNSW::search` runs every metric through max-heaps on
+`(distance, id)` (`HNSW::C`, a `CMax`, for the results, and
+`HNSW::MinimaxHeap` over its `HC`, a `CMax` with 32-bit ids, for the
+candidate queue), negating inner products on the way in and out; among
+equal distances the heaps rank the higher node as worse, so a search
+keeps and lists the lower one. Faiss 1.15.1 searches an inner-product
+index over the similarities with min-heaps instead
+(`HNSW::C_similarity`, a `CMin`, for the results, and a `MinimaxHeapT`
+of the same order, `HC_for<C_similarity>`, for the candidate queue),
+which rank the lower node as worse. That decides more than the order in
+which tied results are listed: also which tied node takes the last
+place, and which tied candidate stays in the queue, so the search itself
+can go elsewhere. Both versions break L2 ties alike.
+`knn-inspect recall` follows `5616caa`. On the fixtures, every L2 list
+is the one faiss-cpu 1.15.1 wrote, the tie-heavy one below included, and
+three inner-product lists, all in byte files, differ; with the two tie
+rules reversed to 1.15.1's, those three come out identical too.
+
+### Synthetic byte fixtures
+
+`tools/make_synthetic.py` writes four to `fixtures/synthetic-byte/`:
+`l2-100x4-byte`, `l2-1000x32-byte`, and `ip-1000x32-byte`, the shapes
+of the fp16 ones, and `l2-1000x4-ties-byte`. Each takes the float
+case's draw scaled, rounded, and clipped to [-128, 127]. The first
+three scale by 32, and the clip changes one value in each 1000x32
+file; the `ip` case holds integer vectors, not unit ones, since a byte
+field is never a cosine field. The ties case scales by 1, so its 1,000
+vectors take 8 values per component (-4 to 3) and many repeat: nearly
+every distance ties, and 97 of its 100 baseline queries tie at the 10th
+place. It is L2, where both Faiss versions break ties alike, so its
+baselines pin how the search breaks them. The generator asserts that
+every code is its value plus 128 and decodes to Faiss's own
+reconstruction, that `code_size` is d, and that the quantizer holds no
+trained values. The files are 15,915, 184,171, 184,171, and 156,171
+bytes: one byte less per component than fp16 ones. The recall baselines
+of a byte file draw each query component from the values the file holds
+in that position, so the queries look like the data.
+
+`tools/walk_faiss.py` reads all four to the end with no trailing bytes.
+In `l2-100x4-byte.faiss`: `IHNs` at 37, `IxSQ` at 14,626, the
+quantizer's `qtype` at 14,663, the codes' byte count (400, for 100
+vectors of 4 bytes) at 14,699 and the codes at 14,707, the ID map's
+labels at 15,115, end at 15,915.
+
+### Real byte files from OpenSearch 3.9.0
+
+`tools/extract_opensearch.py --encoding byte` indexes the same 500
+16-dimensional draw as the other real fixtures, scaled by 32, rounded,
+and clipped to [-128, 127], which changes one `l2` value, -143, to -128.
+It makes one index per space type a byte field allows, `l2` and
+`innerproduct`, compound files off, into
+`fixtures/opensearch-3.9.0-byte/byte/`. Each native file is
+`_2_165_vec.faiss`, 83,947 bytes: 8,000 fewer than the fp16 ones, one
+byte saved on each of 500 x 16 components. Each walks to the end with no
+trailing bytes and a verifying footer: `IxMp` > `IHNs` > `IxSQ`, `qtype`
+8, `code_size` 16, a codes count of 8,000 bytes, `metric_type` 1 for
+`l2` and 0 for `innerproduct`. The codes are exactly the indexed values
+plus 128.
+
+Lucene's copy is `_2_NativeEngines990KnnVectorsFormat_0.vec`, codec
+`Lucene99FlatVectorsFormatData` as for float and `sq` fields, and holds
+the int8 values byte for byte, each 128 below its code, from offset 92.
+Its codec header is 89 bytes, and Lucene 10.5.1 starts a field's vector
+data at the next multiple of 4 for byte data and of 64 for float32 data
+(`alignOutput` in `Lucene99FlatVectorsWriter`), padding with zeros: 3
+bytes here, 39 before the float32 fixtures' data at 128. The file is
+92 + 8,000 + 16 (the footer) = 8,108 bytes. A check against Lucene's
+copy, such as `scan`'s, flips the top bit of every code, which is adding
+128 in two's complement, and looks for the result only where Lucene can
+put vector data: at a multiple of 4, between the header and the footer.
 
 ## Real files from OpenSearch 3.9.0
 

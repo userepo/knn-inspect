@@ -37,10 +37,10 @@ pub enum Error {
         expected: &'static str,
     },
 
-    /// A scalar quantizer type this crate does not decode: only `QT_fp16`
-    /// and `QT_bf16` are read.
+    /// A scalar quantizer type this crate does not decode: only `QT_fp16`,
+    /// `QT_bf16`, and `QT_8bit_direct_signed` are read.
     #[error(
-        "scalar quantizer type {qtype} ({}) at offset {offset} is not supported; expected 4 (QT_fp16) or 7 (QT_bf16)",
+        "scalar quantizer type {qtype} ({}) at offset {offset} is not supported; expected 4 (QT_fp16), 7 (QT_bf16), or 8 (QT_8bit_direct_signed)",
         crate::faiss::quantizer_type_name(*.qtype).unwrap_or("not a Faiss type")
     )]
     UnsupportedQuantizer {

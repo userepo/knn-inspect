@@ -1,4 +1,4 @@
-//! The parser against the scalar-quantized fixtures, fp16 and bf16
+//! The parser against the scalar-quantized fixtures, fp16, bf16, and byte
 //! (`IxMp` > `IHNs` > `IxSQ`): the synthetic ones judged by the values
 //! Faiss Python recorded beside each file, the real ones by Lucene's own
 //! copy of the same vectors.
@@ -18,8 +18,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use knn_format::faiss::{
-    CodeFormat, FourCc, HalfRounding, Metric, QT_BF16, QT_FP16, SqStorage, Storage, bf16_rounds_to,
-    bf16_to_f32, f16_to_f32, f32_to_bf16, quantizer_type_name,
+    CodeFormat, FourCc, HalfRounding, Metric, QT_8BIT_DIRECT_SIGNED, QT_BF16, QT_FP16, SqStorage,
+    Storage, bf16_rounds_to, bf16_to_f32, byte_code, byte_to_f32, f16_to_f32, f32_to_bf16,
+    quantizer_type_name,
 };
 use knn_format::{Error, NativeFile};
 use serde::Deserialize;
@@ -102,7 +103,7 @@ fn sq<'a>(storage: &'a Storage<'_>, name: &str) -> &'a SqStorage<'a> {
 
 fn synthetic_cases() -> Vec<(PathBuf, Expected)> {
     let mut cases = Vec::new();
-    for set in ["synthetic-fp16", "synthetic-bf16"] {
+    for set in ["synthetic-fp16", "synthetic-bf16", "synthetic-byte"] {
         let dir = fixtures().join(set);
         for entry in fs::read_dir(&dir).unwrap() {
             let p = entry.unwrap().path();
@@ -115,29 +116,34 @@ fn synthetic_cases() -> Vec<(PathBuf, Expected)> {
     cases.sort_by(|a, b| a.0.cmp(&b.0));
     assert_eq!(
         cases.len(),
-        6,
-        "three synthetic fixtures each, fp16 and bf16"
+        10,
+        "three synthetic fixtures each, fp16 and bf16, and four byte"
     );
     cases
 }
 
 /// One native file per space for each of the two ways k-NN stores fp16
-/// (the `sq` encoder and `half_float`) and for the `sq` encoder's bf16.
+/// (the `sq` encoder and `half_float`), for the `sq` encoder's bf16, and
+/// for the `byte` data type, which k-NN refuses cosinesimil for.
 fn real_cases() -> Vec<(PathBuf, Manifest)> {
     let mut cases = Vec::new();
-    for (set, encoding) in [
-        ("opensearch-3.9.0-fp16", "sq-fp16"),
-        ("opensearch-3.9.0-fp16", "half-float"),
-        ("opensearch-3.9.0-bf16", "sq-bf16"),
+    let every = ["l2", "innerproduct", "cosinesimil"];
+    for (set, encoding, spaces) in [
+        ("opensearch-3.9.0-fp16", "sq-fp16", &every[..]),
+        ("opensearch-3.9.0-fp16", "half-float", &every[..]),
+        ("opensearch-3.9.0-bf16", "sq-bf16", &every[..]),
+        ("opensearch-3.9.0-byte", "byte", &every[..2]),
     ] {
-        for space in ["l2", "innerproduct", "cosinesimil"] {
+        for space in spaces {
             let dir = fixtures().join(set).join(encoding).join(space);
             let manifest: Manifest =
                 serde_json::from_slice(&fs::read(dir.join("manifest.json")).unwrap()).unwrap();
             assert_eq!(manifest.encoding, encoding);
+            assert_eq!(&manifest.space_type, space);
             cases.push((dir.join("_2_165_vec.faiss"), manifest));
         }
     }
+    assert_eq!(cases.len(), 11);
     cases
 }
 
@@ -212,20 +218,31 @@ fn synthetic_fixtures_match_faiss_python() {
             e.codes.crc32,
             "{name}: codes"
         );
-        let first: Vec<f32> = storage
-            .vector(0)
-            .unwrap()
-            .iter()
-            .map(|h| storage.format.decode(h.get()))
-            .collect();
+        let first: Vec<f32> = storage.decoded(0).unwrap().collect();
         assert_eq!(first, e.codes.first_decoded, "{name}: first vector");
+        let size = storage.format.component_size();
+        assert_eq!(
+            storage.row(0).unwrap().len(),
+            size * e.dimension as usize,
+            "{name}: row bytes"
+        );
         assert_eq!(storage.row_count(), e.count as usize, "{name}");
-        assert!(storage.vector(e.count as usize).is_none(), "{name}");
+        assert!(storage.row(e.count as usize).is_none(), "{name}");
+        assert!(storage.decoded(e.count as usize).is_none(), "{name}");
+        if size == 2 {
+            assert_eq!(storage.halves().len(), e.codes.bytes / 2, "{name}");
+        } else {
+            assert_eq!(
+                storage.halves().len(),
+                0,
+                "{name}: byte storage has no halves"
+            );
+        }
 
         // The storage-agnostic accessors agree with the codes' view.
         let all = &idx.index.storage;
         assert_eq!(all.fourcc(), FourCc::SCALAR_QUANTIZER);
-        assert_eq!(all.component_size(), 2);
+        assert_eq!(all.component_size(), size);
         assert_eq!(
             all.component_count(),
             e.count as usize * e.dimension as usize
@@ -288,21 +305,22 @@ fn real_fixtures_parse_and_match_lucene() {
         assert_eq!(storage.header.metric(), expected_metric, "{name}");
         assert_eq!(idx.header.d as usize, m.dimension, "{name}");
         assert_eq!(idx.header.ntotal as usize, m.count, "{name}");
-        let (qtype, format) = if m.encoding == "sq-bf16" {
-            (QT_BF16, CodeFormat::Bf16)
-        } else {
-            (QT_FP16, CodeFormat::Fp16)
+        let (qtype, format) = match m.encoding.as_str() {
+            "sq-bf16" => (QT_BF16, CodeFormat::Bf16),
+            "byte" => (QT_8BIT_DIRECT_SIGNED, CodeFormat::Byte),
+            _ => (QT_FP16, CodeFormat::Fp16),
         };
+        let size = format.component_size();
         assert_eq!(storage.quantizer.qtype, qtype, "{name}");
         assert_eq!(storage.format, format, "{name}");
         assert_eq!(storage.quantizer.d as usize, m.dimension, "{name}");
         assert_eq!(
             storage.quantizer.code_size as usize,
-            2 * m.dimension,
+            size * m.dimension,
             "{name}"
         );
         assert!(storage.quantizer.trained.is_empty(), "{name}");
-        assert_eq!(storage.codes.len(), 2 * m.count * m.dimension, "{name}");
+        assert_eq!(storage.codes.len(), size * m.count * m.dimension, "{name}");
         assert_eq!(idx.index.graph.ef_search, 100, "{name}");
         assert_eq!(idx.index.graph.ef_construction, 100, "{name}");
         assert_eq!(idx.index.graph.m(), Some(16), "{name}");
@@ -310,12 +328,15 @@ fn real_fixtures_parse_and_match_lucene() {
         let identity: Vec<i64> = (0..m.count as i64).collect();
         assert_eq!(ids, identity, "{name}: labels are doc ids");
 
-        // Lucene's .vec of the segment holds the same vectors from offset
-        // 128: the codes themselves for half_float, and for the sq
-        // encoder the float32 vectors the codes were rounded from, by
-        // whichever of Faiss's fp16 tie rules the build used. For bf16,
-        // `5616caa`, the Faiss that k-NN 3.9.0 builds, has only the portable
-        // encoder, so these files must follow its rule exactly.
+        // Lucene's .vec of the segment holds the same vectors: the codes
+        // themselves for half_float, from offset 128; for the sq encoder
+        // the float32 vectors the codes were rounded from, from 128, by
+        // whichever of Faiss's fp16 tie rules the build used (for bf16,
+        // `5616caa`, the Faiss that k-NN 3.9.0 builds, has only the
+        // portable encoder, so these files must follow its rule exactly);
+        // and for byte the int8 values the codes are 128 above, from 92:
+        // Lucene starts byte data at the first multiple of 4 after the
+        // 89-byte header, float32 data at the first multiple of 64.
         let dir = path.parent().unwrap();
         let data = 128;
         if m.encoding == "half-float" {
@@ -326,6 +347,8 @@ fn real_fixtures_parse_and_match_lucene() {
                 storage.codes,
                 "{name}: codes are the .vec's bytes"
             );
+        } else if m.encoding == "byte" {
+            byte_vec_holds_the_values(&name, dir, storage.codes);
         } else {
             let vec = fs::read(dir.join("_2_NativeEngines990KnnVectorsFormat_0.vec")).unwrap();
             let floats = vec[data..data + 4 * m.count * m.dimension]
@@ -343,14 +366,75 @@ fn real_fixtures_parse_and_match_lucene() {
                 let rounds = match format {
                     CodeFormat::Fp16 => is_nearest_half(x, code),
                     CodeFormat::Bf16 => nearest_bf16_away(x) == code,
+                    // Checked above; a byte file never reaches this branch.
+                    CodeFormat::Byte => false,
                 };
                 assert!(
                     rounds,
                     "{name}: component {i}: {x} stored as {}",
-                    format.decode(code)
+                    format.decode(&code.to_le_bytes()).unwrap()
                 );
             }
         }
+        vectors_file_holds_the_values(&name, dir, storage, m.space_type == "cosinesimil");
+    }
+}
+
+/// The `vectors.f32` the extraction wrote beside a real file: the vectors
+/// indexed, row i for label i. Each rounds to its code, by either of
+/// Faiss's tie rules for fp16 and exactly for bf16 and byte. For a cosine
+/// field k-NN indexed them normalized, so they are only counted there.
+fn vectors_file_holds_the_values(name: &str, dir: &Path, storage: &SqStorage<'_>, cosine: bool) {
+    let bytes = fs::read(dir.join("vectors.f32")).unwrap();
+    let values: Vec<f32> = bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
+        .collect();
+    let size = storage.format.component_size();
+    assert_eq!(
+        values.len() * size,
+        storage.codes.len(),
+        "{name}: vectors.f32"
+    );
+    if cosine {
+        return;
+    }
+    for (i, (&x, code)) in values
+        .iter()
+        .zip(storage.codes.chunks_exact(size))
+        .enumerate()
+    {
+        let rounds = match (storage.format, code) {
+            (CodeFormat::Byte, &[c]) => x.to_bits() == byte_to_f32(c).to_bits(),
+            (CodeFormat::Fp16, &[lo, hi]) => is_nearest_half(x, u16::from_le_bytes([lo, hi])),
+            (CodeFormat::Bf16, &[lo, hi]) => nearest_bf16_away(x) == u16::from_le_bytes([lo, hi]),
+            _ => false,
+        };
+        assert!(rounds, "{name}: vectors.f32 component {i}: {x}");
+    }
+}
+
+/// A byte field's `.vec` holds the int8 values, each 128 below its code,
+/// from offset 92, the first multiple of 4 after its 89-byte header, and
+/// nothing else before the footer.
+fn byte_vec_holds_the_values(name: &str, dir: &Path, codes: &[u8]) {
+    let vec = fs::read(dir.join("_2_NativeEngines990KnnVectorsFormat_0.vec")).unwrap();
+    let data = 92;
+    assert_eq!(
+        vec.len(),
+        data + codes.len() + 16,
+        "{name}: header, values, footer"
+    );
+    for (i, (&value, &code)) in vec[data..].iter().zip(codes).enumerate() {
+        assert_eq!(
+            byte_code(i8::from_ne_bytes([value])),
+            code,
+            "{name}: component {i}: {} stored as {}",
+            i8::from_ne_bytes([value]),
+            byte_to_f32(code)
+        );
     }
 }
 
@@ -403,21 +487,25 @@ fn offsets_agree_with_the_walker() {
 #[test]
 fn other_quantizer_types_are_unsupported() {
     let mut bytes = small();
-    // QT_8bit_direct_signed: what k-NN writes for byte vectors.
-    bytes[QTYPE..QTYPE + 4].copy_from_slice(&8_i32.to_le_bytes());
+    // QT_8bit_direct: unsigned bytes, which k-NN never writes.
+    bytes[QTYPE..QTYPE + 4].copy_from_slice(&5_i32.to_le_bytes());
     let err = knn_format::parse(&bytes).unwrap_err();
     assert!(
         matches!(
             err,
             Error::UnsupportedQuantizer {
                 offset: QTYPE,
-                qtype: 8
+                qtype: 5
             }
         ),
         "{err:?}"
     );
-    assert!(err.to_string().contains("QT_8bit_direct_signed"), "{err}");
+    assert!(err.to_string().contains("(QT_8bit_direct)"), "{err}");
     assert!(err.to_string().contains("7 (QT_bf16)"), "{err}");
+    assert!(
+        err.to_string().contains("8 (QT_8bit_direct_signed)"),
+        "{err}"
+    );
 
     // QT_bf16 in the same place reads, as bf16 codes.
     bytes[QTYPE..QTYPE + 4].copy_from_slice(&7_i32.to_le_bytes());
@@ -426,6 +514,16 @@ fn other_quantizer_types_are_unsupported() {
         sq(&parsed.index.index.storage, "bf16").format,
         CodeFormat::Bf16
     );
+
+    // QT_8bit_direct_signed reads too, as byte codes: the 800 code bytes
+    // are then 200 rows of 4, and the quantizer's code size of 8 is for
+    // `verify` to report, not the parser.
+    bytes[QTYPE..QTYPE + 4].copy_from_slice(&8_i32.to_le_bytes());
+    let parsed = knn_format::parse(&bytes).unwrap();
+    let s = sq(&parsed.index.index.storage, "byte");
+    assert_eq!(s.format, CodeFormat::Byte);
+    assert_eq!(s.row_count(), 200);
+    assert_eq!(s.quantizer.code_size, 8);
 
     bytes[QTYPE..QTYPE + 4].copy_from_slice(&99_i32.to_le_bytes());
     let err = knn_format::parse(&bytes).unwrap_err();
@@ -508,10 +606,111 @@ fn an_odd_code_length_parses_and_keeps_whole_rows_only() {
     let s = sq(storage, "cut");
     assert_eq!(s.codes.len(), 799);
     assert_eq!(s.row_count(), 99);
-    assert!(s.vector(99).is_none());
-    assert!(s.vector(98).is_some());
+    assert!(s.row(99).is_none());
+    assert!(s.row(98).is_some());
+    assert_eq!(s.halves().len(), 399);
     assert_eq!(storage.component_count(), 399);
     assert!(storage.component(399).is_none());
+}
+
+#[test]
+fn byte_codes_are_the_value_plus_128() {
+    // Faiss's Quantizer8bitDirectSigned: code = value + 128 in one byte,
+    // value = code - 128. Every byte is a code, and the two are inverses.
+    for code in 0..=u8::MAX {
+        let value = byte_to_f32(code);
+        assert_eq!(value, f32::from(code) - 128.0);
+        assert!((-128.0..=127.0).contains(&value));
+        assert_eq!(byte_code(value as i8), code);
+        assert_eq!(CodeFormat::Byte.decode(&[code]), Some(value));
+    }
+    assert_eq!(byte_code(-128), 0);
+    assert_eq!(byte_code(0), 128);
+    assert_eq!(byte_code(127), 255);
+    // A component is one byte, no more and no less.
+    assert_eq!(CodeFormat::Byte.decode(&[]), None);
+    assert_eq!(CodeFormat::Byte.decode(&[1, 2]), None);
+    assert_eq!(CodeFormat::Fp16.decode(&[0]), None);
+    assert_eq!(CodeFormat::Fp16.decode(&[0, 0x3c]), Some(1.0));
+    assert_eq!(CodeFormat::Bf16.decode(&[0x80, 0x3f]), Some(1.0));
+    assert_eq!(CodeFormat::Byte.component_size(), 1);
+    assert_eq!(
+        CodeFormat::of_qtype(QT_8BIT_DIRECT_SIGNED),
+        Some(CodeFormat::Byte)
+    );
+    assert_eq!(CodeFormat::Byte.qtype(), 8);
+    assert_eq!(CodeFormat::Byte.name(), "byte");
+}
+
+#[test]
+fn a_partial_byte_row_is_left_out() {
+    // One code byte short: the last row is incomplete, and the
+    // component accessors stop at the last whole one.
+    let bytes = fs::read(fixtures().join("synthetic-byte/l2-100x4-byte.faiss")).unwrap();
+    let parsed = knn_format::parse(&bytes).unwrap();
+    let codes = sq(&parsed.index.index.storage, "l2-100x4-byte").codes;
+    let start = knn_format::view_offset(&bytes, codes).unwrap();
+    let end = start + codes.len();
+    let mut cut = bytes[..end - 1].to_vec();
+    cut.extend_from_slice(&bytes[end..]);
+    cut[start - 8..start].copy_from_slice(&(codes.len() as u64 - 1).to_le_bytes());
+
+    let parsed = knn_format::parse(&cut).unwrap();
+    let storage = &parsed.index.index.storage;
+    let s = sq(storage, "cut");
+    assert_eq!(s.format, CodeFormat::Byte);
+    assert_eq!(s.codes.len(), 399);
+    assert_eq!(s.row_count(), 99);
+    assert!(s.row(99).is_none());
+    assert_eq!(s.row(98).unwrap().len(), 4);
+    assert_eq!(s.halves().len(), 0, "byte storage has no halves");
+    assert_eq!(storage.component_size(), 1);
+    assert_eq!(storage.component_count(), 399);
+    assert_eq!(storage.component(398), Some(byte_to_f32(cut[start + 398])));
+    assert!(storage.component(399).is_none());
+}
+
+#[test]
+fn a_zero_dimension_has_no_rows() {
+    // The storage header's dimension set to 0: the parser accepts it, and
+    // the row accessors agree there is nothing to read, where an empty row
+    // at every index would never end a loop over rows.
+    let mut bytes = fs::read(fixtures().join("synthetic-byte/l2-100x4-byte.faiss")).unwrap();
+    let storage_d = {
+        let parsed = knn_format::parse(&bytes).unwrap();
+        sq(&parsed.index.index.storage, "l2-100x4-byte")
+            .header
+            .offset
+            + 4
+    };
+    bytes[storage_d..storage_d + 4].copy_from_slice(&0_i32.to_le_bytes());
+    let parsed = knn_format::parse(&bytes).unwrap();
+    let s = sq(&parsed.index.index.storage, "d = 0");
+    assert_eq!(s.header.d, 0);
+    assert_eq!(s.row_count(), 0);
+    assert!(s.row(0).is_none());
+    assert!(s.row(1_000_000).is_none());
+    assert!(s.decoded(0).is_none());
+}
+
+/// A decoded row taken from a copy of the storage, which goes out of scope
+/// here: the row borrows only the file's bytes, so this compiles.
+fn decoded_row(storage: Storage<'_>, i: usize) -> Option<impl Iterator<Item = f32> + '_> {
+    let Storage::Sq(s) = storage else {
+        return None;
+    };
+    s.decoded(i)
+}
+
+#[test]
+fn a_decoded_row_outlives_the_storage_value() {
+    let bytes = fs::read(fixtures().join("synthetic-byte/l2-100x4-byte.faiss")).unwrap();
+    let parsed = knn_format::parse(&bytes).unwrap();
+    let row: Vec<f32> = decoded_row(parsed.index.index.storage, 0)
+        .unwrap()
+        .collect();
+    assert_eq!(row.len(), 4);
+    assert!(row.iter().all(|x| (-128.0..=127.0).contains(x)));
 }
 
 /// The float32 values one step either side of `x`, and `x`.

@@ -17,9 +17,11 @@ Usage:
 Writes, next to each synthetic fixture, `<name>.queries.f32`,
 `<name>.results.jsonl`, and `<name>.recall.json`; next to each real
 fixture's manifest, `queries.f32`, `results.jsonl`, and `recall.json`;
-float, fp16, and bf16 fixtures alike. For scalar-quantized storage the
-brute force runs over the vectors Faiss decodes from the codes. Rewrite
-them whenever the fixtures are regenerated.
+float, fp16, bf16, and byte fixtures alike. For scalar-quantized storage
+the brute force runs over the vectors Faiss decodes from the codes. The
+queries of a byte file are integers too, as a byte field receives them,
+each component drawn from the values the file stores in that position.
+Rewrite them whenever the fixtures are regenerated.
 """
 
 from __future__ import annotations
@@ -28,6 +30,7 @@ import argparse
 import json
 import os
 import pathlib
+import sys
 
 # Faiss's portable code on every CPU, as the committed baselines were
 # made: its scalar-quantizer distances are in-order sums over float32
@@ -42,6 +45,9 @@ os.environ["FAISS_SIMD_LEVEL"] = "NONE"
 import faiss  # noqa: E402
 import numpy as np  # noqa: E402
 
+# The tools import each other; `python -I` leaves the script's own
+# directory off the path, so it is put back.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from strip_envelope import parse_footer, parse_header  # noqa: E402
 
 QUERIES = 100
@@ -65,17 +71,28 @@ def baseline(path: pathlib.Path, out_dir: pathlib.Path, prefix: str) -> dict:
     d = storage.d
     metric = storage.metric_type
     # The stored vectors as Faiss reads them: a copy of float32 storage, or
-    # fp16 or bf16 codes decoded (exactly) to float32.
+    # fp16, bf16, or byte codes decoded (exactly) to float32.
     vectors = storage.reconstruct_n(0, storage.ntotal)
     labels = faiss.vector_to_array(index.id_map)
 
     rng = np.random.default_rng(SEED)
-    queries = rng.standard_normal((QUERIES, d), dtype=np.float32)
-    if metric == faiss.METRIC_INNER_PRODUCT:
-        # Inner-product files hold unit vectors (k-NN's cosine); query the
-        # same way. The ranking is the same either way, so this only keeps
-        # the baseline's distances in the same range as the file's.
-        queries /= np.linalg.norm(queries, axis=1, keepdims=True)
+    sq = getattr(storage, "sq", None)
+    if sq is not None and sq.qtype == faiss.ScalarQuantizer.QT_8bit_direct_signed:
+        # A byte field's queries are bytes too, which k-NN casts to
+        # float32; a byte file is never a cosine one, so none is normalized.
+        # Each component is one the file stores in that position, so the
+        # queries look like the data and integer distances tie as they
+        # would in use.
+        rows = rng.integers(0, len(vectors), (QUERIES, d))
+        queries = vectors[rows, np.arange(d)]
+    else:
+        queries = rng.standard_normal((QUERIES, d), dtype=np.float32)
+        if metric == faiss.METRIC_INNER_PRODUCT:
+            # Inner-product files hold unit vectors (k-NN's cosine); query
+            # the same way. The ranking is the same either way, so this
+            # only keeps the baseline's distances in the same range as the
+            # file's.
+            queries /= np.linalg.norm(queries, axis=1, keepdims=True)
 
     # Exact neighbors over the file's own storage, in label space.
     flat = faiss.IndexFlatL2(d) if metric == faiss.METRIC_L2 else faiss.IndexFlatIP(d)
@@ -131,12 +148,12 @@ def main() -> None:
     if level != "NONE":
         raise SystemExit(f"Faiss runs its {level} code; use a portable build")
     faiss.omp_set_num_threads(1)
-    for synthetic in ("synthetic", "synthetic-fp16", "synthetic-bf16"):
+    for synthetic in ("synthetic", "synthetic-fp16", "synthetic-bf16", "synthetic-byte"):
         for path in sorted((args.fixtures / synthetic).glob("*.faiss")):
             baseline(path, path.parent, f"{path.stem}.")
     for manifest in sorted(
         m
-        for real in ("opensearch-3.9.0", "opensearch-3.9.0-fp16", "opensearch-3.9.0-bf16")
+        for real in ("opensearch-3.9.0", "opensearch-3.9.0-fp16", "opensearch-3.9.0-bf16", "opensearch-3.9.0-byte")
         for m in (args.fixtures / real).glob("*/*/manifest.json")
     ):
         files = json.loads(manifest.read_text(encoding="utf-8"))["files"]

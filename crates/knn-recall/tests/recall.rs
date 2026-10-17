@@ -36,10 +36,15 @@ struct Baseline {
 }
 
 /// Every baseline: `<name>.recall.json` beside each synthetic fixture,
-/// `recall.json` beside each real one, float, fp16, and bf16.
+/// `recall.json` beside each real one, float, fp16, bf16, and byte.
 fn baselines() -> Vec<PathBuf> {
     let mut out = Vec::new();
-    for synthetic in ["synthetic", "synthetic-fp16", "synthetic-bf16"] {
+    for synthetic in [
+        "synthetic",
+        "synthetic-fp16",
+        "synthetic-bf16",
+        "synthetic-byte",
+    ] {
         for entry in fs::read_dir(fixtures().join(synthetic)).unwrap() {
             let p = entry.unwrap().path();
             if p.to_string_lossy().ends_with(".recall.json") {
@@ -53,6 +58,7 @@ fn baselines() -> Vec<PathBuf> {
         "opensearch-3.9.0-fp16/sq-fp16",
         "opensearch-3.9.0-fp16/half-float",
         "opensearch-3.9.0-bf16/sq-bf16",
+        "opensearch-3.9.0-byte/byte",
     ] {
         for entry in fs::read_dir(fixtures().join(set)).unwrap() {
             out.push(entry.unwrap().path().join("recall.json"));
@@ -109,11 +115,11 @@ fn recall_matches_faiss_python() {
         }
         seen += 1;
     }
-    assert_eq!(seen, 26, "11 synthetic and 15 real baselines");
-    // Nine synthetic files at efSearch 16 miss neighbors, three of them
-    // fp16 and two bf16, so the comparison covers partial matches, not
-    // only the perfect case.
-    assert_eq!(imperfect, 9);
+    assert_eq!(seen, 32, "15 synthetic and 17 real baselines");
+    // Thirteen synthetic files at efSearch 16 miss neighbors, three of
+    // them fp16, two bf16, and four byte, so the comparison covers partial
+    // matches, not only the perfect case.
+    assert_eq!(imperfect, 13);
 }
 
 /// Flat storage over rows spelled out in the test.

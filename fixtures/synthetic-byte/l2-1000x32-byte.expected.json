@@ -1,0 +1,84 @@
+{
+  "file": "l2-1000x32-byte.faiss",
+  "size": 184171,
+  "faiss_version": "1.15.1",
+  "seed": 20261013,
+  "layout": [
+    "IxMp",
+    "IHNs",
+    "IxSQ"
+  ],
+  "dimension": 32,
+  "count": 1000,
+  "metric": "l2",
+  "faiss_metric_type": 1,
+  "hnsw": {
+    "m": 16,
+    "ef_construction": 100,
+    "ef_search": 16,
+    "max_level": 2,
+    "entry_point": 592,
+    "level_counts": [
+      1000,
+      57,
+      3
+    ],
+    "levels_len": 1000,
+    "offsets_len": 1001,
+    "neighbors_len": 32960,
+    "levels_crc32": 330177091
+  },
+  "sq": {
+    "qtype": 8,
+    "qtype_name": "QT_8bit_direct_signed",
+    "rangestat": 0,
+    "rangestat_arg": 0.0,
+    "d": 32,
+    "code_size": 32,
+    "trained_len": 0
+  },
+  "ids": {
+    "len": 1000,
+    "first": 1000,
+    "last": 1999,
+    "crc32": 3986414682
+  },
+  "codes": {
+    "bytes": 32000,
+    "crc32": 3078892549,
+    "first_decoded": [
+      9.0,
+      -21.0,
+      2.0,
+      7.0,
+      -12.0,
+      38.0,
+      26.0,
+      12.0,
+      -22.0,
+      70.0,
+      53.0,
+      29.0,
+      3.0,
+      8.0,
+      -54.0,
+      8.0,
+      44.0,
+      5.0,
+      2.0,
+      -33.0,
+      -38.0,
+      4.0,
+      -4.0,
+      -11.0,
+      48.0,
+      28.0,
+      -17.0,
+      4.0,
+      -33.0,
+      24.0,
+      10.0,
+      -48.0
+    ]
+  }
+}

@@ -56,9 +56,11 @@ fuzz_target!(|data: &[u8]| {
                 let _ = s.vector(0);
             }
             knn_format::faiss::Storage::Sq(s) => {
-                if let Some(row) = s.vector(0) {
-                    let _: Vec<f32> = row.iter().map(|h| s.format.decode(h.get())).collect();
+                let _ = s.row(0);
+                if let Some(row) = s.decoded(0) {
+                    let _: Vec<f32> = row.collect();
                 }
+                let _ = s.halves();
             }
         }
         if let Some(footer) = parsed.envelope.footer {

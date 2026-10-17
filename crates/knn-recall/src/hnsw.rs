@@ -17,7 +17,11 @@
 //! distances below the current one" rule until the slot is reused. The
 //! result heap is a binary heap under Faiss's `(distance, id)` order,
 //! which yields the same contents and the same sorted output as Faiss's
-//! own.
+//! own at the pinned commit, where every metric goes through those
+//! max-heaps (an inner product as its negation). Faiss 1.15.1 searches an
+//! inner-product index with min-heaps over the similarities instead, which
+//! break exact ties by node the other way, in the candidate queue as well
+//! as the results.
 //!
 //! Where Faiss would read out of bounds on a malformed graph (a neighbor
 //! id past the node count, a node without a stored vector), the entry is
