@@ -533,8 +533,8 @@ float space type, and the binary index computes Hamming distance for it
 all the same; `verify` notes a float `--space` on binary storage instead
 of failing it.
 
-An `on_disk` float field of k-NN 3.9 writes a different file, as does a
-float field whose `sq` encoder keeps 1, 2, or 4 bits
+An `on_disk` float field of k-NN 3.9 writes a different file in a local
+build, as does a float field whose `sq` encoder keeps 1, 2, or 4 bits
 (`FaissSQEncoder.isSQCodedBits`), which is what `on_disk` mode resolves
 to. At 32x (the default), 16x, and 8x compression it builds a
 scalar-quantized graph (`MemOptimizedScalarQuantizedIndexBuildStrategy`)
@@ -543,9 +543,62 @@ header's code size the quantized bytes plus 16 bytes of correction
 factors (18 for 16 dimensions at 32x, 20 at 16x, 24 at 8x), then `null`
 where the storage would be. The quantized vectors stay in Lucene's files
 of the `Faiss1040ScalarQuantizedKnnVectorsFormat` (`.veq`, `.vemq`),
-beside the float32 ones in its `.vec` and `.vemf`. The parser refuses
-the file at the `null` fourcc, naming it: `verify` fails it, and `scan`,
-when its footer verifies, reports it as unsupported rather than failed.
+beside the float32 ones in its `.vec` and `.vemf`.
+
+The rest is a binary graph like the other two's, with three differences,
+all at tag 3.9.0.0. Both headers record the field's metric, 1 for `l2`
+and 0 for `innerproduct` and `cosinesimil` (`TranslateSpaceToMetric`):
+`FaissSQHnsw` copies its storage's metric type into its own header, and
+`IndexBinaryIDMap`'s constructor copies that into the ID map's. The
+graph was built by k-NN's scalar-quantized distance
+(`FaissSQDistanceComputer`: quantized dot products corrected toward the
+field's space; between two stored codes while building, and against a
+4-bit query when searching), not by Hamming distance. The dimension is
+the field's, in components, and need not be a multiple of 8: patch 0010
+lets an "extended" binary index skip that rule, and `FaissSQFlat` and
+`FaissSQHnsw` are built as one. The ID map's code size is the dimension
+/ 8 rounded down, which `sync_d` sets for any binary ID map. The graph's
+is `FaissSQFlat::oneElementSize`: the quantized vector's bytes, the
+length Lucene's encoder gives it (`quantizedVecBytes`), plus 16 bytes of
+correction factors, the lower and upper interval and an additional
+correction as float32 and the component sum as int32, as
+`MemOptimizedScalarQuantizedIndexBuildStrategy` passes them. k-NN keeps
+1, 2, or 4 bits a component, always with a 4-bit query
+(`ScalarEncodingResolver`), which Lucene 10.5.1's `ScalarEncoding` packs
+into `ceil(d / 8)` bytes (`SINGLE_BIT_QUERY_NIBBLE`), two planes of
+those (`DIBIT_QUERY_NIBBLE`), and `ceil(d / 2)` bytes (`PACKED_NIBBLE`):
+2, 4, and 8 for 16 components, so 18, 20, and 24. When k-NN loads the
+file it reads the metric from the ID map's header
+(`FaissFlatIndexFactory.maybeSetFlatBinaryIndex`).
+
+The parser reads the file to the end with no storage. `verify` checks
+the two headers: equal dimension and count, and an ID map metric type of
+L2 or inner product, which k-NN reads and refuses any other. The values
+k-NN writes but never reads for this file warn when they are not what it
+writes, as binary storage's unused metric types do: a graph metric type
+other than the ID map's, an ID map code size other than the dimension /
+8, and a graph code size other than one of the three packed lengths plus
+16. As in every binary header, a negative dimension, count, or code size
+is refused when the file is parsed. `verify` skips the vector count,
+values, and norms, and checks `--space` against the ID map's metric, so
+an `l2` field's graph fails `innerproduct`, `cosinesimil`, and
+`hamming`. `stats` reads the graph as it reads any other, `recall`
+refuses the file, which holds nothing to search, and `scan` skips its
+`.vec` check, since the `.veq` holds the graph's vectors, and checks its
+labels against the `.si`. faiss-cpu 1.15.1 cannot read the file: its
+binary reader has no case for `null`, and it requires code size =
+dimension / 8 of every binary header. So `tools/graph_stats.py` reads a
+copy with zero-filled `IBxF` storage in place of the `null` and plain
+binary headers, which leaves the graph's bytes as they are; `stats`
+matches the statistics it computes.
+
+k-NN's remote index build, which hands the graph to a GPU builder,
+writes a float CAGRA graph instead and leaves its storage out the same
+way, `IxMp` > `IHc2` (or the older `IHNc`, as the builder's Faiss writes
+it) > `null` (`RemoteIndexBuildStrategy.shouldSkipStoredVectors`, and
+`FaissFlatIndexFactory.maybeSetFlatBinaryIndex` wiring the flat vectors
+back in at load). Faiss at `5616caa` writes `IHc2` for a CAGRA graph and
+still reads the older `IHNc`; `knn-inspect` refuses both at the fourcc.
 
 ### Synthetic binary fixtures
 
@@ -604,7 +657,10 @@ them as `_2_NativeEngines990KnnVectorsFormat_0.osknnqstate`.
 `--encoding on-disk` indexes the same draw into an `on_disk` float field
 (`on-disk/l2/`). Its native file, 75,846 bytes, has `IBHf`'s code size
 18 and `null` at offset 71,818, where the storage of the other two
-begins.
+begins. Both headers record dimension 16 and metric type 1, the field
+being `l2`, and the ID map's code size is 2. The labels follow the
+`null` directly: their count, 500, at 71,822, and the labels, doc ids 0
+to 499, up to 75,830, where the footer begins.
 
 ## Real files from OpenSearch 3.9.0
 

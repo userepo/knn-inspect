@@ -1,7 +1,8 @@
 //! Any byte string must parse to `Ok` or `Err`, never panic, as a native
 //! file, a segment info file, and a flat-vectors metadata file, and every
 //! check, the graph statistics, and an HNSW search must run over whatever
-//! parsed. Panics, including failed bounds checks, fail the run;
+//! parsed (a graph without its vectors must refuse the search). Panics,
+//! including failed bounds checks, fail the run;
 //! AddressSanitizer covers the unsafe code inside dependencies
 //! (zerocopy's casts, crc32fast's SIMD). The memory map is not exercised:
 //! the harness parses bytes, not files.
@@ -38,51 +39,69 @@ fuzz_target!(|data: &[u8]| {
         let stats = knn_check::graph_stats(graph);
         assert_eq!(stats.nodes, graph.node_count());
         assert_eq!(stats.layers.len(), graph.level_counts().len());
-        // The HNSW search over an arbitrary graph and any storage, with the
-        // first stored vector, decoded, or for binary storage its bytes, as
-        // the query so the query's size is bounded by the file.
-        let storage = &parsed.index.index.storage;
-        let d = usize::try_from(storage.header().d).unwrap_or(0);
-        let floats: Vec<f32> = (0..d).map_while(|i| storage.component(i)).collect();
-        let query = match storage {
-            knn_format::faiss::Storage::Binary(s) => s.row(0).map(knn_recall::Query::Bits),
-            _ => (d > 0 && floats.len() == d).then_some(knn_recall::Query::Floats(&floats)),
-        };
-        if let Some(query) = query {
-            let mut searcher = knn_recall::Searcher::new(graph.node_count());
-            if let Ok(hits) = searcher.search(&parsed.index.index, query, 3, 5) {
-                assert!(hits.len() <= 3);
-                // Padded to k, or to the node count when the graph is
-                // smaller: no list can hold more.
-                let labels = knn_recall::result_labels(&parsed.index, &hits, 3);
-                assert_eq!(labels.len(), 3.min(graph.node_count()));
-            }
-        }
-        let _ = storage.row_count();
-        let _ = storage.component_count();
-        let _ = storage.code_bytes();
+        let _ = parsed.index.metric();
+        let _ = parsed.index.code_size();
         let _ = parsed.index.layout();
-        match storage {
-            knn_format::faiss::Storage::Flat(s) => {
-                let _ = s.vector(0);
-            }
-            knn_format::faiss::Storage::Sq(s) => {
-                let _ = s.row(0);
-                if let Some(row) = s.decoded(0) {
-                    let _: Vec<f32> = row.collect();
+        'storage: {
+            let Some(storage) = &parsed.index.index.storage else {
+                // A graph without its vectors: nothing to search.
+                let mut searcher = knn_recall::Searcher::new(graph.node_count());
+                assert!(matches!(
+                    searcher.search(&parsed.index.index, &[0.0_f32][..], 3, 5),
+                    Err(knn_recall::Error::NoVectors)
+                ));
+                break 'storage;
+            };
+            // The HNSW search over an arbitrary graph and any storage,
+            // with the first stored vector, decoded, or for binary storage
+            // its bytes, as the query so the query's size is bounded by the
+            // file.
+            let d = usize::try_from(storage.header().d).unwrap_or(0);
+            let floats: Vec<f32> = (0..d).map_while(|i| storage.component(i)).collect();
+            let query = match storage {
+                knn_format::faiss::Storage::Binary(s) => s.row(0).map(knn_recall::Query::Bits),
+                _ => (d > 0 && floats.len() == d).then_some(knn_recall::Query::Floats(&floats)),
+            };
+            if let Some(query) = query {
+                let mut searcher = knn_recall::Searcher::new(graph.node_count());
+                if let Ok(hits) = searcher.search(&parsed.index.index, query, 3, 5) {
+                    assert!(hits.len() <= 3);
+                    // Padded to k, or to the node count when the graph is
+                    // smaller: no list can hold more.
+                    let labels = knn_recall::result_labels(&parsed.index, &hits, 3);
+                    assert_eq!(labels.len(), 3.min(graph.node_count()));
                 }
-                let _ = s.halves();
             }
-            knn_format::faiss::Storage::Binary(s) => {
-                let _ = s.row(0);
-                let _ = s.code_size();
+            let _ = storage.row_count();
+            let _ = storage.component_count();
+            let _ = storage.code_bytes();
+            match storage {
+                knn_format::faiss::Storage::Flat(s) => {
+                    let _ = s.vector(0);
+                }
+                knn_format::faiss::Storage::Sq(s) => {
+                    let _ = s.row(0);
+                    if let Some(row) = s.decoded(0) {
+                        let _: Vec<f32> = row.collect();
+                    }
+                    let _ = s.halves();
+                }
+                knn_format::faiss::Storage::Binary(s) => {
+                    let _ = s.row(0);
+                    let _ = s.code_size();
+                }
             }
         }
         if let Some(footer) = parsed.envelope.footer {
             let _ = footer.verify(data);
         }
     }
-    for space in [None, Some(Space::L2), Some(Space::Cosine), Some(Space::Hamming)] {
+    for space in [
+        None,
+        Some(Space::L2),
+        Some(Space::Cosine),
+        Some(Space::Hamming),
+    ] {
         let report = knn_check::verify(
             data,
             &Options {

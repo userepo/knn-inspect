@@ -1,7 +1,10 @@
-//! The Faiss payload, as `faiss/impl/index_read.cpp` reads it: `IxMp`
+//! The Faiss payload, as `faiss/impl/index_read.cpp` reads it, and the
+//! `null` storage k-NN's patched writer leaves in a binary one: `IxMp`
 //! wrapping `IHNf` over flat float32 storage, or `IHNs` over fp16, bf16,
 //! or byte scalar-quantized storage; or, for binary vectors, `IBMp`
-//! wrapping `IBHf` over `IBxF`, packed bits compared by Hamming distance.
+//! wrapping `IBHf` over `IBxF`, packed bits compared by Hamming distance;
+//! or `IBMp` wrapping `IBHf` over `null`, a graph whose vectors k-NN keeps
+//! in Lucene's files, as it writes an `on_disk` field's.
 //!
 //! Every array is a view into the file's bytes. Element types are the
 //! unaligned little-endian wrappers from `zerocopy`; call `.get()` on an
@@ -43,7 +46,8 @@ impl FourCc {
     /// `IndexBinaryFlat`.
     pub const BINARY_FLAT: Self = Self(*b"IBxF");
     /// What k-NN's patched `write_index_binary` writes in place of the
-    /// storage when it leaves the vectors out of the file.
+    /// storage when it leaves the vectors out of the file, and what
+    /// [`IdMapIndex::layout`] names for that storage.
     pub const NULL: Self = Self(*b"null");
 }
 
@@ -75,18 +79,19 @@ pub enum Metric {
     /// `METRIC_L2` (1): squared Euclidean distance.
     L2,
     /// The Hamming distance between packed bits: the bits in which two
-    /// codes differ. Faiss's binary indexes compute it whatever metric
-    /// type their headers store, which k-NN leaves at 1 (`METRIC_L2`).
+    /// codes differ. Faiss's binary indexes over `IBxF` compute it
+    /// whatever metric type their headers store, which k-NN leaves at 1
+    /// (`METRIC_L2`).
     Hamming,
     /// Any other `faiss::MetricType`.
     Other(i32),
 }
 
 impl Metric {
-    /// The metric of a float index's `metric_type`. It is never
-    /// [`Self::Hamming`], which no metric type names: a binary index
-    /// computes it whatever its metric type, as [`IndexHeader::metric`]
-    /// reports.
+    /// The metric a `metric_type` names: a float index's, or the ID map's
+    /// of a graph without its vectors. It is never [`Self::Hamming`], which
+    /// no metric type names: binary storage computes it whatever its
+    /// metric type, as [`IndexHeader::metric`] reports.
     #[must_use]
     pub fn from_type(metric_type: i32) -> Self {
         match metric_type {
@@ -115,7 +120,8 @@ impl Metric {
 pub struct IndexHeader {
     /// File offset of the fourcc.
     pub offset: usize,
-    /// Dimension: components of a float vector, bits of a binary one.
+    /// Dimension: components of a float vector, bits of a binary one;
+    /// components again in the headers of a graph without its vectors.
     pub d: i32,
     /// Vector count.
     pub ntotal: i64,
@@ -141,14 +147,18 @@ pub enum HeaderKind {
     /// A binary index's (`IndexBinary`).
     Binary {
         /// Bytes per vector. Faiss sets it to the dimension divided by 8
-        /// and reads every vector as this many bytes.
+        /// and reads every vector as this many bytes; the graph header of
+        /// a graph without its vectors records k-NN's quantized vector
+        /// plus its correction factors instead.
         code_size: i32,
     },
 }
 
 impl IndexHeader {
-    /// The distance the index computes: Hamming for a binary index,
-    /// whatever its metric type, otherwise the metric type's.
+    /// The distance the index computes: Hamming for a binary header,
+    /// whatever its metric type, otherwise the metric type's. The binary
+    /// headers of a graph without its vectors record the metric it was
+    /// built for instead, which [`IdMapIndex::metric`] reports.
     #[must_use]
     pub fn metric(&self) -> Metric {
         match self.kind {
@@ -874,14 +884,19 @@ impl<'a> Storage<'a> {
 #[derive(Debug, Clone, Copy)]
 pub struct HnswIndex<'a> {
     /// `IHNf` over float32 storage, `IHNs` over fp16, bf16, or byte, or
-    /// `IBHf` over binary.
+    /// `IBHf` over binary storage or none.
     pub fourcc: FourCc,
     /// The HNSW index's own header.
     pub header: IndexHeader,
     /// The graph.
     pub graph: HnswGraph<'a>,
-    /// The vectors.
-    pub storage: Storage<'a>,
+    /// The vectors; `None` for a graph without them (`null` in the file).
+    /// k-NN's local build writes such a graph under `IBHf` for an
+    /// `on_disk` field, or a float field whose `sq` encoder keeps 1, 2, or
+    /// 4 bits, keeping the quantized vectors in Lucene's files. (Its remote
+    /// build writes `null` under a CAGRA graph, `IHc2`, a layout this
+    /// crate refuses.)
+    pub storage: Option<Storage<'a>>,
 }
 
 /// `IndexIDMap` or `IndexBinaryIDMap`: the outermost index, mapping node
@@ -901,22 +916,46 @@ pub struct IdMapIndex<'a> {
 }
 
 impl IdMapIndex<'_> {
-    /// The three fourccs, outermost first.
+    /// The three fourccs, outermost first; [`FourCc::NULL`] last for a
+    /// graph without its vectors.
     #[must_use]
     pub fn layout(&self) -> [FourCc; 3] {
-        [self.fourcc, self.index.fourcc, self.index.storage.fourcc()]
+        let storage = self
+            .index
+            .storage
+            .as_ref()
+            .map_or(FourCc::NULL, Storage::fourcc);
+        [self.fourcc, self.index.fourcc, storage]
+    }
+
+    /// The distance the index was built for: its storage's, or, for a
+    /// graph without its vectors, the ID map header's metric type. k-NN
+    /// builds such a graph for the field's space, L2 or inner product, by
+    /// its scalar-quantized distance (quantized dot products corrected
+    /// toward that space, not Hamming distance), records the space in both
+    /// headers, and reads it back from the ID map's when it loads the file
+    /// (`FaissFlatIndexFactory.maybeSetFlatBinaryIndex` at tag 3.9.0.0).
+    #[must_use]
+    pub fn metric(&self) -> Metric {
+        match &self.index.storage {
+            Some(storage) => storage.header().metric(),
+            None => Metric::from_type(self.header.metric_type),
+        }
+    }
+
+    /// Bytes per vector of a binary layout: over binary storage, the ID
+    /// map header's code size, the dimension / 8 in a well-formed file;
+    /// over none, the graph header's, a quantized vector plus its
+    /// correction factors, since the ID map's then measures nothing
+    /// stored. `None` for a float layout.
+    #[must_use]
+    pub fn code_size(&self) -> Option<i32> {
+        match self.index.storage {
+            Some(_) => self.header.code_size(),
+            None => self.index.header.code_size(),
+        }
     }
 }
-
-/// What the layouts k-NN writes for a binary index can name in place of
-/// its storage, as errors list them.
-const BINARY_STORAGE_EXPECTED: &str = "IBxF";
-
-/// The same, when the file names `null`: k-NN's patched Faiss writes it
-/// for a graph whose vectors stay in Lucene's files, as k-NN 3.9 builds
-/// an `on_disk` field and any float field whose `sq` encoder keeps 1, 2,
-/// or 4 bits.
-const NULL_STORAGE_EXPECTED: &str = "IBxF; null is a graph without its vectors, which k-NN writes for quantized fields (such as on_disk ones) that keep them in Lucene's files, and this tool does not read";
 
 /// Parses the payload, `base` being its offset in the file.
 ///
@@ -953,7 +992,7 @@ pub fn parse(payload: &[u8], base: usize) -> Result<IdMapIndex<'_>> {
     // Faiss reads any storage under any HNSW tag; k-NN writes each tag
     // over one kind only, and only those pairs are accepted.
     let storage_offset = cur.offset();
-    let storage = if hnsw_fourcc == FourCc::HNSW_SQ {
+    let storage = Some(if hnsw_fourcc == FourCc::HNSW_SQ {
         expect_fourcc(&mut cur, &[FourCc::SCALAR_QUANTIZER], "IxSQ")?;
         let header = IndexHeader::read(&mut cur, storage_offset)?;
         let (quantizer, format) = ScalarQuantizer::read(&mut cur)?;
@@ -975,7 +1014,7 @@ pub fn parse(payload: &[u8], base: usize) -> Result<IdMapIndex<'_>> {
             header,
             codes: cur.xb_vector("vectors")?,
         })
-    };
+    });
 
     let id_map = cur.vector("id_map")?;
 
@@ -994,7 +1033,8 @@ pub fn parse(payload: &[u8], base: usize) -> Result<IdMapIndex<'_>> {
 }
 
 /// The rest of a binary layout, `IBMp` read: its header, `IBHf` with its
-/// header and graph, `IBxF` with its header and codes, then the labels.
+/// header and graph, `IBxF` with its header and codes or `null`, then the
+/// labels.
 fn parse_binary(mut cur: Cursor<'_>, offset: usize) -> Result<IdMapIndex<'_>> {
     let header = IndexHeader::read_binary(&mut cur, offset)?;
 
@@ -1003,21 +1043,23 @@ fn parse_binary(mut cur: Cursor<'_>, offset: usize) -> Result<IdMapIndex<'_>> {
     let hnsw_header = IndexHeader::read_binary(&mut cur, hnsw_offset)?;
     let graph = HnswGraph::read(&mut cur)?;
 
+    // k-NN's patched `write_index_binary` writes `null` and nothing else
+    // in place of the storage it leaves out.
     let storage_offset = cur.offset();
-    let storage_fourcc = FourCc(cur.fourcc("index type")?);
-    if storage_fourcc != FourCc::BINARY_FLAT {
-        return Err(Error::UnsupportedLayout {
-            offset: storage_offset,
-            fourcc: storage_fourcc,
-            expected: if storage_fourcc == FourCc::NULL {
-                NULL_STORAGE_EXPECTED
-            } else {
-                BINARY_STORAGE_EXPECTED
-            },
-        });
-    }
-    let storage_header = IndexHeader::read_binary(&mut cur, storage_offset)?;
-    let codes = cur.vector("binary codes")?;
+    let storage_fourcc = expect_fourcc(
+        &mut cur,
+        &[FourCc::BINARY_FLAT, FourCc::NULL],
+        "IBxF or null",
+    )?;
+    let storage = if storage_fourcc == FourCc::NULL {
+        None
+    } else {
+        let header = IndexHeader::read_binary(&mut cur, storage_offset)?;
+        Some(Storage::Binary(BinaryStorage {
+            header,
+            codes: cur.vector("binary codes")?,
+        }))
+    };
 
     let id_map = cur.vector("id_map")?;
 
@@ -1028,10 +1070,7 @@ fn parse_binary(mut cur: Cursor<'_>, offset: usize) -> Result<IdMapIndex<'_>> {
             fourcc: FourCc::BINARY_HNSW,
             header: hnsw_header,
             graph,
-            storage: Storage::Binary(BinaryStorage {
-                header: storage_header,
-                codes,
-            }),
+            storage,
         },
         id_map,
         end: cur.offset(),

@@ -102,7 +102,7 @@ fn recall_matches_faiss_python() {
         let b: Baseline = serde_json::from_slice(&fs::read(&baseline).unwrap()).unwrap();
         let bytes = fs::read(dir.join(&b.file)).unwrap();
         let parsed = knn_format::parse(&bytes).unwrap();
-        let storage = &parsed.index.index.storage;
+        let storage = &parsed.index.index.storage.unwrap();
         let queries = load_queries(
             storage,
             &fs::read(dir.join(&b.queries_file)).unwrap(),

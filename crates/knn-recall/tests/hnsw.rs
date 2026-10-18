@@ -106,7 +106,7 @@ fn own_search_matches_faiss() {
         let parsed = knn_format::parse(&bytes).unwrap();
         let index = &parsed.index;
         let queries = load_queries(
-            &index.index.storage,
+            &index.index.storage.unwrap(),
             &fs::read(dir.join(&b.queries_file)).unwrap(),
             b.dimension,
         );
@@ -128,8 +128,15 @@ fn own_search_matches_faiss() {
 
         // Within 0.01 of Faiss's recall for the same queries and parameters.
         let labels = Labels::from_id_map(index.id_map).unwrap();
-        let truth = ground_truth(&index.index.storage, &queries, b.k).unwrap();
-        let r = score(&index.index.storage, &labels, &queries, &truth, &own).unwrap();
+        let truth = ground_truth(&index.index.storage.unwrap(), &queries, b.k).unwrap();
+        let r = score(
+            &index.index.storage.unwrap(),
+            &labels,
+            &queries,
+            &truth,
+            &own,
+        )
+        .unwrap();
         assert!(
             (r.recall - b.recall).abs() <= 0.01,
             "{}: own recall {} vs Faiss {}",
@@ -139,7 +146,7 @@ fn own_search_matches_faiss() {
         );
         assert_eq!(r.missing, 0, "{}: every list is full", b.file);
 
-        let inner_product = index.index.storage.header().metric() == Metric::InnerProduct;
+        let inner_product = index.index.storage.unwrap().header().metric() == Metric::InnerProduct;
         for (ours, theirs) in own.iter().zip(&faiss) {
             lists += 1;
             if ours == theirs {
@@ -277,7 +284,7 @@ impl Built {
                 ef_search: 16,
                 upper_beam: 1,
             },
-            storage: Storage::Flat(FlatStorage {
+            storage: Some(Storage::Flat(FlatStorage {
                 fourcc: if self.metric_type == 1 {
                     FourCc::FLAT_L2
                 } else {
@@ -285,7 +292,7 @@ impl Built {
                 },
                 header,
                 codes: &self.codes,
-            }),
+            })),
         }
     }
 }
@@ -516,6 +523,33 @@ fn search_checks_its_inputs() {
 }
 
 #[test]
+fn a_graph_without_its_vectors_has_nothing_to_search() {
+    // An on_disk field's graph: k-NN keeps its vectors in Lucene's files.
+    let bytes =
+        fs::read(fixtures().join("opensearch-3.9.0-binary/on-disk/l2/_2_165_vec.faiss")).unwrap();
+    let parsed = knn_format::parse(&bytes).unwrap();
+    let index = &parsed.index.index;
+    assert!(index.storage.is_none());
+    let mut s = Searcher::new(index.graph.node_count());
+    let query = [0.0_f32; 16];
+    assert!(matches!(
+        s.search(index, &query, 10, 16),
+        Err(Error::NoVectors)
+    ));
+    let queries = Queries::from_rows(16, query.to_vec()).unwrap();
+    assert!(matches!(
+        search_all(index, &queries, 10, 16),
+        Err(Error::NoVectors)
+    ));
+    // k is still checked first.
+    assert!(matches!(s.search(index, &query, 0, 16), Err(Error::ZeroK)));
+    assert!(matches!(
+        search_all(index, &queries, 0, 16),
+        Err(Error::ZeroK)
+    ));
+}
+
+#[test]
 fn scalar_quantized_samples_are_the_decoded_rows() {
     for file in [
         "synthetic-fp16/l2-1000x32-fp16.faiss",
@@ -524,7 +558,7 @@ fn scalar_quantized_samples_are_the_decoded_rows() {
     ] {
         let bytes = fs::read(fixtures().join(file)).unwrap();
         let parsed = knn_format::parse(&bytes).unwrap();
-        let storage = &parsed.index.index.storage;
+        let storage = &parsed.index.index.storage.unwrap();
         let Storage::Sq(sq) = storage else {
             panic!("{file}: scalar-quantized storage");
         };
@@ -543,7 +577,7 @@ fn scalar_quantized_samples_are_the_decoded_rows() {
 fn sampling_is_deterministic_and_distinct() {
     let bytes = fs::read(fixtures().join("synthetic/l2-1000x32.faiss")).unwrap();
     let parsed = knn_format::parse(&bytes).unwrap();
-    let storage = &parsed.index.index.storage;
+    let storage = &parsed.index.index.storage.unwrap();
     let (q1, rows1) = knn_recall::sample_queries(storage, 50, 7).unwrap();
     let (q2, rows2) = knn_recall::sample_queries(storage, 50, 7).unwrap();
     assert_eq!(rows1, rows2);
@@ -598,7 +632,7 @@ fn binary_samples_are_the_stored_bits() {
     ] {
         let bytes = fs::read(fixtures().join(file)).unwrap();
         let parsed = knn_format::parse(&bytes).unwrap();
-        let storage = &parsed.index.index.storage;
+        let storage = &parsed.index.index.storage.unwrap();
         let Storage::Binary(binary) = storage else {
             panic!("{file}: binary storage");
         };

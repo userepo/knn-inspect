@@ -1,7 +1,8 @@
 #!/bin/sh
 # Seeds the fuzz corpus with the committed fixtures (float, fp16, bf16,
-# byte, and binary, clean and corrupted) and the real segments' .si and
-# .vemf files for the segment info and flat-vectors metadata readers.
+# byte, binary, and graphs without their vectors, clean and corrupted)
+# and the real segments' .si and .vemf files for the segment info and
+# flat-vectors metadata readers.
 # Files larger than MAX_LEN are skipped: libFuzzer would only ever see
 # their first MAX_LEN bytes, which is just another truncated file, a case
 # the truncation tests already cover. Keep MAX_LEN in step with the

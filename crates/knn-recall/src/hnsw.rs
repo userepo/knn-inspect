@@ -73,9 +73,10 @@ impl Searcher {
     ///
     /// # Errors
     ///
-    /// Returns an error when `k` is 0, the file's dimension, code size, or
-    /// metric is unusable, or `query` has another dimension or is of the
-    /// other kind: float32 for binary storage, or bits for any other.
+    /// Returns an error when `k` is 0, the file holds no vectors, its
+    /// dimension, code size, or metric is unusable, or `query` has another
+    /// dimension or is of the other kind: float32 for binary storage, or
+    /// bits for any other.
     pub fn search<'q>(
         &mut self,
         index: &HnswIndex<'_>,
@@ -87,9 +88,10 @@ impl Searcher {
             return Err(Error::ZeroK);
         }
         let query = query.into();
-        let vectors = Vectors::of(&index.storage)?;
+        let storage = index.storage.as_ref().ok_or(Error::NoVectors)?;
+        let vectors = Vectors::of(storage)?;
         check_query(&vectors, query.kind(), query.dimension())?;
-        let distance = Distance::of_storage(&index.storage)?;
+        let distance = Distance::of_storage(storage)?;
         let graph = &index.graph;
         if self.visited.len() != graph.node_count() {
             self.visited = vec![0; graph.node_count()];
@@ -250,9 +252,9 @@ fn neighbor_list<'g>(
 ///
 /// # Errors
 ///
-/// Returns an error when `k` is 0, the file's dimension, code size, or
-/// metric is unusable, or the queries' kind or dimension differs from the
-/// file's.
+/// Returns an error when `k` is 0, the file holds no vectors, its
+/// dimension, code size, or metric is unusable, or the queries' kind or
+/// dimension differs from the file's.
 pub fn search_all(
     index: &HnswIndex<'_>,
     queries: &Queries,
@@ -262,8 +264,9 @@ pub fn search_all(
     if k == 0 {
         return Err(Error::ZeroK);
     }
-    checked_vectors(&index.storage, queries)?;
-    Distance::of_storage(&index.storage)?;
+    let storage = index.storage.as_ref().ok_or(Error::NoVectors)?;
+    checked_vectors(storage, queries)?;
+    Distance::of_storage(storage)?;
     let nodes = index.graph.node_count();
     queries
         .rows()

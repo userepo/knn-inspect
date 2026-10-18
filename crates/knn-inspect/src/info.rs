@@ -8,6 +8,9 @@ use knn_format::NativeFile;
 use knn_format::faiss::{Storage, quantizer_type_name};
 use serde::Serialize;
 
+/// What `info` says of a graph without its vectors in place of them.
+const NO_STORAGE: &str = "none: k-NN keeps the field's quantized vectors in Lucene's .veq file";
+
 #[derive(Serialize)]
 struct Report {
     file: String,
@@ -18,13 +21,28 @@ struct Report {
     dimension: i32,
     count: i64,
     metric: String,
-    /// Bytes per vector, which only a binary index's header records.
+    /// Bytes per vector, which only a binary index's headers record.
     #[serde(skip_serializing_if = "Option::is_none")]
     code_size: Option<i32>,
+    /// What the dimension counts and the storage holds, for text output.
+    #[serde(skip)]
+    kind: Kind,
     #[serde(skip_serializing_if = "Option::is_none")]
     quantizer: Option<QuantizerReport>,
     hnsw: HnswReport,
     ids: IdsReport,
+}
+
+/// The three kinds of storage a file can have, as text output tells them
+/// apart.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// Float32 or scalar-quantized components.
+    Float,
+    /// Packed bits, the dimension counting them.
+    Binary,
+    /// None: a graph whose field's vectors are in Lucene's files.
+    GraphOnly,
 }
 
 #[derive(Serialize)]
@@ -112,7 +130,7 @@ pub fn run(path: &Path, json: bool) -> anyhow::Result<ExitCode> {
 
     let idx = &parsed.index;
     let graph = &idx.index.graph;
-    let storage = &idx.index.storage;
+    let storage = idx.index.storage.as_ref();
     let report = Report {
         file: path.display().to_string(),
         size: bytes.len(),
@@ -125,12 +143,16 @@ pub fn run(path: &Path, json: bool) -> anyhow::Result<ExitCode> {
         layout: idx.layout().iter().map(ToString::to_string).collect(),
         dimension: idx.header.d,
         count: idx.header.ntotal,
-        metric: storage.header().metric().name(),
-        // From the ID map's header, as the dimension and count are.
-        code_size: idx.header.code_size(),
+        metric: idx.metric().name(),
+        code_size: idx.code_size(),
+        kind: match storage {
+            Some(Storage::Flat(_) | Storage::Sq(_)) => Kind::Float,
+            Some(Storage::Binary(_)) => Kind::Binary,
+            None => Kind::GraphOnly,
+        },
         quantizer: match storage {
-            Storage::Flat(_) | Storage::Binary(_) => None,
-            Storage::Sq(s) => Some(QuantizerReport {
+            Some(Storage::Flat(_) | Storage::Binary(_)) | None => None,
+            Some(Storage::Sq(s)) => Some(QuantizerReport {
                 qtype: s.quantizer.qtype,
                 name: quantizer_type_name(s.quantizer.qtype)
                     .unwrap_or("unknown")
@@ -197,14 +219,21 @@ fn print_text(r: &Report) {
         r.payload.offset, r.payload.length, r.payload.trailing_bytes
     );
     println!("  layout          {}", r.layout.join(" > "));
-    match r.code_size {
-        Some(size) => println!(
+    match (r.kind, r.code_size) {
+        (Kind::Binary, Some(size)) => println!(
             "  dimension       {} bits, code size {size} bytes",
             r.dimension
         ),
-        None => println!("  dimension       {}", r.dimension),
+        (Kind::GraphOnly, Some(size)) => println!(
+            "  dimension       {}, code size {size} bytes (quantized vector and correction factors)",
+            r.dimension
+        ),
+        _ => println!("  dimension       {}", r.dimension),
     }
     println!("  vectors         {}", r.count);
+    if r.kind == Kind::GraphOnly {
+        println!("  storage         {NO_STORAGE}");
+    }
     println!("  metric          {}", r.metric);
     if let Some(q) = &r.quantizer {
         println!(

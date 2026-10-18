@@ -1,7 +1,8 @@
 //! The parser against the binary fixtures (`IBMp` > `IBHf` > `IBxF`): the
 //! synthetic ones judged by the values Faiss Python recorded beside each
-//! file, the real ones by Lucene's own copy of the same bits; and against
-//! binary files made malformed by hand.
+//! file, the real ones by Lucene's own copy of the same bits; against the
+//! graph without its vectors k-NN writes for an `on_disk` field (`IBMp` >
+//! `IBHf` > `null`); and against binary files made malformed by hand.
 
 #![allow(
     clippy::unwrap_used,
@@ -78,10 +79,10 @@ struct Manifest {
 }
 
 /// The binary storage of a parsed file, which must be what it holds.
-fn binary<'a>(storage: &'a Storage<'_>, name: &str) -> &'a BinaryStorage<'a> {
+fn binary<'a>(storage: Option<Storage<'a>>, name: &str) -> BinaryStorage<'a> {
     match storage {
-        Storage::Binary(s) => s,
-        Storage::Flat(_) | Storage::Sq(_) => panic!("{name}: expected binary storage"),
+        Some(Storage::Binary(s)) => s,
+        Some(Storage::Flat(_) | Storage::Sq(_)) | None => panic!("{name}: expected binary storage"),
     }
 }
 
@@ -117,7 +118,7 @@ fn synthetic_fixtures_match_faiss_python() {
         assert_eq!(layout, e.layout, "{name}: layout");
         assert_eq!(idx.fourcc, FourCc::BINARY_ID_MAP, "{name}");
         assert_eq!(idx.index.fourcc, FourCc::BINARY_HNSW, "{name}");
-        let storage = binary(&idx.index.storage, name);
+        let storage = binary(idx.index.storage, name);
         for (what, header) in [
             ("idmap", &idx.header),
             ("hnsw", &idx.index.header),
@@ -181,7 +182,7 @@ fn synthetic_fixtures_match_faiss_python() {
 
         // The storage-agnostic accessors agree, counting bytes; bits have
         // no float32 value.
-        let all = &idx.index.storage;
+        let all = &idx.index.storage.unwrap();
         assert_eq!(all.fourcc(), FourCc::BINARY_FLAT);
         assert_eq!(all.component_size(), 1);
         assert_eq!(all.component_count(), e.codes.bytes);
@@ -220,7 +221,7 @@ fn real_binary_fields_parse_and_match_lucene() {
             FourCc::BINARY_FLAT
         ]
     );
-    let storage = binary(&idx.index.storage, &name);
+    let storage = binary(idx.index.storage, &name);
     let code_size = m.dimension / 8;
     for header in [&idx.header, &idx.index.header, &storage.header] {
         assert_eq!(header.d as usize, m.dimension, "{name}");
@@ -280,7 +281,7 @@ fn a_binary_encoder_field_writes_the_same_layout_over_quantized_bits() {
             FourCc::BINARY_FLAT
         ]
     );
-    let storage = binary(&idx.index.storage, "binary-encoder");
+    let storage = binary(idx.index.storage, "binary-encoder");
     assert_eq!(storage.header.d as usize, m.dimension);
     assert_eq!(storage.header.code_size(), Some(2));
     assert_eq!(storage.row_count(), m.count);
@@ -294,26 +295,88 @@ fn a_binary_encoder_field_writes_the_same_layout_over_quantized_bits() {
 }
 
 #[test]
-fn an_on_disk_graph_without_its_vectors_is_refused_by_name() {
+fn an_on_disk_graph_parses_without_its_vectors() {
     // k-NN 3.9 writes an on_disk field's graph with `null` where the
-    // storage would be: its vectors stay in Lucene's files.
-    let path = fixtures().join("opensearch-3.9.0-binary/on-disk/l2/_2_165_vec.faiss");
-    let file = NativeFile::open(&path).unwrap();
-    let err = file.parse().unwrap_err();
-    match &err {
-        Error::UnsupportedLayout {
-            fourcc, expected, ..
-        } => {
-            assert_eq!(*fourcc, FourCc::NULL);
-            assert!(expected.contains("on_disk"), "{expected}");
-        }
-        other => panic!("expected an unsupported layout, got {other:?}"),
-    }
-    assert!(
-        err.to_string()
-            .starts_with("unsupported index type null at offset "),
-        "{err}"
+    // storage would be: its quantized vectors stay in Lucene's files. Both
+    // headers record the field's metric, and the graph's code size counts
+    // a quantized vector (16 components at 1 bit, 2 bytes) and 16 bytes of
+    // correction factors.
+    let dir = fixtures().join("opensearch-3.9.0-binary/on-disk/l2");
+    let m: Manifest =
+        serde_json::from_slice(&fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(m.encoding, "on-disk");
+    let file = NativeFile::open(dir.join("_2_165_vec.faiss")).unwrap();
+    let parsed = file.parse().unwrap();
+    assert_eq!(parsed.trailing, 0);
+    let idx = &parsed.index;
+    assert_eq!(
+        idx.layout(),
+        [FourCc::BINARY_ID_MAP, FourCc::BINARY_HNSW, FourCc::NULL]
     );
+    assert!(idx.index.storage.is_none());
+    for header in [&idx.header, &idx.index.header] {
+        assert_eq!(header.d as usize, m.dimension);
+        assert_eq!(header.ntotal as usize, m.count);
+        assert_eq!(header.metric_type, 1, "l2");
+    }
+    assert_eq!(idx.header.code_size(), Some(2));
+    assert_eq!(idx.index.header.code_size(), Some(18));
+    assert_eq!(idx.code_size(), Some(18), "the graph's, not the id map's");
+    assert_eq!(idx.metric(), Metric::L2);
+    assert_eq!(idx.index.graph.node_count(), m.count);
+    assert_eq!(idx.id_map.len(), m.count);
+    // A merged segment's labels are its doc ids.
+    assert!(
+        idx.id_map
+            .iter()
+            .enumerate()
+            .all(|(i, l)| usize::try_from(l.get()) == Ok(i))
+    );
+    assert_eq!(m.space_type, "l2");
+}
+
+/// [`small`] as a graph without its vectors, as k-NN writes an `on_disk`
+/// field's: `null` in place of the `IBxF` storage and its codes, and the
+/// graph's code size a 2-byte quantized vector plus 16 bytes of correction
+/// factors.
+fn small_graph_only() -> Vec<u8> {
+    let bytes = small();
+    let (hnsw, storage) = fourcc_offsets(&bytes);
+    // The storage: fourcc, 21-byte header, the codes' count, the codes.
+    let count_at = storage + 4 + 21;
+    let codes = u64::from_le_bytes(bytes[count_at..count_at + 8].try_into().unwrap()) as usize;
+    let mut out = bytes[..storage].to_vec();
+    out.extend_from_slice(b"null");
+    out.extend_from_slice(&bytes[count_at + 8 + codes..]);
+    out[hnsw + 8..hnsw + 12].copy_from_slice(&18_i32.to_le_bytes());
+    out
+}
+
+#[test]
+fn a_graph_without_its_vectors_keeps_the_rest_of_the_file() {
+    let bytes = small();
+    let graph_only = small_graph_only();
+    let full = knn_format::parse(&bytes).unwrap();
+    let parsed = knn_format::parse(&graph_only).unwrap();
+    assert!(parsed.index.index.storage.is_none());
+    assert_eq!(parsed.index.layout()[2], FourCc::NULL);
+    // The graph and the labels are read as they are with the storage.
+    let (a, b) = (&full.index.index.graph, &parsed.index.index.graph);
+    assert_eq!(a.levels.as_bytes(), b.levels.as_bytes());
+    assert_eq!(a.offsets.as_bytes(), b.offsets.as_bytes());
+    assert_eq!(a.neighbors.as_bytes(), b.neighbors.as_bytes());
+    assert_eq!(a.entry_point, b.entry_point);
+    assert_eq!(full.index.id_map.as_bytes(), parsed.index.id_map.as_bytes());
+    assert_eq!(parsed.index.end, graph_only.len());
+    assert_eq!(parsed.index.code_size(), Some(18));
+    assert_eq!(parsed.index.metric(), Metric::L2);
+    // Every truncation is an error, inside or right after `null` too.
+    for len in 0..graph_only.len() {
+        assert!(
+            knn_format::parse(&graph_only[..len]).is_err(),
+            "prefix of {len} bytes must not parse"
+        );
+    }
 }
 
 /// The smallest synthetic binary file.
@@ -358,7 +421,7 @@ fn malformed_binary_files_are_errors_not_panics() {
 
     // Binary and float tags do not mix: each layout is read as k-NN writes
     // it.
-    for (at, tag, expected) in [(hnsw, b"IHNf", "IBHf"), (storage, b"IxF2", "IBxF")] {
+    for (at, tag, expected) in [(hnsw, b"IHNf", "IBHf"), (storage, b"IxF2", "IBxF or null")] {
         let mut b = bytes.clone();
         b[at..at + 4].copy_from_slice(tag);
         let err = knn_format::parse(&b).unwrap_err();
@@ -368,8 +431,43 @@ fn malformed_binary_files_are_errors_not_panics() {
         );
     }
     let float = fs::read(fixtures().join("synthetic/l2-100x4.faiss")).unwrap();
+    // `null` under a float graph is refused: k-NN's local build writes it
+    // under `IBHf` only (its remote build writes it under a CAGRA graph,
+    // `IHc2`, a layout this tool does not read, as below).
     let mut b = float.clone();
+    let float_storage = float.windows(4).position(|w| w == b"IxF2").unwrap();
+    b[float_storage..float_storage + 4].copy_from_slice(b"null");
+    let err = knn_format::parse(&b).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            Error::UnsupportedLayout {
+                expected: "IxF2 or IxFI",
+                fourcc: FourCc::NULL,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    // The CAGRA graph of k-NN's remote build, `IHc2` (or Faiss's older
+    // `IHNc`), is refused where the HNSW graph would be.
     let float_hnsw = float.windows(4).position(|w| w == b"IHNf").unwrap();
+    for cagra in [b"IHc2", b"IHNc"] {
+        let mut b = float.clone();
+        b[float_hnsw..float_hnsw + 4].copy_from_slice(cagra);
+        let err = knn_format::parse(&b).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::UnsupportedLayout {
+                    expected: "IHNf or IHNs",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+    let mut b = float.clone();
     b[float_hnsw..float_hnsw + 4].copy_from_slice(b"IBHf");
     let err = knn_format::parse(&b).unwrap_err();
     assert!(
@@ -417,7 +515,7 @@ fn a_zero_code_size_holds_no_rows() {
     let (_, storage) = fourcc_offsets(&bytes);
     bytes[storage + 8..storage + 12].copy_from_slice(&0_i32.to_le_bytes());
     let parsed = knn_format::parse(&bytes).unwrap();
-    let s = binary(&parsed.index.index.storage, "zero code size");
+    let s = binary(parsed.index.index.storage, "zero code size");
     assert_eq!(s.code_size(), None);
     assert_eq!(s.row_count(), 0);
     assert!(s.row(0).is_none());

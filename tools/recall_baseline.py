@@ -16,15 +16,16 @@ Usage:
 
 Writes, next to each synthetic fixture, `<name>.queries.f32`,
 `<name>.results.jsonl`, and `<name>.recall.json`; next to each real
-fixture's manifest, `queries.f32`, `results.jsonl`, and `recall.json`;
-float, fp16, bf16, and byte fixtures alike. For scalar-quantized storage
-the brute force runs over the vectors Faiss decodes from the codes. The
-queries of a byte file are integers too, as a byte field receives them,
-each component drawn from the values the file stores in that position.
-A binary file's queries are packed bits, `queries.u8` in place of
-`queries.f32`, each byte drawn from the bytes the file stores in that
-position; Faiss searches and brute-forces them by Hamming distance.
-Rewrite them whenever the fixtures are regenerated.
+fixture's manifest whose native file holds vectors, `queries.f32`,
+`results.jsonl`, and `recall.json`; float, fp16, bf16, and byte fixtures
+alike. For scalar-quantized storage the brute force runs over the
+vectors Faiss decodes from the codes. The queries of a byte file are
+integers too, as a byte field receives them, each component drawn from
+the values the file stores in that position. A binary file's queries are
+packed bits, `queries.u8` in place of `queries.f32`, each byte drawn
+from the bytes the file stores in that position; Faiss searches and
+brute-forces them by Hamming distance. Rewrite them whenever the
+fixtures are regenerated.
 """
 
 from __future__ import annotations
@@ -66,8 +67,8 @@ REAL_SETS = (
 )
 
 # Real sets whose native file holds a graph without its vectors (a `null`
-# storage), which Faiss Python cannot read.
-UNREADABLE = ("on-disk",)
+# storage): there is nothing to search or score.
+NO_VECTORS = ("on-disk",)
 
 
 def payload(path: pathlib.Path) -> np.ndarray:
@@ -216,7 +217,7 @@ def main() -> None:
         for m in (args.fixtures / real).glob("*/*/manifest.json")
     ):
         # A graph without its vectors has nothing to search.
-        if manifest.parent.parent.name in UNREADABLE:
+        if manifest.parent.parent.name in NO_VECTORS:
             continue
         files = json.loads(manifest.read_text(encoding="utf-8"))["files"]
         native = next(f["name"] for f in files if f["name"].endswith((".faiss", ".faissc")))

@@ -31,7 +31,11 @@ fn info_exit_codes() {
     let real = fixtures().join("opensearch-3.9.0/cfs/l2/_2_165_vec.faissc");
     let o = run(&["info", real.to_str().unwrap()]);
     assert_eq!(o.status.code(), Some(0));
-    assert!(stdout(&o).contains("IxMp > IHNf > IxF2"));
+    let text = stdout(&o);
+    assert!(text.contains("IxMp > IHNf > IxF2"));
+    // A float file's dimension counts components, and it has storage.
+    assert!(text.contains("  dimension       16\n"), "{text}");
+    assert!(!text.contains("  storage "), "{text}");
 
     let o = run(&["info", "no-such-file.faiss"]);
     assert_eq!(o.status.code(), Some(1));
@@ -902,7 +906,7 @@ fn scan_searches_zero_filled_vectors_in_linear_time() {
     let mut bytes = std::fs::read(fixtures().join("synthetic/l2-4000x64.faiss")).unwrap();
     let (start, len) = {
         let parsed = knn_format::parse(&bytes).unwrap();
-        let codes = parsed.index.index.storage.flat().unwrap().codes;
+        let codes = parsed.index.index.storage.unwrap().flat().unwrap().codes;
         (
             knn_format::view_offset(&bytes, codes).unwrap(),
             codes.len() * 4,
@@ -1346,7 +1350,7 @@ impl SqSegment {
         let meta = std::fs::read(dir.join(vec_name).with_extension("vemf")).unwrap();
         let codes = {
             let parsed = knn_format::parse(&native).unwrap();
-            let storage = parsed.index.index.storage;
+            let storage = parsed.index.index.storage.unwrap();
             knn_format::view_offset(&native, storage.code_bytes()).unwrap()
         };
         Self {
@@ -1703,7 +1707,11 @@ fn scan_checks_where_the_vemf_puts_the_vectors() {
     // did not. The .vemf says where the field is, so this is a mismatch.
     let codes = {
         let parsed = knn_format::parse(&seg.native).unwrap();
-        knn_format::view_offset(&seg.native, parsed.index.index.storage.code_bytes()).unwrap()
+        knn_format::view_offset(
+            &seg.native,
+            parsed.index.index.storage.unwrap().code_bytes(),
+        )
+        .unwrap()
     };
     let bytes = 500 * 16 * 4;
     let mut shifted = vec![0_u8; 4];
@@ -2077,7 +2085,11 @@ fn scan_flags_binary_codes_that_differ_from_the_lucene_copy() {
     // One bit of the native codes flipped, the file resealed.
     let codes = {
         let parsed = knn_format::parse(&seg.native).unwrap();
-        knn_format::view_offset(&seg.native, parsed.index.index.storage.code_bytes()).unwrap()
+        knn_format::view_offset(
+            &seg.native,
+            parsed.index.index.storage.unwrap().code_bytes(),
+        )
+        .unwrap()
     };
     seg.native[codes + 100] ^= 0x01;
     reseal(&mut seg.native);
@@ -2192,7 +2204,11 @@ fn scan_flags_corrupt_bits_beside_float_fields_that_are_not_theirs() {
     let mut seg = BinarySegment::new("binary-and-float", "opensearch-3.9.0-binary/binary/hamming");
     let codes = {
         let parsed = knn_format::parse(&seg.native).unwrap();
-        knn_format::view_offset(&seg.native, parsed.index.index.storage.code_bytes()).unwrap()
+        knn_format::view_offset(
+            &seg.native,
+            parsed.index.index.storage.unwrap().code_bytes(),
+        )
+        .unwrap()
     };
     seg.native[codes + 100] ^= 0x01;
     reseal(&mut seg.native);
@@ -2265,7 +2281,11 @@ fn a_mismatch_names_the_field_that_was_compared() {
     let mut seg = BinarySegment::new("binary-reason", "opensearch-3.9.0-binary/binary/hamming");
     let codes = {
         let parsed = knn_format::parse(&seg.native).unwrap();
-        knn_format::view_offset(&seg.native, parsed.index.index.storage.code_bytes()).unwrap()
+        knn_format::view_offset(
+            &seg.native,
+            parsed.index.index.storage.unwrap().code_bytes(),
+        )
+        .unwrap()
     };
     seg.native[codes + 100] ^= 0x01;
     reseal(&mut seg.native);
@@ -2341,7 +2361,11 @@ fn equally_close_fields_report_the_last() {
     let mut seg = BinarySegment::new("binary-ties", "opensearch-3.9.0-binary/binary/hamming");
     let codes = {
         let parsed = knn_format::parse(&seg.native).unwrap();
-        knn_format::view_offset(&seg.native, parsed.index.index.storage.code_bytes()).unwrap()
+        knn_format::view_offset(
+            &seg.native,
+            parsed.index.index.storage.unwrap().code_bytes(),
+        )
+        .unwrap()
     };
     seg.native[codes + 100] ^= 0x01;
     reseal(&mut seg.native);
@@ -2362,13 +2386,177 @@ fn equally_close_fields_report_the_last() {
 }
 
 #[test]
-fn scan_reports_an_on_disk_graph_as_unsupported() {
-    // k-NN 3.9 writes an on_disk field's graph without its vectors, a
-    // layout this tool does not read. The file is sound, so scan says
-    // unsupported, exit code 2, with the structure check naming the
-    // layout; verify alone fails it.
+fn on_disk_graphs_are_read_without_their_vectors() {
+    // k-NN 3.9 writes an on_disk field's graph with `null` in place of its
+    // storage, keeping the quantized vectors in Lucene's .veq. Every
+    // command but recall reads it; the graph records the field's metric.
     let dir = fixtures().join("opensearch-3.9.0-binary/on-disk/l2");
+    let file = dir.join("_2_165_vec.faiss");
+    let path = file.to_str().unwrap();
+
+    let o = run(&["info", "--json", path]);
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["layout"], serde_json::json!(["IBMp", "IBHf", "null"]));
+    assert_eq!(v["dimension"], 16, "{v}");
+    assert_eq!(v["count"], 500, "{v}");
+    assert_eq!(v["metric"], "l2", "{v}");
+    // The graph's bytes per vector: 2 of quantized bits and 16 of
+    // correction factors, where the ID map's header says 16 / 8.
+    assert_eq!(v["code_size"], 18, "{v}");
+    assert!(v.get("quantizer").is_none(), "{v}");
+    assert_eq!(v["ids"]["len"], 500, "{v}");
+    let text = stdout(&run(&["info", path]));
+    assert!(
+        text.contains(
+            "  dimension       16, code size 18 bytes (quantized vector and correction factors)\n"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("  storage         none: k-NN keeps the field's quantized vectors in Lucene's .veq file\n"),
+        "{text}"
+    );
+    assert!(text.contains("  metric          l2\n"), "{text}");
+
+    // Clean as the l2 field it is; the vector checks are skipped.
+    let o = run(&["verify", "--json", "--space", "l2", path]);
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["status"], "clean", "{v}");
+    for check in v["checks"].as_array().unwrap() {
+        let skipped = check.get("skipped").and_then(|s| s.as_str());
+        match check["name"].as_str().unwrap() {
+            "vector_count" | "vector_values" => assert!(
+                skipped.is_some_and(|s| s.contains("holds the graph only")),
+                "{check}"
+            ),
+            "norms" => assert!(skipped.is_some(), "{check}"),
+            _ => assert!(skipped.is_none(), "{check}"),
+        }
+    }
+    let o = run(&["verify", "--space", "innerproduct", path]);
+    assert_eq!(o.status.code(), Some(1), "{}", stdout(&o));
+    assert!(
+        stdout(&o)
+            .contains("file records metric l2, but an innerproduct field needs inner_product"),
+        "{}",
+        stdout(&o)
+    );
+
+    let o = run(&["stats", "--json", path]);
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["nodes"], 500, "{v}");
+
+    // No vectors to search or score.
+    let o = run(&["recall", path, "--sample", "5"]);
+    assert_eq!(o.status.code(), Some(1), "{}", stdout(&o));
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        err.contains(&format!("{path}: the file holds the graph only")),
+        "{err}"
+    );
+
     let o = run(&["scan", dir.to_str().unwrap(), "--json"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    let f = &v["files"][0];
+    assert_eq!(f["status"], "clean", "{f}");
+    assert_eq!(f["layout"], serde_json::json!(["IBMp", "IBHf", "null"]));
+    assert_eq!(f["metric"], "l2", "{f}");
+    assert_eq!(f["code_size"], 18, "{f}");
+    // Whatever .vec lies beside it: this segment's holds the float32
+    // vectors.
+    assert_eq!(f["lucene_vectors"]["status"], "skipped", "{f}");
+    assert!(
+        f["lucene_vectors"]["detail"]
+            .as_str()
+            .unwrap()
+            .starts_with("the native file holds the graph only"),
+        "{f}"
+    );
+    assert_eq!(f["lucene_docs"]["status"], "match", "{f}");
+    let text = stdout(&run(&["scan", dir.to_str().unwrap()]));
+    assert!(
+        text.contains("    clean       IBMp > IBHf > null  d=16 n=500 l2\n"),
+        "{text}"
+    );
+    // Nor does a float file's dimension count bits.
+    let float = fixtures().join("opensearch-3.9.0/nocfs/l2");
+    let text = stdout(&run(&["scan", float.to_str().unwrap()]));
+    assert!(
+        text.contains("    clean       IxMp > IHNf > IxF2  d=16 n=500 l2\n"),
+        "{text}"
+    );
+
+    // With no .vec beside it, the reason is still the missing vectors.
+    let scratch = Scratch::new("graph-only-alone");
+    std::fs::copy(&file, scratch.0.join("_2_165_vec.faiss")).unwrap();
+    let o = run(&["scan", scratch.0.to_str().unwrap(), "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    let lv = &v["files"][0]["lucene_vectors"];
+    assert_eq!(lv["status"], "skipped", "{lv}");
+    assert!(
+        lv["detail"]
+            .as_str()
+            .unwrap()
+            .starts_with("the native file holds the graph only"),
+        "{lv}"
+    );
+}
+
+#[test]
+fn info_and_scan_report_a_graph_only_files_metric() {
+    // The metric comes from the ID map's header: the graph-only fixture
+    // whose graph header says 0 (inner product) under an ID map that says
+    // 1 reports l2, and with the ID map's set to 0 too, inner_product.
+    let source = fixtures().join("corrupted/graph-only-metric-types.faiss");
+    let o = run(&["info", "--json", source.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["metric"], "l2", "{v}");
+    let scratch = Scratch::new("graph-only-ip");
+    let ip_file = scratch.0.join("_2_165_vec.faiss");
+    std::fs::copy(&source, &ip_file).unwrap();
+    let o = run(&["scan", scratch.0.to_str().unwrap(), "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["files"][0]["metric"], "l2", "{v}");
+    let mut ip = std::fs::read(&source).unwrap();
+    // The metric type closes the ID map's 21-byte header.
+    ip[21..25].copy_from_slice(&0_i32.to_le_bytes());
+    std::fs::write(&ip_file, &ip).unwrap();
+    let o = run(&["info", "--json", ip_file.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["metric"], "inner_product", "{v}");
+    let o = run(&["scan", scratch.0.to_str().unwrap(), "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["files"][0]["metric"], "inner_product", "{v}");
+}
+
+#[test]
+fn scan_reports_a_sound_file_it_cannot_read_as_unsupported() {
+    // A real fp16 file whose quantizer type is changed to 5 (QT_8bit_direct,
+    // which k-NN never writes), resealed: sound, but in a type this tool
+    // does not decode. scan says unsupported, exit code 2, with the
+    // structure check naming the type; verify alone fails it.
+    let source = fixtures().join("opensearch-3.9.0-fp16/sq-fp16/l2/_2_165_vec.faiss");
+    let mut bytes = std::fs::read(&source).unwrap();
+    let qtype_at = {
+        let parsed = knn_format::parse(&bytes).unwrap();
+        match parsed.index.index.storage {
+            Some(knn_format::faiss::Storage::Sq(s)) => s.quantizer.offset,
+            other => panic!("expected scalar-quantized storage, got {other:?}"),
+        }
+    };
+    bytes[qtype_at..qtype_at + 4].copy_from_slice(&5_i32.to_le_bytes());
+    reseal(&mut bytes);
+    let scratch = Scratch::new("unsupported");
+    let native = scratch.0.join("_2_165_vec.faiss");
+    std::fs::write(&native, &bytes).unwrap();
+
+    let o = run(&["scan", scratch.0.to_str().unwrap(), "--json"]);
     assert_eq!(o.status.code(), Some(2), "{}", stdout(&o));
     let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
     assert_eq!(v["status"], "unsupported", "{v}");
@@ -2385,27 +2573,27 @@ fn scan_reports_an_on_disk_graph_as_unsupported() {
         structure["findings"][0]["message"]
             .as_str()
             .unwrap()
-            .contains("null is a graph without its vectors"),
+            .starts_with("scalar quantizer type 5 (QT_8bit_direct)"),
         "{structure}"
     );
     assert_eq!(
         f["lucene_vectors"]["detail"],
-        "the native file's layout is not supported"
+        "the native file's scalar quantizer type is not supported"
     );
     assert_eq!(
         f["lucene_docs"]["detail"],
-        "the native file's layout is not supported"
+        "the native file's scalar quantizer type is not supported"
     );
-    let o = run(&["scan", dir.to_str().unwrap()]);
+    let o = run(&["scan", scratch.0.to_str().unwrap()]);
     let text = stdout(&o);
     assert!(
-        text.contains("    unsupported (a layout this tool does not read)\n"),
+        text.contains("    unsupported (a layout or quantizer type this tool does not read)\n"),
         "{text}"
     );
-    // The structure finding names the layout, as a note: the file is not
+    // The structure finding names the type, as a note: the file is not
     // failed for it.
     assert!(
-        text.contains("    note        structure            unsupported index type null"),
+        text.contains("    note        structure            scalar quantizer type 5"),
         "{text}"
     );
     assert!(!text.contains("FAIL"), "{text}");
@@ -2415,26 +2603,50 @@ fn scan_reports_an_on_disk_graph_as_unsupported() {
         ),
         "{text}"
     );
-    let o = run(&["verify", dir.join("_2_165_vec.faiss").to_str().unwrap()]);
+    let o = run(&["verify", native.to_str().unwrap()]);
     assert_eq!(o.status.code(), Some(1), "{}", stdout(&o));
 
-    // The same layout in a file whose footer does not verify, or with no
-    // footer at all, is failed: nothing says the unknown fourcc is not
+    // The same type in a file whose footer does not verify, or with no
+    // footer at all, is failed: nothing says the unknown type is not
     // damage.
-    let scratch = Scratch::new("unsupported-damaged");
-    let mut bytes = std::fs::read(dir.join("_2_165_vec.faiss")).unwrap();
     let at = bytes.len() - 1;
     bytes[at] ^= 0xff;
-    std::fs::write(scratch.0.join("_2_165_vec.faiss"), &bytes).unwrap();
+    std::fs::write(&native, &bytes).unwrap();
     let o = run(&["scan", scratch.0.to_str().unwrap(), "--json"]);
     assert_eq!(o.status.code(), Some(1), "{}", stdout(&o));
     let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
     assert_eq!(v["files"][0]["status"], "failed", "{v}");
-    let bare = fixtures().join("corrupted/wrong-fourcc.faiss");
-    std::fs::copy(bare, scratch.0.join("_2_165_vec.faiss")).unwrap();
+    assert_eq!(
+        v["files"][0]["lucene_vectors"]["detail"],
+        "the native file did not parse"
+    );
+    let bare = fixtures().join("corrupted/fp16-unsupported-qtype.faiss");
+    std::fs::copy(bare, &native).unwrap();
     let o = run(&["scan", scratch.0.to_str().unwrap(), "--json"]);
     let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
     assert_eq!(v["files"][0]["status"], "failed", "{v}");
+    assert_eq!(
+        v["files"][0]["lucene_docs"]["detail"],
+        "the native file did not parse"
+    );
+
+    // A layout this tool does not read, as a fourcc it does not know: a
+    // real float file whose storage is renamed IxPQ, resealed.
+    let mut float =
+        std::fs::read(fixtures().join("opensearch-3.9.0/nocfs/l2/_2_165_vec.faiss")).unwrap();
+    let at = float.windows(4).position(|w| w == b"IxF2").unwrap();
+    float[at..at + 4].copy_from_slice(b"IxPQ");
+    reseal(&mut float);
+    std::fs::write(&native, &float).unwrap();
+    let o = run(&["scan", scratch.0.to_str().unwrap(), "--json"]);
+    assert_eq!(o.status.code(), Some(2), "{}", stdout(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    let f = &v["files"][0];
+    assert_eq!(f["status"], "unsupported", "{f}");
+    assert_eq!(
+        f["lucene_vectors"]["detail"],
+        "the native file's layout is not supported"
+    );
 }
 
 #[test]
@@ -2451,6 +2663,17 @@ fn info_reports_the_id_maps_code_size() {
     assert_eq!(v["dimension"], 16, "{v}");
     let o = run(&["verify", path]);
     assert_eq!(o.status.code(), Some(1), "{}", stdout(&o));
+    // The same with the graph header saying 3: still the ID map's.
+    let scratch = Scratch::new("binary-graph-code-size");
+    let mut bytes =
+        std::fs::read(fixtures().join("synthetic-binary/hamming-100x16-binary.faiss")).unwrap();
+    let hnsw = bytes.windows(4).position(|w| w == b"IBHf").unwrap();
+    bytes[hnsw + 8..hnsw + 12].copy_from_slice(&3_i32.to_le_bytes());
+    let graph_says_3 = scratch.0.join("graph.faiss");
+    std::fs::write(&graph_says_3, &bytes).unwrap();
+    let o = run(&["info", "--json", graph_says_3.to_str().unwrap()]);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["code_size"], 2, "{v}");
     // A float file records no code size.
     let float = fixtures().join("synthetic/l2-100x4.faiss");
     let o = run(&["info", "--json", float.to_str().unwrap()]);

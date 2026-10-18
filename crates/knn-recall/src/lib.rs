@@ -111,6 +111,12 @@ pub enum Error {
     /// `k` was 0.
     #[error("k must be at least 1")]
     ZeroK,
+    /// The file is a graph without its vectors, which k-NN keeps in
+    /// Lucene's files for the field.
+    #[error(
+        "the file holds the graph only, no vectors to search: k-NN keeps the field's quantized vectors in Lucene's .veq file"
+    )]
+    NoVectors,
     /// Two nodes carry the same label, so a result cannot be resolved.
     #[error("label {label} belongs to nodes {first} and {second}")]
     DuplicateLabel {

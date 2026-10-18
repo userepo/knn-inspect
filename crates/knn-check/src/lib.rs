@@ -89,18 +89,30 @@ pub enum Check {
     Structure,
     /// No bytes between the index and the footer.
     Trailing,
-    /// The three Faiss headers agree and hold supported values; for
-    /// scalar-quantized storage, the quantizer's dimension and code size
-    /// match them and it holds no trained values; for binary storage, the
+    /// The Faiss headers agree on dimension and count and hold supported
+    /// values, and agree on the rest where k-NN reads it; for scalar-
+    /// quantized storage, the quantizer's dimension and code size match
+    /// them and it holds no trained values; for binary storage, the
     /// dimension is a multiple of 8 and the code size is its bytes, and a
-    /// metric type other than the one k-NN writes is a warning.
+    /// metric type other than the one k-NN writes is a warning. A graph
+    /// without its vectors has two headers; the ID map's metric type,
+    /// which k-NN reads, must name L2 or inner product, and what k-NN
+    /// writes but does not read warns when it differs: the graph's metric
+    /// type from the ID map's, an ID map code size other than the
+    /// dimension / 8, and a graph code size other than a quantized vector
+    /// at 1, 2, or 4 bits per component, as Lucene packs it, plus 16
+    /// bytes of correction factors. Its dimension and count must still
+    /// agree, as every layout's must, and a negative value is refused
+    /// when the file is parsed.
     Headers,
     /// `--space` matches the metric the file records. With `--space
     /// cosine`, byte storage is also reported, as a warning or, when the
     /// metric does not match either, in the failure: k-NN refuses
     /// cosinesimil for byte fields. Binary storage, which computes Hamming
     /// distance, passes as `hamming`, and with any other space is noted:
-    /// k-NN writes it for float fields with the binary encoder too.
+    /// k-NN writes it for float fields with the binary encoder too. A
+    /// graph without its vectors is checked by the metric its ID map's
+    /// header records, which k-NN reads.
     Metric,
     /// Neighbor offsets are monotonic and end at the neighbor array.
     Offsets,
@@ -115,12 +127,14 @@ pub enum Check {
     NeighborLevels,
     /// The storage holds exactly `count x dimension` components: float32
     /// elements, two bytes each of fp16 or bf16 codes, or one byte each of
-    /// byte codes; binary storage, `count x code size` bytes.
+    /// byte codes; binary storage, `count x code size` bytes. Skipped for
+    /// a graph without its vectors, as are the vector values and norms.
     VectorCount,
     /// The ID map holds one label per node.
     IdMapLength,
     /// No NaN or infinite vector components. Skipped for byte and binary
-    /// storage, where no code is either.
+    /// storage, where no code is either, and for a graph without its
+    /// vectors.
     VectorValues,
     /// No node lists the same neighbor twice on one level.
     DuplicateNeighbors,
@@ -129,7 +143,8 @@ pub enum Check {
     /// With `--space cosine`: every vector has unit length. Skipped for
     /// byte storage, which k-NN never normalizes, since it refuses
     /// cosinesimil for byte fields (the metric check reports the space
-    /// instead), and for binary storage, whose bits have no length.
+    /// instead), for binary storage, whose bits have no length, and for a
+    /// graph without its vectors.
     Norms,
 }
 

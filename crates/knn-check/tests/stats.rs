@@ -22,8 +22,8 @@ fn fixtures() -> PathBuf {
 }
 
 /// Every baseline: `<name>.stats.json` beside each synthetic fixture,
-/// `stats.json` beside each real one, float, fp16, bf16, byte, and
-/// binary.
+/// `stats.json` beside each real one, float, fp16, bf16, byte, binary,
+/// and a graph without its vectors.
 fn baselines() -> Vec<PathBuf> {
     let mut out = Vec::new();
     for synthetic in [
@@ -49,6 +49,7 @@ fn baselines() -> Vec<PathBuf> {
         "opensearch-3.9.0-byte/byte",
         "opensearch-3.9.0-binary/binary",
         "opensearch-3.9.0-binary/binary-encoder",
+        "opensearch-3.9.0-binary/on-disk",
     ] {
         for entry in fs::read_dir(fixtures().join(set)).unwrap() {
             out.push(entry.unwrap().path().join("stats.json"));
@@ -92,7 +93,7 @@ fn stats_match_faiss_python() {
         unreachable_seen += stats.layers.iter().map(|l| l.unreachable).sum::<usize>();
         seen += 1;
     }
-    assert_eq!(seen, 37, "18 synthetic and 19 real baselines");
+    assert_eq!(seen, 38, "18 synthetic and 20 real baselines");
     // l2-4000x64 has unreachable nodes on levels 0 and 1, so the search
     // itself is compared, not only the empty case.
     assert_eq!(unreachable_seen, 8);

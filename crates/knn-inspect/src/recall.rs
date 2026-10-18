@@ -96,8 +96,10 @@ struct Search {
 ///
 /// # Errors
 ///
-/// Returns the open, parse, or read error, wrapped with the path, and any
-/// mismatch between the file, the queries, the results, and the ids.
+/// Returns the open, parse, or read error, wrapped with the path; the
+/// refusal of a file that holds no vectors (a graph without them), also
+/// with the path; and any mismatch between the file, the queries, the
+/// results, and the ids.
 pub fn run(args: &RecallArgs) -> anyhow::Result<ExitCode> {
     let path = &args.file;
     let file = NativeFile::open(path).with_context(|| format!("opening {}", path.display()))?;
@@ -105,7 +107,12 @@ pub fn run(args: &RecallArgs) -> anyhow::Result<ExitCode> {
         .parse()
         .with_context(|| format!("parsing {}", path.display()))?;
     let index = &parsed.index;
-    let storage = &index.index.storage;
+    let storage = index
+        .index
+        .storage
+        .as_ref()
+        .ok_or(knn_recall::Error::NoVectors)
+        .with_context(|| path.display().to_string())?;
     // The dimension queries must have: the file's, or for binary storage
     // the bits of its code size, which Faiss reads every vector by.
     let dimension = knn_recall::query_dimension(storage)
@@ -113,7 +120,7 @@ pub fn run(args: &RecallArgs) -> anyhow::Result<ExitCode> {
 
     let (queries, sample) = load_queries(args, storage, dimension)?;
     let (results, search) = results_for(args, index, &queries)?;
-    let labels = load_labels(args, index)?;
+    let labels = load_labels(args, index, storage.row_count())?;
 
     let started = Instant::now();
     let truth = knn_recall::ground_truth(storage, &queries, args.k)?;
@@ -197,7 +204,11 @@ fn results_for(
 }
 
 /// What the result lists' labels mean: the file's ID map, or `--ids`.
-fn load_labels(args: &RecallArgs, index: &IdMapIndex<'_>) -> anyhow::Result<Labels> {
+fn load_labels(
+    args: &RecallArgs,
+    index: &IdMapIndex<'_>,
+    vectors: usize,
+) -> anyhow::Result<Labels> {
     let Some(p) = &args.ids else {
         return Labels::from_id_map(index.id_map)
             .with_context(|| format!("{}: id map", args.file.display()));
@@ -208,7 +219,6 @@ fn load_labels(args: &RecallArgs, index: &IdMapIndex<'_>) -> anyhow::Result<Labe
     // A map that does not name every vector exactly once can only be the
     // wrong map; scoring with it would report the gap as unknown labels
     // instead of saying why.
-    let vectors = index.index.storage.row_count();
     if ids.len() != vectors {
         bail!(
             "{}: {} ids for {vectors} vectors; --ids needs one per vector, in storage order",

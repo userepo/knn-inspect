@@ -410,6 +410,46 @@
     }
   },
   {
+    "file": "graph-only-code-size.faiss",
+    "source": "fixtures/synthetic-binary/hamming-100x16-binary.faiss",
+    "mutation": "as a graph without its vectors, the graph's code size set to 17, one byte short of a 2-byte quantized vector and 16 bytes of correction factors, which k-NN never writes and never reads",
+    "space": null,
+    "expect": {
+      "check": "headers",
+      "severity": "warning"
+    }
+  },
+  {
+    "file": "graph-only-id-map-code-size.faiss",
+    "source": "fixtures/synthetic-binary/hamming-100x16-binary.faiss",
+    "mutation": "as a graph without its vectors, the ID map's code size set to 3 for dimension 16, which k-NN never writes and never reads",
+    "space": null,
+    "expect": {
+      "check": "headers",
+      "severity": "warning"
+    }
+  },
+  {
+    "file": "graph-only-metric-types.faiss",
+    "source": "fixtures/synthetic-binary/hamming-100x16-binary.faiss",
+    "mutation": "as a graph without its vectors, the graph's metric type set to 0 (inner product) under an ID map that says 1 (L2), the one k-NN reads",
+    "space": null,
+    "expect": {
+      "check": "headers",
+      "severity": "warning"
+    }
+  },
+  {
+    "file": "graph-only-metric-unknown.faiss",
+    "source": "fixtures/synthetic-binary/hamming-100x16-binary.faiss",
+    "mutation": "as a graph without its vectors, both headers' metric type set to 2, neither L2 nor inner product, which k-NN refuses to load",
+    "space": null,
+    "expect": {
+      "check": "headers",
+      "severity": "failure"
+    }
+  },
+  {
     "file": "hamming-float-file.faiss",
     "source": "fixtures/synthetic/l2-100x4.faiss",
     "mutation": "an L2 float file verified with --space hamming, which k-NN accepts for binary fields only",

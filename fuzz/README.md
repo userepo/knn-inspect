@@ -2,8 +2,9 @@
 
 One libFuzzer target, `parse_and_verify`, feeds arbitrary bytes to
 `knn_format::parse`, `knn_check::verify`, `knn_check::graph_stats`, and
-an HNSW search (`knn_recall::Searcher`) over whatever graph parsed, and
-to the segment info and flat-vectors metadata readers
+an HNSW search (`knn_recall::Searcher`) over whatever graph parsed (one
+without its vectors must refuse the search), and to the segment info and
+flat-vectors metadata readers
 (`knn_format::segment_info`, `knn_format::flat_vectors`). The rule under
 test: any input yields a result, never a panic or an out-of-bounds read.
 

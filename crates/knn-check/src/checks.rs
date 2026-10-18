@@ -34,8 +34,18 @@ const HAMMING_SPACE: &str = "k-NN accepts hamming for binary fields only";
 /// Why binary storage can belong to a float field too.
 const BINARY_ENCODER: &str = "k-NN writes it for a float field with the binary encoder too, whose index compares the quantized bits by hamming distance";
 
+/// Why a graph without its vectors has none to check.
+const NO_VECTORS: &str =
+    "the file holds the graph only: k-NN keeps the field's quantized vectors in Lucene's .veq file";
+
+/// Bytes of correction factors k-NN stores after each quantized vector of
+/// a graph without its vectors (lower and upper interval, additional
+/// correction, component sum), which the graph's code size counts.
+const CORRECTION_BYTES: i32 = 16;
+
 /// The metric type Faiss's `IndexBinary` starts with and k-NN never
-/// changes: `METRIC_L2`, which a binary index does not use.
+/// changes over binary storage: `METRIC_L2`, which that index does not
+/// use. (A graph without its vectors records its build metric instead.)
 const BINARY_METRIC_TYPE: i32 = 1;
 
 /// Runs every check over `bytes`.
@@ -141,13 +151,30 @@ fn check_trailing(col: &mut Collector, parsed: &Parsed<'_>) {
 }
 
 fn check_headers(col: &mut Collector, bytes: &[u8], idx: &IdMapIndex<'_>) {
-    let headers: [(&str, &IndexHeader); 3] = [
-        ("id map", &idx.header),
-        ("hnsw", &idx.index.header),
-        ("storage", idx.index.storage.header()),
+    let storage = idx.index.storage.as_ref();
+    // How each header's metric type is used. A graph without its vectors
+    // records the distance it was built for, where binary storage computes
+    // hamming distance whatever its headers say.
+    let graph_only = storage.is_none();
+    let role = |h: &IndexHeader| match h.kind {
+        HeaderKind::Float { .. } => MetricRole::Read,
+        HeaderKind::Binary { .. } if graph_only => MetricRole::Read,
+        HeaderKind::Binary { .. } => MetricRole::Hamming,
+    };
+    let graph_role = if graph_only {
+        MetricRole::Unread
+    } else {
+        role(&idx.index.header)
+    };
+    let mut headers: Vec<(&str, &IndexHeader, MetricRole)> = vec![
+        ("id map", &idx.header, role(&idx.header)),
+        ("hnsw", &idx.index.header, graph_role),
     ];
+    if let Some(storage) = storage {
+        headers.push(("storage", storage.header(), role(storage.header())));
+    }
     let first = &idx.header;
-    for (name, h) in &headers {
+    for &(name, h, role) in &headers {
         let at = Some(h.offset);
         if h.d != first.d {
             col.fail(
@@ -171,29 +198,11 @@ fn check_headers(col: &mut Collector, bytes: &[u8], idx: &IdMapIndex<'_>) {
                 None,
             );
         }
-        // A binary index does not use its metric type, so disagreeing ones
-        // change nothing; the warning below reports any k-NN never writes.
-        if h.metric_type != first.metric_type && !matches!(h.kind, HeaderKind::Binary { .. }) {
-            col.fail(
-                Check::Headers,
-                format!(
-                    "{name} header metric {} differs from the id map's {}",
-                    h.metric_type, first.metric_type
-                ),
-                at,
-                None,
-            );
-        }
-        if let Metric::Other(m) = h.metric() {
-            col.fail(
-                Check::Headers,
-                format!("{name} header metric type {m} is not L2 (1) or inner product (0)"),
-                at,
-                None,
-            );
-        }
+        // A graph without its vectors counts each quantized vector with its
+        // correction factors, which `check_graph_code_sizes` checks.
         if let (Some(size), Some(first_size)) = (h.code_size(), first.code_size())
             && size != first_size
+            && role != MetricRole::Unread
         {
             col.fail(
                 Check::Headers,
@@ -202,20 +211,7 @@ fn check_headers(col: &mut Collector, bytes: &[u8], idx: &IdMapIndex<'_>) {
                 None,
             );
         }
-        // Faiss computes Hamming distance for a binary index whatever its
-        // metric type says, so another value changes no search; but k-NN
-        // never writes one.
-        if matches!(h.kind, HeaderKind::Binary { .. }) && h.metric_type != BINARY_METRIC_TYPE {
-            col.warn(
-                Check::Headers,
-                format!(
-                    "{name} header records metric type {}; a binary index computes hamming distance whatever it says, and k-NN writes {BINARY_METRIC_TYPE}",
-                    h.metric_type
-                ),
-                at,
-                None,
-            );
-        }
+        check_header_metric(col, name, h, first, role);
         if !h.is_trained {
             col.warn(
                 Check::Headers,
@@ -233,11 +229,93 @@ fn check_headers(col: &mut Collector, bytes: &[u8], idx: &IdMapIndex<'_>) {
             None,
         );
     }
-    if let Storage::Sq(storage) = &idx.index.storage {
+    if let Some(Storage::Sq(storage)) = storage {
         check_quantizer(col, bytes, storage, first.d);
     }
     if let HeaderKind::Binary { code_size } = first.kind {
-        check_binary_shape(col, first, code_size);
+        if graph_only {
+            check_graph_code_sizes(col, first, code_size, &idx.index.header);
+        } else {
+            check_binary_shape(col, first, code_size);
+        }
+    }
+}
+
+/// How a header's metric type is used, which decides what is checked of
+/// it. For the graph header of a graph without its vectors, it also spares
+/// the code size the comparison with the ID map's.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MetricRole {
+    /// A float index's, or the ID map's of a graph without its vectors,
+    /// which k-NN reads: it must agree with the ID map's and name L2 or
+    /// inner product, the only types k-NN loads.
+    Read,
+    /// Binary storage's headers': it computes Hamming distance whatever
+    /// they say, and k-NN writes [`BINARY_METRIC_TYPE`] in each.
+    Hamming,
+    /// The graph header of a graph without its vectors: k-NN takes the ID
+    /// map's metric for it and writes both alike.
+    Unread,
+}
+
+/// One header's metric type, against the ID map's. A value that is read
+/// fails when it is wrong; one that is not only warns, since it changes no
+/// search, when it is not what k-NN writes.
+fn check_header_metric(
+    col: &mut Collector,
+    name: &str,
+    h: &IndexHeader,
+    first: &IndexHeader,
+    role: MetricRole,
+) {
+    let at = Some(h.offset);
+    if role == MetricRole::Unread {
+        if h.metric_type != first.metric_type {
+            col.warn(
+                Check::Headers,
+                format!(
+                    "{name} header metric {} differs from the id map's {}, which k-NN reads instead; k-NN writes both alike",
+                    h.metric_type, first.metric_type
+                ),
+                at,
+                None,
+            );
+        }
+        return;
+    }
+    if role == MetricRole::Hamming {
+        // Another value changes no search, but k-NN never writes one.
+        if h.metric_type != BINARY_METRIC_TYPE {
+            col.warn(
+                Check::Headers,
+                format!(
+                    "{name} header records metric type {}; a binary index computes hamming distance whatever it says, and k-NN writes {BINARY_METRIC_TYPE}",
+                    h.metric_type
+                ),
+                at,
+                None,
+            );
+        }
+        return;
+    }
+    if h.metric_type != first.metric_type {
+        col.fail(
+            Check::Headers,
+            format!(
+                "{name} header metric {} differs from the id map's {}",
+                h.metric_type, first.metric_type
+            ),
+            at,
+            None,
+        );
+    }
+    if let Metric::Other(m) = Metric::from_type(h.metric_type) {
+        col.fail(
+            Check::Headers,
+            format!("{name} header metric type {m} is not L2 (1) or inner product (0)"),
+            at,
+            None,
+        );
     }
 }
 
@@ -264,6 +342,56 @@ fn check_binary_shape(col: &mut Collector, header: &IndexHeader, code_size: i32)
                 d / 8
             ),
             code_size_at,
+            None,
+        );
+    }
+}
+
+/// The code sizes of a graph without its vectors, which k-NN writes as
+/// below and never reads (its vectors come from Lucene's files), so one
+/// that differs warns, as an unread metric type does. Its dimension counts
+/// the field's float components and need not be a multiple of 8: k-NN's
+/// patched Faiss lets its graph skip that rule. The ID map's code size is
+/// still the dimension / 8, rounded down, as Faiss sets it for any binary
+/// ID map. The graph's is a quantized vector plus [`CORRECTION_BYTES`] of
+/// correction factors, the vector as long as Lucene 10.5.1's encoder packs
+/// it at one of the three bit widths k-NN keeps (its `ScalarEncoding`):
+/// `ceil(d / 8)` bytes at 1 bit a component, two planes of those at 2,
+/// and `ceil(d / 2)` at 4.
+fn check_graph_code_sizes(
+    col: &mut Collector,
+    first: &IndexHeader,
+    code_size: i32,
+    hnsw: &IndexHeader,
+) {
+    let d = first.d;
+    if code_size != d / 8 {
+        col.warn(
+            Check::Headers,
+            format!(
+                "id map header code size {code_size} is not {}, the dimension {d} / 8 Faiss sets for a binary id map; k-NN does not read it",
+                d / 8
+            ),
+            first.offset.checked_add(8),
+            None,
+        );
+    }
+    let Some(graph_size) = hnsw.code_size() else {
+        return;
+    };
+    // In i64, where no sum can overflow; the parser refuses negative
+    // dimensions.
+    let one_bit = (i64::from(d) + 7) / 8;
+    let packed = [one_bit, 2 * one_bit, (i64::from(d) + 1) / 2];
+    let stored = i64::from(graph_size) - i64::from(CORRECTION_BYTES);
+    if !packed.contains(&stored) {
+        let [one, two, four] = packed;
+        col.warn(
+            Check::Headers,
+            format!(
+                "hnsw header code size {graph_size} is not {CORRECTION_BYTES} bytes of correction factors plus a quantized vector of dimension {d}, which takes {one} bytes at 1 bit a component, {two} at 2, or {four} at 4; k-NN does not read it"
+            ),
+            hnsw.offset.checked_add(8),
             None,
         );
     }
@@ -322,12 +450,12 @@ fn check_metric(col: &mut Collector, idx: &IdMapIndex<'_>, space: Option<Space>)
         col.skip(Check::Metric, "no --space given");
         return;
     };
-    let storage = &idx.index.storage;
-    // A binary index belongs to a hamming field of binary vectors, or to a
+    let storage = idx.index.storage.as_ref();
+    // Binary storage belongs to a hamming field of binary vectors, or to a
     // float field of any other space whose vectors k-NN quantizes to bits
     // (the binary encoder). Either is valid, and only the field mapping
     // says which, so a float space is noted, not failed.
-    if let Storage::Binary(_) = storage {
+    if let Some(storage @ Storage::Binary(_)) = storage {
         if space != Space::Hamming {
             col.info(
                 Check::Metric,
@@ -342,7 +470,13 @@ fn check_metric(col: &mut Collector, idx: &IdMapIndex<'_>, space: Option<Space>)
         }
         return;
     }
-    let metric = storage.header().metric();
+    // A graph without its vectors records the metric k-NN built it for,
+    // the field's space as Faiss names it, in both headers; k-NN reads the
+    // ID map's.
+    let (metric, metric_at) = match storage {
+        Some(storage) => (storage.header().metric(), storage.header().offset),
+        None => (idx.metric(), idx.header.offset),
+    };
     let wanted = match space {
         Space::L2 => Metric::L2,
         Space::InnerProduct | Space::Cosine => Metric::InnerProduct,
@@ -352,7 +486,7 @@ fn check_metric(col: &mut Collector, idx: &IdMapIndex<'_>, space: Option<Space>)
     // over normalized vectors, cannot normalize bytes, and refuses the
     // space for byte fields when the mapping is created.
     let byte_cosine = match storage {
-        Storage::Sq(s) if space == Space::Cosine && s.format == CodeFormat::Byte => {
+        Some(Storage::Sq(s)) if space == Space::Cosine && s.format == CodeFormat::Byte => {
             Some(s.quantizer.offset)
         }
         _ => None,
@@ -374,7 +508,7 @@ fn check_metric(col: &mut Collector, idx: &IdMapIndex<'_>, space: Option<Space>)
                 space.name(),
                 wanted.name()
             ),
-            Some(storage.header().offset),
+            Some(metric_at),
             None,
         );
     } else if let Some(at) = byte_cosine {
@@ -652,7 +786,10 @@ fn node_of_slot(graph: &HnswGraph<'_>, slot: usize) -> Option<usize> {
 }
 
 fn check_vector_count(col: &mut Collector, idx: &IdMapIndex<'_>) {
-    let storage = &idx.index.storage;
+    let Some(storage) = &idx.index.storage else {
+        col.skip(Check::VectorCount, NO_VECTORS);
+        return;
+    };
     // Counted as the file counts them: float32 elements, or bytes of
     // codes.
     let (held, per_component, unit) = match storage {
@@ -668,7 +805,7 @@ fn check_vector_count(col: &mut Collector, idx: &IdMapIndex<'_>) {
             },
         ),
         Storage::Binary(s) => {
-            check_binary_count(col, idx, s.codes.len());
+            check_binary_count(col, idx, s.header.offset, s.codes.len());
             return;
         }
     };
@@ -694,7 +831,7 @@ fn check_vector_count(col: &mut Collector, idx: &IdMapIndex<'_>) {
 
 /// Binary storage holds `count x code size` bytes, by the id map's
 /// header, as Faiss's own reader requires of the storage's.
-fn check_binary_count(col: &mut Collector, idx: &IdMapIndex<'_>, held: usize) {
+fn check_binary_count(col: &mut Collector, idx: &IdMapIndex<'_>, storage_at: usize, held: usize) {
     let code_size = idx.header.code_size().unwrap_or(0);
     let expected = usize::try_from(idx.header.ntotal)
         .ok()
@@ -708,7 +845,7 @@ fn check_binary_count(col: &mut Collector, idx: &IdMapIndex<'_>, held: usize) {
                 idx.header.ntotal,
                 expected.map_or_else(|| "more than fit".to_owned(), |e| e.to_string())
             ),
-            Some(idx.index.storage.header().offset),
+            Some(storage_at),
             None,
         );
     }
@@ -731,7 +868,10 @@ fn check_id_map_length(col: &mut Collector, bytes: &[u8], idx: &IdMapIndex<'_>) 
 }
 
 fn check_vector_values(col: &mut Collector, bytes: &[u8], idx: &IdMapIndex<'_>) {
-    let storage = &idx.index.storage;
+    let Some(storage) = &idx.index.storage else {
+        col.skip(Check::VectorValues, NO_VECTORS);
+        return;
+    };
     match storage {
         Storage::Sq(s) if s.format == CodeFormat::Byte => {
             col.skip(Check::VectorValues, "every byte code is a finite value");
@@ -826,7 +966,10 @@ fn check_norms(col: &mut Collector, bytes: &[u8], idx: &IdMapIndex<'_>, space: O
         col.skip(Check::Norms, "only meaningful with --space cosine");
         return;
     }
-    let storage = &idx.index.storage;
+    let Some(storage) = &idx.index.storage else {
+        col.skip(Check::Norms, NO_VECTORS);
+        return;
+    };
     let base = view_offset(bytes, storage.code_bytes());
     let size = storage.component_size();
     let tolerance = match storage {

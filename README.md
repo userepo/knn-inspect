@@ -10,11 +10,12 @@ Rust, read-only, and does not link Faiss or talk to a cluster.
 ## Status
 
 Every command reads every layout listed under [Supported
-files](#supported-files), and is checked against Faiss Python and
-Lucene's own files on the fixtures, real OpenSearch 3.9.0 segments
-included. The JSON output of each command is documented in
-[docs/json.md](docs/json.md) with a stability rule: fields are only
-added. The library crates' APIs may still change between minor versions.
+files](#supported-files), except that `recall` needs one that holds
+vectors. Each is checked against Faiss Python and Lucene's own files on
+the fixtures, real OpenSearch 3.9.0 segments included. The JSON output
+of each command is documented in [docs/json.md](docs/json.md) with a
+stability rule: fields are only added. The library crates' APIs may
+still change between minor versions.
 [docs/format-notes.md](docs/format-notes.md) describes the file formats
 byte by byte.
 
@@ -48,29 +49,43 @@ storage, HNSW parameters, level sizes, and the label range. Exit code 0
 when the file parsed, 1 otherwise. A cosine field reports
 `inner_product`, because that is what the file records; k-NN normalizes
 the vectors instead. A binary file reports `hamming`, the distance a
-binary index computes, and its dimension in bits.
+binary index computes, and its dimension in bits. A graph without its
+vectors, as k-NN writes for an `on_disk` field, reports the metric it
+was built for (`l2` or `inner_product`, or `metric_n` for any other type
+`n`), its dimension in components, and the graph's code size: a
+quantized vector plus 16 bytes of correction factors.
 
 `verify` runs every structural check and prints one line per check.
 Failures: footer checksum, truncation, an unsupported layout or scalar
 quantizer type, trailing bytes, disagreeing headers (except in the
-metric type of binary headers, which a binary index does not use; for
-scalar-quantized storage, the quantizer's dimension and code size too;
-for binary storage, a dimension that is not a multiple of 8 or a code
-size other than its bytes), a `--space` that does not match the stored
-metric, non-monotonic neighbor offsets, node levels that contradict the
-slot counts, an invalid entry point, neighbor ids out of range, a
-neighbor listed on a level it is not on, a vector array or ID map of the
-wrong size. Warnings: an unexpected Lucene header, a Faiss header that
-says the index is not trained, trained values in a scalar quantizer, a
-binary header with a metric type k-NN never writes, NaN or infinite
-components, duplicate neighbors, self-loops, byte storage checked as a
-cosine field (k-NN refuses to create one), and with `--space cosine`,
-zero or non-unit vectors. Binary storage matches `--space hamming`, the
-only space k-NN takes for binary fields, and any other space is noted
-rather than failed: k-NN writes the same binary index for a float field
-with the binary encoder. Exit code 0 when clean, 1 on any failure, 2 on
-warnings only. Where a finding points at bytes or a node, it names the
-file offset and node, so it can be looked up in a hex dump.
+metric type of binary storage's headers, which binary storage does not
+use, and in the header values of a graph without its vectors that k-NN
+does not read, which warn instead; for scalar-quantized storage, the
+quantizer's dimension and code size too; for binary storage, a dimension
+that is not a multiple of 8 or a code size other than its bytes; for a
+graph without its vectors, an ID map metric type other than L2 or inner
+product), a `--space` that does not match the stored metric,
+non-monotonic neighbor offsets, node levels that contradict the slot
+counts, an invalid entry point, neighbor ids out of range, a neighbor
+listed on a level it is not on, a vector array or ID map of the wrong
+size. Warnings: an unexpected Lucene header, a Faiss header that says
+the index is not trained, trained values in a scalar quantizer, a binary
+storage header with a metric type k-NN never writes, header values k-NN
+writes for a graph without its vectors but never reads when they differ
+from what it writes (a graph metric type other than the ID map's, an ID
+map code size other than the dimension / 8, a graph code size other than
+a quantized vector at 1, 2, or 4 bits per component plus 16 bytes of
+correction factors), NaN or infinite components, duplicate neighbors,
+self-loops, byte storage checked as a cosine field (k-NN refuses to
+create one), and with `--space cosine`, zero or non-unit vectors. Binary
+storage matches `--space hamming`, the only space k-NN takes for binary
+fields, and any other space is noted rather than failed: k-NN writes the
+same binary index for a float field with the binary encoder. A graph
+without its vectors is checked against the metric its ID map records,
+which k-NN reads, and its vector count, values, and norms are skipped.
+Exit code 0 when clean, 1 on any failure, 2 on warnings only. Where a
+finding points at bytes or a node, it names the file offset and node, so
+it can be looked up in a hex dump.
 
 `stats` reports, per graph level, the node count, neighbor slots, edges,
 the out-degree histogram, and the nodes no search can reach. A node's
@@ -121,18 +136,19 @@ A label matches when its vector is at least as close to the query as the
 k-th nearest, so a tie with the k-th neighbor counts; a label repeated
 within a list counts once, and -1 (Faiss's "no result") never matches.
 The report gives recall@k, a histogram of matches per query, and counts
-of the anomalies above. Exit code 0 when the results were scored, 1
-otherwise.
+of the anomalies above. A graph without its vectors has nothing to
+search or score, so `recall` refuses it. Exit code 0 when the results
+were scored, 1 otherwise.
 
 `scan` finds every `.faiss` and `.faissc` file under a directory,
 subdirectories included, and runs `verify` on each, printing one summary
 line per file (layout, dimension, count, metric, verdict) and the checks
-that failed or warned. For a file in a layout this tool does not read,
-it prints the structure check's finding, which names the layout, as a
-note. Links to directories are not followed, so a link back up the tree
-cannot loop; a link to a native file is scanned like the file. A
-subdirectory that cannot be read is listed as not scanned, and the rest
-of the tree still is.
+that failed or warned. For a file in a layout or scalar quantizer type
+this tool does not read, it prints the structure check's finding, which
+names it, as a note. Links to directories are not followed, so a link
+back up the tree cannot loop; a link to a native file is scanned like
+the file. A subdirectory that cannot be read is listed as not scanned,
+and the rest of the tree still is.
 
 `scan` also cross-checks each native file against the Lucene files of
 its segment. The `.vec` file holds the same vectors in the same order,
@@ -148,24 +164,26 @@ encoder does). A byte field's `.vec` holds the int8 values the codes are
 bits byte for byte. A float field with the binary encoder writes a
 binary index over bits that quantize its float32 vectors, which its
 `.vec` holds; the check is skipped for it, since the bits cannot be
-compared with the floats without the field's quantization state. Where
-the segment's `.vemf` lies beside the `.vec`, the vectors must be
-exactly where it records the field; without one, or with a sound one in
-a format this tool does not read, `scan` searches the `.vec` at every
-offset Lucene could have used. The `.si` file gives the segment's
-document count, and every label in the ID map, which k-NN sets to a doc
-id, must be one of the segment's doc ids. A `.vec`, `.vemf`, or `.si`
-that is there but cannot be read, or fails its own checksum, fails the
-native file too: the segment cannot be trusted as it stands. A sound
-`.si` in a format this tool does not read, as a newer Lucene may write,
-is skipped instead. `--space` applies to every file found; leave it out
-when the directory mixes space types. A sound file in a layout this tool
-does not read, such as an `on_disk` field's, is reported as
-`unsupported` rather than failed: `verify` alone fails it, but a scan of
-a whole index must not read it as corruption. Exit code 0 when every
-file is clean, 1 if any failed (or would not open, a subdirectory could
-not be read, or none was found), 2 if the worst verdict was a warning or
-an unsupported file.
+compared with the floats without the field's quantization state. It is
+skipped for a graph without its vectors too, whose quantized vectors are
+in Lucene's `.veq`, which this tool does not read. Where the segment's
+`.vemf` lies beside the `.vec`, the vectors must be exactly where it
+records the field; without one, or with a sound one in a format this
+tool does not read, `scan` searches the `.vec` at every offset Lucene
+could have used. The `.si` file gives the segment's document count, and
+every label in the ID map, which k-NN sets to a doc id, must be one of
+the segment's doc ids. A `.vec`, `.vemf`, or `.si` that is there but
+cannot be read, or fails its own checksum, fails the native file too:
+the segment cannot be trusted as it stands. A sound `.si` in a format
+this tool does not read, as a newer Lucene may write, is skipped
+instead. `--space` applies to every file found; leave it out when the
+directory mixes space types. A sound file in a layout or scalar
+quantizer type this tool does not read is reported as `unsupported`
+rather than failed: `verify` alone fails it, but a scan of a whole index
+must not read it as corruption. Exit code 0 when every file is clean, 1
+if any failed (or would not open, a subdirectory could not be read, or
+none was found), 2 if the worst verdict was a warning or an unsupported
+file.
 
 ## Benchmarks
 
@@ -235,18 +253,21 @@ encoder with `type: fp16` or `type: bf16`, and the `half_float` and
 product over normalized vectors, and is refused for byte fields); and a
 binary ID map wrapping binary HNSW over packed bits, compared by Hamming
 distance (the `binary` data type, whose only space is `hamming`, and
-float fields with the binary encoder); with or without the Lucene
-footer. Every command reads all of them. Fixtures and format notes
-target OpenSearch 3.9.0.
+float fields with the binary encoder); and the same binary ID map and
+HNSW graph without its vectors, which k-NN 3.9's local build writes for
+an `on_disk` field or an `sq` encoder of 1, 2, or 4 bits, keeping the
+quantized vectors in Lucene's files; with or without the Lucene footer.
+Every command reads all of them, except that `recall` needs vectors to
+search. Fixtures and format notes target OpenSearch 3.9.0.
 
-Not yet: other scalar-quantized storage, product quantization, IVF, and
-the graph without its vectors that k-NN 3.9 writes for an `on_disk`
-field or an `sq` encoder of 1, 2, or 4 bits, whose quantized vectors
-stay in Lucene's files. Their files are refused rather than misread, as
-an unsupported layout or scalar quantizer type: `verify` fails them, and
-`scan` reports those whose footer verifies as `unsupported`. NMSLIB and
-Lucene-engine fields write no `.faiss` file, so `scan` does not see
-them.
+Not yet: other scalar-quantized storage, product quantization, IVF, the
+quantized vectors of a graph without its vectors, in Lucene's `.veq`,
+and the float graph without its vectors (a CAGRA graph, `IHc2` or the
+older `IHNc`, over `null`) that k-NN's remote index build writes. Files
+in another layout or scalar quantizer type are refused rather than
+misread: `verify` fails them, and `scan` reports those whose footer
+verifies as `unsupported`. NMSLIB and Lucene-engine fields write no
+`.faiss` file, so `scan` does not see them.
 
 ## Pinned versions
 
@@ -284,20 +305,22 @@ fixtures and baselines use faiss-cpu 1.15.1.
   of 128 bits, the signs of the `l2` vectors (`binary/hamming/`); of a
   float field with the binary encoder, one bit per component
   (`binary-encoder/l2/`); and of an `on_disk` float field, whose native
-  file this tool refuses (`on-disk/l2/`), and which has no baselines,
-  since Faiss Python cannot read it either
+  file holds the graph only (`on-disk/l2/`), with graph statistics but
+  no recall baselines
 - `*.stats.json` beside each synthetic fixture and `stats.json` beside
   each real one - the graph statistics Faiss Python computes from the
-  same file, the baseline `stats` must match
+  same file (for a graph without its vectors, from a copy Faiss can
+  read), the baseline `stats` must match
 - `*.queries.f32`, `*.results.jsonl`, and `*.recall.json` beside each
   synthetic fixture (`queries.f32`, `results.jsonl`, `recall.json`
-  beside each real one) - 100 fixed queries, the labels Faiss's HNSW
-  search returns for them, and the recall@10 Faiss computes for those
-  results, the baseline `recall` must match; a binary file's queries are
-  packed bits, `*.queries.u8` (`queries.u8` beside a real one)
-- `fixtures/corrupted/` - one file per structural check, each derived
-  from a clean fixture by a single mutation; `manifest.json` records the
-  mutation and the check and severity it must trip
+  beside each real one that holds vectors) - 100 fixed queries, the
+  labels Faiss's HNSW search returns for them, and the recall@10 Faiss
+  computes for those results, the baseline `recall` must match; a binary
+  file's queries are packed bits, `*.queries.u8` (`queries.u8` beside a
+  real one)
+- `fixtures/corrupted/` - files that each trip the structural check
+  named for them, each derived from a clean fixture; `manifest.json`
+  records the change and the check and severity it must trip
 
 Each real fixture directory also holds `vectors.f32`, the indexed vectors
 in doc-id order (row i is Faiss label i), or for a binary field
@@ -352,10 +375,11 @@ so rewrite them after regenerating either fixture set:
 
 - `tools/strip_envelope.py <file>` reports and verifies the Lucene footer;
   with `--out` it writes the bare Faiss payload for `faiss.read_index`
-  (`faiss.read_index_binary` for a binary file)
+  (`faiss.read_index_binary` for a binary file with its vectors)
 - `tools/walk_faiss.py <file>` prints every Faiss field with its offset
 - `tools/graph_stats.py <file>` prints the graph statistics from the
-  graph Faiss Python loads
+  graph Faiss Python loads (for a graph without its vectors, from a copy
+  with zero-filled storage, which Faiss can read)
 
 ## Fuzzing
 

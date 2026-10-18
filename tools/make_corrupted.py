@@ -1,10 +1,11 @@
 #!/usr/bin/env python
-"""Write corrupted fixtures, one per structural check, from the clean ones.
+"""Write corrupted fixtures from the clean ones, each for a named check.
 
-Each case takes a clean fixture, applies one mutation at an offset found
-with the walker in `walk_faiss.py`, and records in `manifest.json` which
-check must trip and at what severity. The Rust tests in `knn-check` read
-the manifest, so they need no Python.
+Each case takes a clean fixture, applies a mutation at an offset found
+with the walker in `walk_faiss.py` (within a conversion, for the
+`graph-only-` cases below), and records in `manifest.json` which check
+must trip and at what severity. The Rust tests in `knn-check` read the
+manifest, so they need no Python.
 
 Bare synthetic files carry no footer, so a mutation there exercises just
 the structural check it targets; the real OpenSearch file carries a
@@ -12,7 +13,11 @@ footer, so it is used for the envelope and checksum cases. The `fp16-`,
 `bf16-`, and `byte-` cases mutate the smallest synthetic fp16, bf16, and
 byte files, for the checks that read the scalar quantizer and its codes,
 and the `binary-` cases the smallest binary file, for the checks that
-read the binary headers and codes.
+read the binary headers and codes. The `graph-only-` cases turn that
+file into a graph without its vectors, as k-NN writes an `on_disk`
+field's (`null` in place of the `IBxF` storage, the graph's code size a
+2-byte quantized vector plus 16 bytes of correction factors), then
+mutate it, for the header rules of that layout.
 
 Usage:
     python tools/make_corrupted.py [--out fixtures/corrupted]
@@ -346,6 +351,42 @@ def build() -> Cases:
         return d[: o + n - 2] + d[o + n :]
 
     c.add("binary-codes-short", SYNTHETIC_BINARY, "last vector's 2 code bytes removed and the byte count lowered to match", "vector_count", "failure", binary_codes_short)
+
+    # --- graph only: a binary graph without its vectors ---
+    def graph_only(mutate):
+        def apply(d, f):
+            put(d, f["hnsw.code_size"]["offset"], "<i", 2 + 16)
+            d = mutate(d, f)
+            start = f["storage.fourcc"]["offset"]
+            end = f["storage.codes.data"]["offset"] + f["storage.codes.data"]["size"]
+            return d[:start] + b"null" + d[end:]
+
+        return apply
+
+    def graph_code_size(d, f):
+        put(d, f["hnsw.code_size"]["offset"], "<i", 17)
+        return d
+
+    c.add("graph-only-code-size", SYNTHETIC_BINARY, "as a graph without its vectors, the graph's code size set to 17, one byte short of a 2-byte quantized vector and 16 bytes of correction factors, which k-NN never writes and never reads", "headers", "warning", graph_only(graph_code_size))
+
+    def graph_id_map_code_size(d, f):
+        put(d, f["idmap.code_size"]["offset"], "<i", 3)
+        return d
+
+    c.add("graph-only-id-map-code-size", SYNTHETIC_BINARY, "as a graph without its vectors, the ID map's code size set to 3 for dimension 16, which k-NN never writes and never reads", "headers", "warning", graph_only(graph_id_map_code_size))
+
+    def graph_metric_types(d, f):
+        put(d, f["hnsw.metric_type"]["offset"], "<i", 0)
+        return d
+
+    c.add("graph-only-metric-types", SYNTHETIC_BINARY, "as a graph without its vectors, the graph's metric type set to 0 (inner product) under an ID map that says 1 (L2), the one k-NN reads", "headers", "warning", graph_only(graph_metric_types))
+
+    def graph_metric_unknown(d, f):
+        for prefix in ("idmap", "hnsw"):
+            put(d, f[f"{prefix}.metric_type"]["offset"], "<i", 2)
+        return d
+
+    c.add("graph-only-metric-unknown", SYNTHETIC_BINARY, "as a graph without its vectors, both headers' metric type set to 2, neither L2 nor inner product, which k-NN refuses to load", "headers", "failure", graph_only(graph_metric_unknown))
 
     c.add("hamming-float-file", SYNTHETIC_L2, "an L2 float file verified with --space hamming, which k-NN accepts for binary fields only", "metric", "failure", lambda d, f: d, space="hamming")
 

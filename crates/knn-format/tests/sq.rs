@@ -94,10 +94,10 @@ struct Manifest {
 
 /// The scalar-quantized storage of a parsed file, which must be what it
 /// holds.
-fn sq<'a>(storage: &'a Storage<'_>, name: &str) -> &'a SqStorage<'a> {
+fn sq<'a>(storage: Option<Storage<'a>>, name: &str) -> SqStorage<'a> {
     match storage {
-        Storage::Sq(s) => s,
-        Storage::Flat(_) | Storage::Binary(_) => {
+        Some(Storage::Sq(s)) => s,
+        Some(Storage::Flat(_) | Storage::Binary(_)) | None => {
             panic!("{name}: expected scalar-quantized storage")
         }
     }
@@ -164,7 +164,7 @@ fn synthetic_fixtures_match_faiss_python() {
         let idx = &parsed.index;
         let layout: Vec<String> = idx.layout().iter().map(ToString::to_string).collect();
         assert_eq!(layout, e.layout, "{name}: layout");
-        let storage = sq(&idx.index.storage, name);
+        let storage = sq(idx.index.storage, name);
         for (what, header) in [
             ("idmap", &idx.header),
             ("hnsw", &idx.index.header),
@@ -242,7 +242,7 @@ fn synthetic_fixtures_match_faiss_python() {
         }
 
         // The storage-agnostic accessors agree with the codes' view.
-        let all = &idx.index.storage;
+        let all = &idx.index.storage.unwrap();
         assert_eq!(all.fourcc(), FourCc::SCALAR_QUANTIZER);
         assert_eq!(all.component_size(), size);
         assert_eq!(
@@ -303,7 +303,7 @@ fn real_fixtures_parse_and_match_lucene() {
             "innerproduct" | "cosinesimil" => Metric::InnerProduct,
             other => panic!("unexpected space {other}"),
         };
-        let storage = sq(&idx.index.storage, &name);
+        let storage = sq(idx.index.storage, &name);
         assert_eq!(storage.header.metric(), expected_metric, "{name}");
         assert_eq!(idx.header.d as usize, m.dimension, "{name}");
         assert_eq!(idx.header.ntotal as usize, m.count, "{name}");
@@ -378,7 +378,7 @@ fn real_fixtures_parse_and_match_lucene() {
                 );
             }
         }
-        vectors_file_holds_the_values(&name, dir, storage, m.space_type == "cosinesimil");
+        vectors_file_holds_the_values(&name, dir, &storage, m.space_type == "cosinesimil");
     }
 }
 
@@ -479,7 +479,7 @@ fn small() -> Vec<u8> {
 fn offsets_agree_with_the_walker() {
     let bytes = small();
     let parsed = knn_format::parse(&bytes).unwrap();
-    let storage = sq(&parsed.index.index.storage, "l2-100x4-fp16");
+    let storage = sq(parsed.index.index.storage, "l2-100x4-fp16");
     assert_eq!(storage.header.offset, SQ_TAG);
     assert_eq!(storage.quantizer.offset, QTYPE);
     // The codes' byte count (800) at 14,699 and the codes at 14,707.
@@ -513,7 +513,7 @@ fn other_quantizer_types_are_unsupported() {
     bytes[QTYPE..QTYPE + 4].copy_from_slice(&7_i32.to_le_bytes());
     let parsed = knn_format::parse(&bytes).unwrap();
     assert_eq!(
-        sq(&parsed.index.index.storage, "bf16").format,
+        sq(parsed.index.index.storage, "bf16").format,
         CodeFormat::Bf16
     );
 
@@ -522,7 +522,7 @@ fn other_quantizer_types_are_unsupported() {
     // `verify` to report, not the parser.
     bytes[QTYPE..QTYPE + 4].copy_from_slice(&8_i32.to_le_bytes());
     let parsed = knn_format::parse(&bytes).unwrap();
-    let s = sq(&parsed.index.index.storage, "byte");
+    let s = sq(parsed.index.index.storage, "byte");
     assert_eq!(s.format, CodeFormat::Byte);
     assert_eq!(s.row_count(), 200);
     assert_eq!(s.quantizer.code_size, 8);
@@ -596,7 +596,7 @@ fn an_odd_code_length_parses_and_keeps_whole_rows_only() {
     // fewer whole row.
     let bytes = small();
     let parsed = knn_format::parse(&bytes).unwrap();
-    let codes = sq(&parsed.index.index.storage, "l2-100x4-fp16").codes;
+    let codes = sq(parsed.index.index.storage, "l2-100x4-fp16").codes;
     let start = knn_format::view_offset(&bytes, codes).unwrap();
     let end = start + codes.len();
     let mut cut = bytes[..end - 1].to_vec();
@@ -604,8 +604,8 @@ fn an_odd_code_length_parses_and_keeps_whole_rows_only() {
     cut[start - 8..start].copy_from_slice(&(codes.len() as u64 - 1).to_le_bytes());
 
     let parsed = knn_format::parse(&cut).unwrap();
-    let storage = &parsed.index.index.storage;
-    let s = sq(storage, "cut");
+    let storage = parsed.index.index.storage.unwrap();
+    let s = sq(Some(storage), "cut");
     assert_eq!(s.codes.len(), 799);
     assert_eq!(s.row_count(), 99);
     assert!(s.row(99).is_none());
@@ -650,7 +650,7 @@ fn a_partial_byte_row_is_left_out() {
     // component accessors stop at the last whole one.
     let bytes = fs::read(fixtures().join("synthetic-byte/l2-100x4-byte.faiss")).unwrap();
     let parsed = knn_format::parse(&bytes).unwrap();
-    let codes = sq(&parsed.index.index.storage, "l2-100x4-byte").codes;
+    let codes = sq(parsed.index.index.storage, "l2-100x4-byte").codes;
     let start = knn_format::view_offset(&bytes, codes).unwrap();
     let end = start + codes.len();
     let mut cut = bytes[..end - 1].to_vec();
@@ -658,8 +658,8 @@ fn a_partial_byte_row_is_left_out() {
     cut[start - 8..start].copy_from_slice(&(codes.len() as u64 - 1).to_le_bytes());
 
     let parsed = knn_format::parse(&cut).unwrap();
-    let storage = &parsed.index.index.storage;
-    let s = sq(storage, "cut");
+    let storage = parsed.index.index.storage.unwrap();
+    let s = sq(Some(storage), "cut");
     assert_eq!(s.format, CodeFormat::Byte);
     assert_eq!(s.codes.len(), 399);
     assert_eq!(s.row_count(), 99);
@@ -680,14 +680,14 @@ fn a_zero_dimension_has_no_rows() {
     let mut bytes = fs::read(fixtures().join("synthetic-byte/l2-100x4-byte.faiss")).unwrap();
     let storage_d = {
         let parsed = knn_format::parse(&bytes).unwrap();
-        sq(&parsed.index.index.storage, "l2-100x4-byte")
+        sq(parsed.index.index.storage, "l2-100x4-byte")
             .header
             .offset
             + 4
     };
     bytes[storage_d..storage_d + 4].copy_from_slice(&0_i32.to_le_bytes());
     let parsed = knn_format::parse(&bytes).unwrap();
-    let s = sq(&parsed.index.index.storage, "d = 0");
+    let s = sq(parsed.index.index.storage, "d = 0");
     assert_eq!(s.header.d, 0);
     assert_eq!(s.row_count(), 0);
     assert!(s.row(0).is_none());
@@ -708,7 +708,7 @@ fn decoded_row(storage: Storage<'_>, i: usize) -> Option<impl Iterator<Item = f3
 fn a_decoded_row_outlives_the_storage_value() {
     let bytes = fs::read(fixtures().join("synthetic-byte/l2-100x4-byte.faiss")).unwrap();
     let parsed = knn_format::parse(&bytes).unwrap();
-    let row: Vec<f32> = decoded_row(parsed.index.index.storage, 0)
+    let row: Vec<f32> = decoded_row(parsed.index.index.storage.unwrap(), 0)
         .unwrap()
         .collect();
     assert_eq!(row.len(), 4);

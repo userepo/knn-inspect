@@ -13,13 +13,21 @@ each lower level from every node reached on the level above (any of them
 can be where a search descends), and the search follows only neighbors
 that exist and are on that level.
 
+A graph without its vectors (`IBMp` > `IBHf` > `null`, as k-NN writes an
+`on_disk` field's) is read through a copy Faiss accepts: zero-filled
+`IBxF` storage in place of the `null`, which Faiss cannot read in a
+binary index, and every header's dimension and code size restated as a
+plain binary index's (faiss-cpu 1.15.1 checks code size = dimension / 8,
+which the graph's quantized vectors and correction factors are not). The
+graph's own bytes are unchanged.
+
 Usage:
     python tools/graph_stats.py <file.faiss>          print the statistics
     python tools/graph_stats.py --fixtures fixtures   rewrite the baselines
 
 The baselines are `<name>.stats.json` next to each synthetic fixture and
 `stats.json` next to each real fixture's manifest, float, fp16, bf16,
-byte, and binary alike.
+byte, binary, and graphs without their vectors alike.
 Rewrite them whenever the fixtures are regenerated: real fixtures get new
 neighbor arrays on every extraction.
 """
@@ -30,6 +38,7 @@ import argparse
 import collections
 import json
 import pathlib
+import struct
 import sys
 
 import faiss
@@ -39,6 +48,38 @@ import numpy as np
 # directory off the path, so it is put back.
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from strip_envelope import parse_footer, parse_header  # noqa: E402
+from walk_faiss import Walker  # noqa: E402
+
+
+def with_zero_storage(payload: bytes) -> bytes:
+    """A binary payload Faiss reads, with zero-filled `IBxF` where `null` is.
+
+    Every header's dimension is rounded up to a multiple of 8 and its code
+    size that / 8, as Faiss's reader requires of a binary index; the
+    storage takes the graph header's count and metric type, and count x
+    code size zero bytes, which is all Faiss checks of it. Nothing reads
+    those bytes, and the graph's are left as they are. A payload with
+    storage is returned as it is.
+    """
+    walker = Walker(payload)
+    summary = walker.walk()
+    if summary["storage"] is not None:
+        return payload
+    offsets = {f["field"]: f["offset"] for f in walker.fields}
+    h = summary["hnsw"]
+    d = -(-h["d"] // 8) * 8
+    code_size = d // 8
+    out = bytearray(payload)
+    for prefix in ("idmap", "hnsw"):
+        struct.pack_into("<ii", out, offsets[f"{prefix}.d"], d, code_size)
+    at = offsets["storage.fourcc"]
+    storage = (
+        b"IBxF"
+        + struct.pack("<iiq?i", d, code_size, h["ntotal"], True, h["metric_type"])
+        + struct.pack("<Q", h["ntotal"] * code_size)
+        + bytes(h["ntotal"] * code_size)
+    )
+    return bytes(out[:at]) + storage + bytes(out[at + 4 :])
 
 
 def load_graph(path: pathlib.Path) -> dict:
@@ -48,14 +89,15 @@ def load_graph(path: pathlib.Path) -> dict:
     footer = parse_footer(data)
     start = header["length"] if header else 0
     end = footer["offset"] if footer else len(data)
-    payload = np.frombuffer(data[start:end], dtype=np.uint8)
-    if data[start : start + 4] == b"IBMp":
+    payload = data[start:end]
+    if payload[:4] == b"IBMp":
         # A binary index. `index` must stay referenced while its parts are
         # read: the downcast views do not own what they point at.
+        payload = np.frombuffer(with_zero_storage(payload), dtype=np.uint8)
         index = faiss.deserialize_index_binary(payload)
         graph = faiss.downcast_IndexBinary(faiss.downcast_IndexBinary(index).index).hnsw
     else:
-        index = faiss.deserialize_index(payload)
+        index = faiss.deserialize_index(np.frombuffer(payload, dtype=np.uint8))
         graph = faiss.downcast_index(faiss.downcast_index(index).index).hnsw
     return {
         "levels": faiss.vector_to_array(graph.levels),
@@ -142,10 +184,6 @@ REAL_SETS = (
     "opensearch-3.9.0-binary",
 )
 
-# Real sets whose native file holds a graph without its vectors (a `null`
-# storage), which Faiss Python cannot read.
-UNREADABLE = ("on-disk",)
-
 
 def write(stats: dict, out: pathlib.Path) -> None:
     with open(out, "w", encoding="utf-8", newline="\n") as f:
@@ -171,8 +209,6 @@ def main() -> None:
         ):
             files = json.loads(manifest.read_text(encoding="utf-8"))["files"]
             native = next(f["name"] for f in files if f["name"].endswith((".faiss", ".faissc")))
-            if manifest.parent.parent.name in UNREADABLE:
-                continue
             write(graph_stats(manifest.parent / native), manifest.parent / "stats.json")
     elif args.file:
         print(json.dumps(graph_stats(args.file), indent=2))

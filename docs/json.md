@@ -19,11 +19,11 @@ map's values, which k-NN sets to Lucene doc ids.
 | `envelope.footer` | object, nullable | Lucene footer: `offset`, `algorithm`, `checksum` (hex string), `verified` (whether the CRC32 matches) |
 | `payload.offset`, `payload.length` | integer | Where the Faiss payload lies |
 | `payload.trailing_bytes` | integer | Bytes between the end of the index and the footer; 0 in a well-formed file |
-| `layout` | array of strings | The Faiss fourccs, outermost first: `IxMp`, then `IHNf` and `IxF2` or `IxFI` (float32 storage), or `IHNs` and `IxSQ` (fp16, bf16, or byte storage); or `IBMp`, `IBHf`, and `IBxF` (binary storage, since 0.7.0) |
-| `dimension` | integer | Vector dimension; bits for binary storage |
+| `layout` | array of strings | The Faiss fourccs, outermost first: `IxMp`, then `IHNf` and `IxF2` or `IxFI` (float32 storage), or `IHNs` and `IxSQ` (fp16, bf16, or byte storage); or `IBMp`, `IBHf`, and `IBxF` (binary storage, since 0.7.0); or `IBMp`, `IBHf`, and `null` (a graph without its vectors, as k-NN writes an `on_disk` field's, since 0.8.0) |
+| `dimension` | integer | Vector dimension; bits for binary storage, components for a graph without its vectors |
 | `count` | integer | Vector count from the ID map's header |
-| `metric` | string | `l2` or `inner_product` as the file records it; a cosine field reads `inner_product`. `hamming` for binary storage, which computes Hamming distance whatever metric type its headers record (since 0.7.0) |
-| `code_size` | integer, optional | For binary storage, the bytes per vector the ID map's header records: the dimension / 8 in a well-formed file. Since 0.7.0 |
+| `metric` | string | `l2` or `inner_product` as the file records it; a cosine field reads `inner_product`. `hamming` for binary storage, which computes Hamming distance whatever metric type its headers record (since 0.7.0). A graph without its vectors reads `l2` or `inner_product`, the metric k-NN built it for, as its ID map's header records it and k-NN reads it (since 0.8.0). Any other metric type `n` reads `metric_n` |
+| `code_size` | integer, optional | For binary storage, the bytes per vector the ID map's header records: the dimension / 8 in a well-formed file. Since 0.7.0. For a graph without its vectors, the bytes per vector the graph's header records: a quantized vector plus 16 bytes of correction factors (since 0.8.0) |
 | `quantizer` | object, optional | For scalar-quantized storage, the quantizer as stored: `qtype` (4, 7, or 8), `name` (`QT_fp16`, `QT_bf16`, or `QT_8bit_direct_signed`), `dimension`, `code_size` (bytes per vector: twice the dimension for fp16 and bf16, the dimension for byte), `trained` (number of trained values; none of the three formats uses any). Since 0.4.0; bf16 since 0.5.0; byte since 0.6.0 |
 | `hnsw.m` | integer, nullable | Neighbor slots per node on the upper levels; `null` if the level table is too short to say |
 | `hnsw.ef_construction`, `hnsw.ef_search` | integer | As stored |
@@ -117,7 +117,7 @@ Each entry of `files`:
 | `size` | integer, nullable | Bytes; `null` when the file would not open |
 | `error` | string, optional | Why the file would not open; `failures`, `warnings`, and `checks` are then absent, and both cross-checks are `skipped` |
 | `layout`, `dimension`, `count`, `metric` | optional | As for `info`; absent when the file did not parse |
-| `code_size` | integer, optional | As for `info`, for binary storage (since 0.7.0) |
+| `code_size` | integer, optional | As for `info`, for binary storage (since 0.7.0) and a graph without its vectors (since 0.8.0) |
 | `status` | string | `clean`, `warnings`, or `failed`, counting both Lucene cross-checks; or `unsupported` (since 0.7.0): a file whose footer verifies, in a layout or scalar quantizer type this tool does not read, which fails only the structure check. `verify` fails such a file; `scan` does not count it as failed, since nothing is known to be wrong with it |
 | `failures`, `warnings`, `checks` | optional | As for `verify` |
 | `lucene_vectors.status` | string | `match`, `mismatch`, `damaged`, or `skipped` (`damaged` since 0.3.0) |
@@ -165,9 +165,11 @@ fails the file.
   beside it, or, without a `.vemf`, when that file lies beside it: a
   float field with k-NN's binary encoder writes a binary index over bits
   that quantize the float32 vectors its `.vec` holds, which the bits
-  cannot be checked against (since 0.7.0). Before 0.3.0, a `.vec` that
-  could not be opened was reported as `mismatch`, and a failing checksum
-  was only mentioned in `detail`.
+  cannot be checked against (since 0.7.0); and always for a graph
+  without its vectors, whose quantized vectors are in Lucene's `.veq`,
+  which this tool does not read (since 0.8.0). Before 0.3.0, a `.vec`
+  that could not be opened was reported as `mismatch`, and a failing
+  checksum was only mentioned in `detail`.
 - `lucene_docs` reads the document count from the segment's `.si` and
   checks that every label in the ID map, which k-NN sets to a doc id,
   lies in `0..doc_count`, with no more labels than documents. The `.si`

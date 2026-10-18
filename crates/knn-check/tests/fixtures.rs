@@ -127,7 +127,7 @@ fn byte_storage_in_a_cosine_field_warns_and_skips_norms() {
         "{metric:#?}"
     );
     let parsed = knn_format::parse(&bytes).unwrap();
-    let knn_format::faiss::Storage::Sq(sq) = parsed.index.index.storage else {
+    let knn_format::faiss::Storage::Sq(sq) = parsed.index.index.storage.unwrap() else {
         panic!("byte storage");
     };
     assert_eq!(metric.findings[0].offset, Some(sq.quantizer.offset));
@@ -201,6 +201,7 @@ fn real_fixtures_are_clean_with_their_space() {
         "opensearch-3.9.0-byte/byte",
         "opensearch-3.9.0-binary/binary",
         "opensearch-3.9.0-binary/binary-encoder",
+        "opensearch-3.9.0-binary/on-disk",
     ] {
         for entry in fs::read_dir(fixtures().join(set)).unwrap() {
             let dir = entry.unwrap().path();
@@ -227,8 +228,8 @@ fn real_fixtures_are_clean_with_their_space() {
         }
     }
     assert_eq!(
-        seen, 19,
-        "six float, six fp16, three bf16, two byte, one binary, and one binary-encoder real fixtures"
+        seen, 20,
+        "six float, six fp16, three bf16, two byte, one binary, one binary-encoder, and one on_disk real fixtures"
     );
 }
 
@@ -338,10 +339,13 @@ fn binary_header_findings_name_the_field_and_point_at_it() {
     );
 
     let report = verify("binary-codes-short.faiss");
+    let count = report.result(Check::VectorCount).unwrap();
     assert_eq!(
-        report.result(Check::VectorCount).unwrap().findings[0].message,
+        count.findings[0].message,
         "storage holds 198 bytes of binary codes; 100 vectors of 2 bytes need 200"
     );
+    // At the storage's fourcc, `IBxF` at 14,602.
+    assert_eq!(count.findings[0].offset, Some(14_602));
 }
 
 #[test]
@@ -366,24 +370,368 @@ fn a_code_size_that_is_not_the_dimension_in_bytes_fails() {
 }
 
 #[test]
-fn an_on_disk_graph_fails_the_structure_check_by_name() {
+fn an_on_disk_graph_is_checked_by_the_metric_it_records() {
+    // An on_disk field's graph without its vectors records the space k-NN
+    // built it for, l2 here, in both headers; unlike binary storage it does
+    // not compute hamming distance.
     let bytes =
         fs::read(fixtures().join("opensearch-3.9.0-binary/on-disk/l2/_2_165_vec.faiss")).unwrap();
     let report = knn_check::verify(&bytes, &options(Some(Space::L2)));
-    let structure = report.result(Check::Structure).unwrap();
-    assert!(structure.failed(), "{report:#?}");
+    assert_eq!(report.status, Status::Clean, "{report:#?}");
+    assert_eq!(report.result(Check::Metric).unwrap().count, 0);
+    for check in [Check::VectorCount, Check::VectorValues] {
+        let skipped = report.result(check).unwrap().skipped.as_deref();
+        assert!(
+            skipped.is_some_and(|s| s.contains("Lucene's .veq")),
+            "{check:?}: {skipped:?}"
+        );
+    }
+    // Every graph check ran.
+    for check in [
+        Check::Headers,
+        Check::Offsets,
+        Check::Levels,
+        Check::EntryPoint,
+        Check::NeighborIds,
+        Check::NeighborLevels,
+        Check::IdMapLength,
+        Check::DuplicateNeighbors,
+        Check::SelfLoops,
+    ] {
+        assert!(report.result(check).unwrap().skipped.is_none(), "{check:?}");
+    }
+    // With cosine, the norms have no vectors either; the metric fails, as
+    // it does for any space but l2.
+    let report = knn_check::verify(&bytes, &options(Some(Space::Cosine)));
+    let norms = report.result(Check::Norms).unwrap();
     assert!(
-        structure.findings[0]
+        norms
+            .skipped
+            .as_deref()
+            .is_some_and(|s| s.contains("graph only")),
+        "{norms:?}"
+    );
+    for space in [Space::Cosine, Space::InnerProduct, Space::Hamming] {
+        let report = knn_check::verify(&bytes, &options(Some(space)));
+        let metric = report.result(Check::Metric).unwrap();
+        assert!(metric.failed(), "{space:?}: {report:#?}");
+        assert_eq!(
+            metric.findings[0].offset,
+            Some(0),
+            "the id map's header, which k-NN reads"
+        );
+        assert_eq!(report.failures, 1, "{space:?}: {report:#?}");
+    }
+    let report = knn_check::verify(&bytes, &options(Some(Space::Hamming)));
+    assert!(
+        report.result(Check::Metric).unwrap().findings[0]
             .message
-            .contains("null is a graph without its vectors"),
-        "{:?}",
-        structure.findings[0]
+            .ends_with("; k-NN accepts hamming for binary fields only"),
+        "{report:#?}"
     );
-    // The envelope is still read: the footer verifies.
+}
+
+/// The smallest synthetic binary file as a graph without its vectors, as
+/// k-NN writes an `on_disk` field's, with its two metric types set to
+/// `metric_type`.
+fn graph_only(metric_type: i32) -> Vec<u8> {
+    let bytes = fs::read(fixtures().join("synthetic-binary/hamming-100x16-binary.faiss")).unwrap();
+    let find = |tag: &[u8; 4]| bytes.windows(4).position(|w| w == tag).unwrap();
+    let (hnsw, storage) = (find(b"IBHf"), find(b"IBxF"));
+    let count_at = storage + 4 + 21;
+    let codes = usize::try_from(u64::from_le_bytes(
+        bytes[count_at..count_at + 8].try_into().unwrap(),
+    ))
+    .unwrap();
+    let mut out = bytes[..storage].to_vec();
+    out.extend_from_slice(b"null");
+    out.extend_from_slice(&bytes[count_at + 8 + codes..]);
+    // A 2-byte quantized vector and 16 bytes of correction factors.
+    out[hnsw + 8..hnsw + 12].copy_from_slice(&18_i32.to_le_bytes());
+    // The metric type closes each 21-byte header.
+    for header in [0, hnsw] {
+        out[header + 21..header + 25].copy_from_slice(&metric_type.to_le_bytes());
+    }
+    out
+}
+
+#[test]
+fn a_graph_without_its_vectors_names_l2_or_inner_product() {
+    // The l2 graph and an inner-product one are clean with their space; an
+    // inner-product graph serves cosinesimil too, as k-NN builds a cosine
+    // field's.
+    let report = knn_check::verify(&graph_only(1), &options(Some(Space::L2)));
+    assert_eq!(report.status, Status::Clean, "{report:#?}");
+    let ip = graph_only(0);
+    for space in [Space::InnerProduct, Space::Cosine] {
+        let report = knn_check::verify(&ip, &options(Some(space)));
+        assert_eq!(report.status, Status::Clean, "{space:?}: {report:#?}");
+    }
+    // No warning for a metric type other than 1, as binary storage gets:
+    // this one is used.
+    let report = knn_check::verify(&ip, &options(None));
     assert_eq!(
-        report.result(Check::Checksum).unwrap().severity,
-        Some(Severity::Info)
+        report.result(Check::Headers).unwrap().count,
+        0,
+        "{report:#?}"
     );
+    let report = knn_check::verify(&ip, &options(Some(Space::L2)));
+    assert!(
+        report.result(Check::Metric).unwrap().failed(),
+        "{report:#?}"
+    );
+
+    // The space is checked against the ID map's metric, which k-NN reads
+    // when it loads the file; a graph header that disagrees, which k-NN
+    // never writes and never reads, warns.
+    let mut mixed = graph_only(0);
+    let hnsw = mixed.windows(4).position(|w| w == b"IBHf").unwrap();
+    mixed[hnsw + 21..hnsw + 25].copy_from_slice(&1_i32.to_le_bytes());
+    let report = knn_check::verify(&mixed, &options(Some(Space::InnerProduct)));
+    assert_eq!(report.status, Status::Warnings, "{report:#?}");
+    assert_eq!(
+        report.result(Check::Headers).unwrap().findings[0].message,
+        "hnsw header metric 1 differs from the id map's 0, which k-NN reads instead; k-NN writes both alike"
+    );
+    assert_eq!(
+        report.result(Check::Headers).unwrap().findings[0].offset,
+        Some(hnsw),
+        "the graph's header"
+    );
+    assert_eq!(
+        report.result(Check::Metric).unwrap().count,
+        0,
+        "{report:#?}"
+    );
+    let report = knn_check::verify(&mixed, &options(Some(Space::L2)));
+    assert!(
+        report.result(Check::Metric).unwrap().failed(),
+        "{report:#?}"
+    );
+    // An ID map metric type k-NN cannot load fails, and so the space too.
+    let mut unknown = graph_only(2);
+    unknown[hnsw + 21..hnsw + 25].copy_from_slice(&0_i32.to_le_bytes());
+    let report = knn_check::verify(&unknown, &options(None));
+    let headers = report.result(Check::Headers).unwrap();
+    assert!(headers.failed(), "{report:#?}");
+    assert!(
+        headers
+            .findings
+            .iter()
+            .any(|f| f.message == "id map header metric type 2 is not L2 (1) or inner product (0)"),
+        "{report:#?}"
+    );
+    let report = knn_check::verify(&unknown, &options(Some(Space::L2)));
+    let metric = report.result(Check::Metric).unwrap();
+    assert!(metric.failed(), "{report:#?}");
+    assert_eq!(
+        metric.findings[0].message,
+        "file records metric metric_2, but an l2 field needs l2"
+    );
+}
+
+#[test]
+fn a_graph_without_its_vectors_fails_on_dimension_and_count() {
+    // The two headers must still agree on these, as every layout's must;
+    // an untrained graph header warns, as any header does.
+    let clean = graph_only(1);
+    let hnsw = clean.windows(4).position(|w| w == b"IBHf").unwrap();
+    let mut bytes = clean.clone();
+    bytes[hnsw + 4..hnsw + 8].copy_from_slice(&24_i32.to_le_bytes());
+    let report = knn_check::verify(&bytes, &options(None));
+    let headers = report.result(Check::Headers).unwrap();
+    assert!(headers.failed(), "{report:#?}");
+    assert_eq!(
+        headers.findings[0].message,
+        "hnsw header dimension 24 differs from the id map's 16"
+    );
+    let mut bytes = clean.clone();
+    bytes[hnsw + 12..hnsw + 20].copy_from_slice(&99_i64.to_le_bytes());
+    let report = knn_check::verify(&bytes, &options(None));
+    let headers = report.result(Check::Headers).unwrap();
+    assert!(headers.failed(), "{report:#?}");
+    assert_eq!(
+        headers.findings[0].message,
+        "hnsw header count 99 differs from the id map's 100"
+    );
+    // With no vector checks to run, a dimension of 0 is caught here: the
+    // code sizes of 0 and 16 it implies are what k-NN would write.
+    let mut bytes = clean.clone();
+    for header in [0, hnsw] {
+        bytes[header + 4..header + 8].copy_from_slice(&0_i32.to_le_bytes());
+    }
+    bytes[8..12].copy_from_slice(&0_i32.to_le_bytes());
+    bytes[hnsw + 8..hnsw + 12].copy_from_slice(&16_i32.to_le_bytes());
+    let report = knn_check::verify(&bytes, &options(None));
+    let headers = report.result(Check::Headers).unwrap();
+    assert!(headers.failed(), "{report:#?}");
+    assert_eq!(headers.count, 1, "{report:#?}");
+    assert_eq!(headers.findings[0].message, "dimension 0 with 100 vectors");
+    assert_eq!(headers.findings[0].offset, Some(0));
+    let mut bytes = clean;
+    bytes[hnsw + 20] = 0;
+    let report = knn_check::verify(&bytes, &options(None));
+    assert_eq!(report.status, Status::Warnings, "{report:#?}");
+    assert_eq!(
+        report.result(Check::Headers).unwrap().findings[0].message,
+        "hnsw header says the index is not trained"
+    );
+}
+
+#[test]
+fn float_headers_that_disagree_on_the_metric_fail() {
+    // A float index reads its metric type: the HNSW header's set to 0
+    // under an ID map that says 1.
+    let mut bytes = fs::read(fixtures().join("synthetic/l2-100x4.faiss")).unwrap();
+    let hnsw = bytes.windows(4).position(|w| w == b"IHNf").unwrap();
+    // d, count, two reserved int64s, and the trained flag: 29 bytes.
+    let at = hnsw + 4 + 29;
+    assert_eq!(bytes[at..at + 4], 1_i32.to_le_bytes());
+    bytes[at..at + 4].copy_from_slice(&0_i32.to_le_bytes());
+    let report = knn_check::verify(&bytes, &options(None));
+    let headers = report.result(Check::Headers).unwrap();
+    assert!(headers.failed(), "{report:#?}");
+    assert_eq!(
+        headers.findings[0].message,
+        "hnsw header metric 0 differs from the id map's 1"
+    );
+}
+
+#[test]
+fn a_graph_code_size_follows_every_packed_length() {
+    let mut bytes = graph_only(1);
+    let hnsw = bytes.windows(4).position(|w| w == b"IBHf").unwrap();
+    // Every remainder of the dimension by 8, at every width: the three
+    // lengths Lucene packs plus 16 are clean, and one byte past the
+    // longest, which no width packs, warns.
+    for d in 1..=24_i32 {
+        for header in [0, hnsw] {
+            bytes[header + 4..header + 8].copy_from_slice(&d.to_le_bytes());
+        }
+        bytes[8..12].copy_from_slice(&(d / 8).to_le_bytes());
+        let one_bit = (d + 7) / 8;
+        let packed = [one_bit, 2 * one_bit, (d + 1) / 2].map(|bytes| bytes + 16);
+        let off = packed.iter().max().unwrap() + 1;
+        for (size, clean) in packed
+            .map(|size| (size, true))
+            .into_iter()
+            .chain([(off, false)])
+        {
+            bytes[hnsw + 8..hnsw + 12].copy_from_slice(&size.to_le_bytes());
+            let report = knn_check::verify(&bytes, &options(Some(Space::L2)));
+            let expected = if clean {
+                Status::Clean
+            } else {
+                Status::Warnings
+            };
+            assert_eq!(report.status, expected, "{d} at {size}: {report:#?}");
+        }
+    }
+}
+
+#[test]
+fn a_graph_without_its_vectors_may_have_any_dimension() {
+    // k-NN's patched Faiss lets the graph skip the multiple-of-8 rule: a
+    // 12-dimensional on_disk field keeps 12, with an id map code size of
+    // 12 / 8 = 1. Lucene packs 12 components into 2 bytes at 1 bit, two
+    // planes of 2 at 2 bits, and 6 bytes at 4, so with 16 bytes of
+    // correction factors the graph's code size is 18, 20, or 22.
+    let mut bytes = graph_only(1);
+    let hnsw = bytes.windows(4).position(|w| w == b"IBHf").unwrap();
+    for header in [0, hnsw] {
+        bytes[header + 4..header + 8].copy_from_slice(&12_i32.to_le_bytes());
+    }
+    bytes[8..12].copy_from_slice(&1_i32.to_le_bytes());
+    for size in [18_i32, 20, 22] {
+        bytes[hnsw + 8..hnsw + 12].copy_from_slice(&size.to_le_bytes());
+        let report = knn_check::verify(&bytes, &options(Some(Space::L2)));
+        assert_eq!(report.status, Status::Clean, "{size}: {report:#?}");
+    }
+    // Any other size is one k-NN never writes, but it does not read it
+    // either: a warning.
+    for size in [17_i32, 19, 21, 23, 24, i32::MAX] {
+        bytes[hnsw + 8..hnsw + 12].copy_from_slice(&size.to_le_bytes());
+        let report = knn_check::verify(&bytes, &options(Some(Space::L2)));
+        assert_eq!(report.status, Status::Warnings, "{size}: {report:#?}");
+        let headers = report.result(Check::Headers).unwrap();
+        assert_eq!(
+            headers.findings[0].message,
+            format!(
+                "hnsw header code size {size} is not 16 bytes of correction factors plus a quantized vector of dimension 12, which takes 2 bytes at 1 bit a component, 4 at 2, or 6 at 4; k-NN does not read it"
+            )
+        );
+        assert_eq!(headers.findings[0].offset, Some(hnsw + 8));
+    }
+
+    // An odd dimension rounds up at 4 bits too: 13 components take 2
+    // bytes at 1 bit, 4 at 2, and 7 at 4.
+    for header in [0, hnsw] {
+        bytes[header + 4..header + 8].copy_from_slice(&13_i32.to_le_bytes());
+    }
+    for (size, clean) in [(18_i32, true), (20, true), (23, true), (22, false)] {
+        bytes[hnsw + 8..hnsw + 12].copy_from_slice(&size.to_le_bytes());
+        let report = knn_check::verify(&bytes, &options(Some(Space::L2)));
+        let expected = if clean {
+            Status::Clean
+        } else {
+            Status::Warnings
+        };
+        assert_eq!(report.status, expected, "13 at {size}: {report:#?}");
+    }
+
+    // At a dimension k-NN fields often have, 128, the three widths pack
+    // into 16, 32, and 64 bytes, so the graph's code size is 32, 48, or 80.
+    for header in [0, hnsw] {
+        bytes[header + 4..header + 8].copy_from_slice(&128_i32.to_le_bytes());
+    }
+    bytes[8..12].copy_from_slice(&16_i32.to_le_bytes());
+    for (size, clean) in [
+        (32_i32, true),
+        (48, true),
+        (80, true),
+        (18, false),
+        (33, false),
+        (34, false),
+    ] {
+        bytes[hnsw + 8..hnsw + 12].copy_from_slice(&size.to_le_bytes());
+        let report = knn_check::verify(&bytes, &options(Some(Space::L2)));
+        let expected = if clean {
+            Status::Clean
+        } else {
+            Status::Warnings
+        };
+        assert_eq!(report.status, expected, "128 at {size}: {report:#?}");
+    }
+    // An ID map code size under the dimension / 8 warns too.
+    bytes[hnsw + 8..hnsw + 12].copy_from_slice(&32_i32.to_le_bytes());
+    bytes[8..12].copy_from_slice(&15_i32.to_le_bytes());
+    let report = knn_check::verify(&bytes, &options(Some(Space::L2)));
+    assert_eq!(report.status, Status::Warnings, "{report:#?}");
+    for header in [0, hnsw] {
+        bytes[header + 4..header + 8].copy_from_slice(&12_i32.to_le_bytes());
+    }
+
+    // The ID map's code size is the dimension / 8, rounded down.
+    bytes[hnsw + 8..hnsw + 12].copy_from_slice(&18_i32.to_le_bytes());
+    bytes[8..12].copy_from_slice(&2_i32.to_le_bytes());
+    let report = knn_check::verify(&bytes, &options(Some(Space::L2)));
+    assert_eq!(report.status, Status::Warnings, "{report:#?}");
+    let headers = report.result(Check::Headers).unwrap();
+    assert_eq!(headers.count, 1, "{report:#?}");
+    assert_eq!(
+        headers.findings[0].message,
+        "id map header code size 2 is not 1, the dimension 12 / 8 Faiss sets for a binary id map; k-NN does not read it"
+    );
+    assert_eq!(headers.findings[0].offset, Some(8));
+
+    // Both code sizes off: each warns on its own.
+    bytes[hnsw + 8..hnsw + 12].copy_from_slice(&17_i32.to_le_bytes());
+    let report = knn_check::verify(&bytes, &options(Some(Space::L2)));
+    assert_eq!(report.status, Status::Warnings, "{report:#?}");
+    let headers = report.result(Check::Headers).unwrap();
+    assert_eq!(headers.count, 2, "{report:#?}");
+    let offsets: Vec<_> = headers.findings.iter().map(|f| f.offset).collect();
+    assert_eq!(offsets, [Some(8), Some(hnsw + 8)]);
 }
 
 #[test]
@@ -558,7 +906,8 @@ fn scalar_quantized_norms_are_checked_on_the_decoded_codes() {
         let bytes = fs::read(fixtures().join(file)).unwrap();
         let parsed = knn_format::parse(&bytes).unwrap();
         let codes =
-            knn_format::view_offset(&bytes, parsed.index.index.storage.code_bytes()).unwrap();
+            knn_format::view_offset(&bytes, parsed.index.index.storage.unwrap().code_bytes())
+                .unwrap();
         let row_bytes = 2 * usize::try_from(parsed.index.header.d).unwrap();
 
         let mut scaled = bytes.clone();
@@ -608,7 +957,7 @@ fn rows_are_walked_by_the_storage_dimension() {
         let mut bytes = fs::read(fixtures().join(file)).unwrap();
         let (codes, size) = {
             let parsed = knn_format::parse(&bytes).unwrap();
-            let storage = &parsed.index.index.storage;
+            let storage = &parsed.index.index.storage.unwrap();
             (
                 knn_format::view_offset(&bytes, storage.code_bytes()).unwrap(),
                 storage.component_size(),
@@ -673,5 +1022,16 @@ fn a_binary_metric_type_only_warns_even_when_headers_disagree() {
             .starts_with("hnsw header records metric type 0"),
         "{:?}",
         headers.findings[0]
+    );
+
+    // With a code size that disagrees too, the failure comes first, so the
+    // line that says FAIL shows it.
+    bytes[ibhf + 8..ibhf + 12].copy_from_slice(&99_i32.to_le_bytes());
+    let report = knn_check::verify(&bytes, &options(None));
+    let headers = report.result(Check::Headers).unwrap();
+    assert!(headers.failed(), "{report:#?}");
+    assert_eq!(
+        headers.findings[0].message,
+        "hnsw header code size 99 differs from the id map's 2"
     );
 }

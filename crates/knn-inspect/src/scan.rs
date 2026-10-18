@@ -59,8 +59,8 @@ struct Summary {
     failed: usize,
 }
 
-/// A file's verdict, or the directory's: [`Status`] plus a layout this
-/// tool does not read.
+/// A file's verdict, or the directory's: [`Status`] plus a layout or
+/// scalar quantizer type this tool does not read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum Verdict {
@@ -207,7 +207,8 @@ impl CrossCheck {
 /// Runs `scan`; the exit code is the worst verdict over the files found:
 /// 0 clean, 1 any failure (or a file that would not open, a subdirectory
 /// that could not be read, or no native files at all), 2 warnings or a
-/// sound file in a layout this tool does not read.
+/// sound file in a layout or scalar quantizer type this tool does not
+/// read.
 ///
 /// # Errors
 ///
@@ -385,17 +386,20 @@ fn scan_file(path: &Path, options: &Options) -> FileReport {
         && report
             .result(Check::Checksum)
             .is_some_and(|c| c.severity == Some(Severity::Info));
+    // Why the cross-checks cannot run when the file does not parse.
+    let why = match &parsed {
+        _ if !unsupported => "the native file did not parse",
+        Err(knn_format::Error::UnsupportedQuantizer { .. }) => {
+            "the native file's scalar quantizer type is not supported"
+        }
+        _ => "the native file's layout is not supported",
+    };
     let parsed = parsed.ok();
     let idx = parsed.as_ref().map(|p| &p.index);
 
     let (lucene_vectors, lucene_docs) = if let Some(p) = &parsed {
         (lucene_vectors(path, bytes, p), lucene_docs(path, p))
     } else {
-        let why = if unsupported {
-            "the native file's layout is not supported"
-        } else {
-            "the native file did not parse"
-        };
         (
             LuceneVectors::skipped(why.to_owned()),
             LuceneDocs::skipped(why.to_owned()),
@@ -416,8 +420,8 @@ fn scan_file(path: &Path, options: &Options) -> FileReport {
         layout: idx.map(|i| i.layout().iter().map(ToString::to_string).collect()),
         dimension: idx.map(|i| i.header.d),
         count: idx.map(|i| i.header.ntotal),
-        metric: idx.map(|i| i.index.storage.header().metric().name()),
-        code_size: idx.and_then(|i| i.header.code_size()),
+        metric: idx.map(|i| i.metric().name()),
+        code_size: idx.and_then(knn_format::faiss::IdMapIndex::code_size),
         status,
         failures: Some(report.failures),
         warnings: Some(report.warnings),
@@ -542,11 +546,14 @@ fn lucene_footer(bytes: &[u8]) -> Result<(), String> {
         .map_err(|_| "fails its footer checksum".to_owned())
 }
 
+/// Why a graph without its vectors has none to look for in a `.vec`.
+const GRAPH_ONLY: &str = "the native file holds the graph only: k-NN keeps the field's quantized vectors in Lucene's .veq file, which this tool does not read";
+
 /// The bytes to look for in a `.vec`, how else the `.vec` may hold them,
 /// and the stored vectors' shape; or why there is nothing to look for.
 fn stored_vectors<'a>(
     bytes: &'a [u8],
-    parsed: &knn_format::Parsed<'a>,
+    all: Storage<'a>,
 ) -> Result<(&'a [u8], Sources<'a>, Shape), String> {
     // Float32 storage as it lies in the file, or every whole code, which
     // a half_float field's .vec holds byte for byte. The .vec of an sq
@@ -555,7 +562,6 @@ fn stored_vectors<'a>(
     // field's holds the int8 values the codes are 128 above, so byte codes
     // are looked for that way only. A binary field's .vec holds the packed
     // bits byte for byte.
-    let all = &parsed.index.index.storage;
     let (storage, sources) = match all {
         Storage::Flat(flat) => {
             let codes = flat.codes;
@@ -595,6 +601,11 @@ fn stored_vectors<'a>(
 /// its segment.
 fn lucene_vectors(path: &Path, bytes: &[u8], parsed: &knn_format::Parsed<'_>) -> LuceneVectors {
     let skipped = LuceneVectors::skipped;
+    // Said first: whatever .vec lies beside it, or none, a graph without
+    // its vectors has nothing to compare with one.
+    let Some(all) = parsed.index.index.storage else {
+        return skipped(GRAPH_ONLY.to_owned());
+    };
     let candidates = match segment_vec_files(path) {
         Ok(c) => c,
         Err(e) => return skipped(format!("could not list the segment's files: {e}")),
@@ -608,7 +619,7 @@ fn lucene_vectors(path: &Path, bytes: &[u8], parsed: &knn_format::Parsed<'_>) ->
             "no .vec file of segment {segment} beside the native file (a compound segment keeps its .vec inside the .cfs)"
         ));
     }
-    let (storage, sources, shape) = match stored_vectors(bytes, parsed) {
+    let (storage, sources, shape) = match stored_vectors(bytes, all) {
         Ok(stored) => stored,
         Err(why) => return skipped(why),
     };
@@ -1388,11 +1399,15 @@ fn text(out: &Output) -> String {
         };
         let shape = match (&r.layout, r.dimension, r.count, &r.metric) {
             (Some(layout), Some(d), Some(n), Some(metric)) => {
-                let bits = if r.code_size.is_some() { " bits" } else { "" };
+                // Binary storage's dimension counts bits; a graph without
+                // its vectors counts the field's components.
+                let binary =
+                    r.code_size.is_some() && layout.last().map(String::as_str) != Some("null");
+                let bits = if binary { " bits" } else { "" };
                 format!("{}  d={d}{bits} n={n} {metric}", layout.join(" > "))
             }
             _ if r.status == Verdict::Unsupported => {
-                "(a layout this tool does not read)".to_owned()
+                "(a layout or quantizer type this tool does not read)".to_owned()
             }
             _ => "(did not parse)".to_owned(),
         };
@@ -1405,8 +1420,9 @@ fn text(out: &Output) -> String {
         }
         for c in r.checks.iter().flatten() {
             let tag = match c.severity {
-                // The structure check names the layout an unsupported file
-                // is in; the file is not failed for it.
+                // The structure check names the layout or scalar quantizer
+                // type an unsupported file is in; the file is not failed
+                // for it.
                 Some(Severity::Failure)
                     if r.status == Verdict::Unsupported && c.check == Check::Structure =>
                 {

@@ -14,8 +14,11 @@
 //! encoder with `type: bf16`), or `QT_8bit_direct_signed` (the `byte`
 //! data type); and an `IBMp` binary ID map wrapping an `IBHf` binary HNSW
 //! index over `IBxF` packed bits (the `binary` data type, and float
-//! fields with the `binary` encoder). See `docs/format-notes.md` in the
-//! repository for the byte-level description.
+//! fields with the `binary` encoder), or over `null`: a graph whose
+//! vectors k-NN keeps in Lucene's files instead (an `on_disk` field, or
+//! one whose `sq` encoder keeps 1, 2, or 4 bits). See
+//! `docs/format-notes.md` in the repository for the byte-level
+//! description.
 //!
 //! [`segment_info`] reads one more Lucene file of the segment, as far as
 //! the document count: the segment info (`.si`). [`flat_vectors`] reads
