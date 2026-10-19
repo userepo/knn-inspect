@@ -123,9 +123,10 @@ pub enum Error {
     #[error("k must be at least 1")]
     ZeroK,
     /// The file is a graph without its vectors, which k-NN keeps in
-    /// Lucene's files for the field.
+    /// Lucene's files for the field: [`on_disk::OnDiskField`] searches it
+    /// over them, as k-NN does.
     #[error(
-        "the file holds the graph only, no vectors to search: k-NN keeps the field's quantized vectors in Lucene's .veq file"
+        "the file holds the graph only, no vectors for Faiss's search: k-NN keeps the field's vectors in Lucene's .veq and .vec files, which on_disk::OnDiskField searches"
     )]
     NoVectors,
     /// Two nodes carry the same label, so a result cannot be resolved.
