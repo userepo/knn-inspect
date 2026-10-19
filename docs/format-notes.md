@@ -942,6 +942,35 @@ dimensions 1 to 768, and exact ties, signed zeros, subnormal, very
 small, and huge components, constant vectors, and vectors equal to their
 centroid. The port matches every one.
 
+A search scores a query against these records with Lucene's
+`Lucene104ScalarQuantizedVectorScorer`, which k-NN's
+`KNN1040ScalarQuantizedVectorScorer` runs for 2- and 4-bit fields. The
+query is quantized with the field's quantizer and centroid, to 4 bits
+for the 1-, 2-, and 4-bit encodings, after Lucene normalizes a cosine
+query (and refuses one whose squared norm is 0, including one whose
+components are too small to square in float32). With `a` an interval's
+lower end, `l` its width over `2^bits - 1`, and `s` the sum of the
+codes, the stored vector's (`x`) and the query's (`y`) centered dot
+product is estimated as `ax ay d + ay lx sx + ax ly sy + lx ly (codes .
+codes)`, in float32 and in that order. For `EUCLIDEAN` the score is `1 /
+(1 + max(dist, 0))`, the distance the two squared norms less twice that
+estimate; for `MAXIMUM_INNER_PRODUCT` the estimate plus both dot
+products with the centroid less the centroid's own, scaled as
+`scaleMaxInnerProductScore` does (`1 + x` from 0 up, `1 / (1 - x)`
+below); for `COSINE`, the same sum clamped to [-1, 1] and mapped to `(1
++ x) / 2`. For 1-bit fields k-NN scores with a native kernel instead
+(`DefaultSQSimilarityFunction` and its SIMD builds), which computes the
+same expression and transforms; a build whose compiler fuses
+multiply-adds (Arm's NEON may) can give a last bit of its own, and its
+Euclidean clamp turns a NaN distance into 0.
+`knn_recall::quantized_scorer` ports Lucene's scorer operation for
+operation. `tools/scorer_oracle.py` runs Lucene's own scorer
+(`tools/ScorerOracle.java`) over the five `on_disk` fixtures' vectors
+with ten queries each and over 160 synthetic sets of eight vectors and
+three queries, every similarity and scalar encoding; the port matches
+all 28,840 scores bit for bit, and scoring the fixtures' own `.veq`
+records gives the same.
+
 ### Bytes
 
 Head of `nocfs/l2/_2_165_vec.faiss`:

@@ -340,32 +340,37 @@ fn pack_bits(codes: &[u8], packed: &mut [u8], bit: u32) {
 }
 
 /// `VectorUtil.l2normalize`: divides `v` by its norm, unless its squared
-/// norm is within 1e-4 of 1 or is 0, as Lucene's merge does to a cosine
-/// field's vectors before it quantizes them. Returns whether `v` was
-/// divided.
+/// norm is within 1e-4 of 1, as Lucene's merge does to a cosine field's
+/// vectors before it quantizes them, and its scorer to a cosine query.
+/// Returns whether `v` was divided, or `None` when its squared norm is 0
+/// (every square too small for float32 included), where Lucene throws.
 ///
 /// Lucene sums the squares in an order of its build's own (fused
-/// multiply-adds, SIMD lanes); this sums them in order. Within the
+/// multiply-adds, SIMD lanes); this sums them in order. Whether the sum is
+/// 0 does not depend on the order, since no term is negative. Within the
 /// tolerance the vector is left as it is either way, as k-NN's normalized
 /// vectors are; outside it, a quotient can differ in its last bit.
-pub fn l2normalize(v: &mut [f32]) -> bool {
+pub fn l2normalize(v: &mut [f32]) -> Option<bool> {
     let mut dot = 0.0_f32;
     for &x in v.iter() {
         dot += x * x;
     }
     let l1norm = f64::from(dot);
-    if l1norm == 0.0 || (l1norm - 1.0).abs() <= f64::from(UNIT_EPSILON) {
-        return false;
+    if l1norm == 0.0 {
+        return None;
+    }
+    if (l1norm - 1.0).abs() <= f64::from(UNIT_EPSILON) {
+        return Some(false);
     }
     let l2norm = narrow(l1norm.sqrt());
     for x in v.iter_mut() {
         *x /= l2norm;
     }
-    true
+    Some(true)
 }
 
 /// Java's `Math.min(float, float)`: NaN if `a` is, -0 below +0.
-fn java_min_f32(a: f32, b: f32) -> f32 {
+pub(crate) fn java_min_f32(a: f32, b: f32) -> f32 {
     if a.is_nan() {
         a
     } else if a == 0.0 && b == 0.0 && b.is_sign_negative() {
@@ -378,7 +383,7 @@ fn java_min_f32(a: f32, b: f32) -> f32 {
 }
 
 /// Java's `Math.max(float, float)`: NaN if `a` is, +0 above -0.
-fn java_max_f32(a: f32, b: f32) -> f32 {
+pub(crate) fn java_max_f32(a: f32, b: f32) -> f32 {
     if a.is_nan() {
         a
     } else if a == 0.0 && b == 0.0 && a.is_sign_negative() {
@@ -463,7 +468,7 @@ fn narrow(x: f64) -> f32 {
     clippy::cast_precision_loss,
     reason = "Java's long-to-float conversion rounds the same way"
 )]
-fn long_f32(x: i64) -> f32 {
+pub(crate) fn long_f32(x: i64) -> f32 {
     x as f32
 }
 
@@ -482,7 +487,7 @@ fn long_f64(x: i64) -> f64 {
     clippy::cast_precision_loss,
     reason = "Java's int-to-float conversion rounds the same way"
 )]
-fn int_f32(x: i32) -> f32 {
+pub(crate) fn int_f32(x: i32) -> f32 {
     x as f32
 }
 

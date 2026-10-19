@@ -16,7 +16,8 @@
 //! from [`search_all`], an HNSW search over the file's graph that follows
 //! Faiss's; [`sample_queries`] draws queries from the file's vectors.
 //! [`quantizer`] ports Lucene's `OptimizedScalarQuantizer`, which wrote
-//! the quantized vectors Lucene keeps for a graph without its own.
+//! the quantized vectors Lucene keeps for a graph without its own, and
+//! [`quantized_scorer`] the scorer of a query against them.
 //!
 //! Distances are float32 sums in element order. That is how Faiss's
 //! portable scalar-quantizer code computes scalar-quantized distances; its
@@ -38,6 +39,7 @@
 //! with binary vectors, whose distances are small integers.
 
 mod hnsw;
+pub mod quantized_scorer;
 pub mod quantizer;
 
 use std::cmp::Ordering;

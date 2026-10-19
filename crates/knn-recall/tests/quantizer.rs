@@ -96,8 +96,9 @@ fn every_fixture_record_recomputes_bit_for_bit() {
             // k-NN's already are.
             let mut v = row;
             if similarity == Similarity::Cosine {
-                assert!(
-                    !l2normalize(&mut v),
+                assert_eq!(
+                    l2normalize(&mut v),
+                    Some(false),
                     "{fixture}: vector {i} is a unit vector"
                 );
             }
@@ -369,13 +370,18 @@ fn shapes_the_quantizer_cannot_take_are_refused() {
 }
 
 #[test]
-fn l2normalize_leaves_unit_vectors_and_zero_as_they_are() {
+fn l2normalize_leaves_unit_vectors_and_refuses_a_zero_norm() {
     let mut unit = [0.6_f32, 0.8];
-    assert!(!l2normalize(&mut unit));
+    assert_eq!(l2normalize(&mut unit), Some(false));
     assert_eq!(unit, [0.6, 0.8]);
-    let mut zero = [0.0_f32; 3];
-    assert!(!l2normalize(&mut zero));
     let mut v = [3.0_f32, 4.0];
-    assert!(l2normalize(&mut v));
+    assert_eq!(l2normalize(&mut v), Some(true));
     assert_eq!(v, [0.6, 0.8]);
+    // A zero norm, where Lucene throws: zero components, or components
+    // whose squares are too small for float32.
+    let mut zero = [0.0_f32; 3];
+    assert_eq!(l2normalize(&mut zero), None);
+    let mut tiny = [1e-30_f32, -1e-30, 1e-30];
+    assert_eq!(l2normalize(&mut tiny), None);
+    assert_eq!(tiny, [1e-30, -1e-30, 1e-30]);
 }

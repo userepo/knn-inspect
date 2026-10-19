@@ -353,7 +353,11 @@ whose results come from Lucene 10.5.1 itself.
   for every similarity, 1 to 8 bits, and dimensions 1 to 768
   (`quantizer.cases`), and the codes and corrective terms Lucene's own
   `OptimizedScalarQuantizer` gives them (`quantizer.expected`), which the
-  port in `knn_recall::quantizer` must match bit for bit
+  port in `knn_recall::quantizer` must match bit for bit; and the
+  `on_disk` fixtures' vectors and 160 synthetic sets over every similarity
+  and scalar encoding, with queries (`scorer.cases`), and the scores
+  Lucene's own scorer gives them (`scorer.expected`), which
+  `knn_recall::quantized_scorer` must match bit for bit
 
 Each real fixture directory also holds `vectors.f32`, the indexed vectors
 in doc-id order (row i is Faiss label i), or for a binary field
@@ -376,12 +380,14 @@ Synthetic and corrupted fixtures:
 .venv\Scripts\python tools\make_corrupted.py
 ```
 
-The quantizer cases need Docker and the OpenSearch 3.9.0 image, whose JDK
-runs Lucene's quantizer from its jar (`tools/QuantizerOracle.java`); no
-cluster is started:
+The quantizer and scorer cases need Docker and the OpenSearch 3.9.0
+image, whose JDK runs Lucene's quantizer and scorer from its jar
+(`tools/QuantizerOracle.java`, `tools/ScorerOracle.java`); no cluster is
+started:
 
 ```
 .venv\Scripts\python tools\quantizer_oracle.py --out fixtures\synthetic-quantizer
+.venv\Scripts\python tools\scorer_oracle.py --fixtures fixtures --out fixtures\synthetic-quantizer
 ```
 
 Real fixtures need Docker:
@@ -430,8 +436,8 @@ so rewrite them after regenerating either fixture set:
 `fuzz/` holds a cargo-fuzz target that feeds arbitrary bytes to the
 parser, every check, the graph statistics, the HNSW search, the readers
 of Lucene's segment info, field infos, flat-vectors metadata, and
-scalar-quantized vectors, and Lucene's quantizer; the rule is a result,
-never a panic. It needs nightly and Linux; see
+scalar-quantized vectors, and Lucene's quantizer and scorer; the rule is
+a result, never a panic. It needs nightly and Linux; see
 [fuzz/README.md](fuzz/README.md).
 
 ## Platform

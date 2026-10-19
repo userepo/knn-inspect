@@ -3,7 +3,8 @@
 //! metadata file, and a scalar-quantized vectors metadata or data file,
 //! and every check, the graph statistics, and an HNSW search must run
 //! over whatever parsed (a graph without its vectors must refuse the
-//! search), as must Lucene's quantizer over the bytes as float32s. Panics,
+//! search), as must Lucene's quantizer and scorer over the bytes as
+//! float32s. Panics,
 //! including failed bounds checks, fail the run; AddressSanitizer
 //! covers the unsafe code inside dependencies (zerocopy's casts,
 //! crc32fast's SIMD). The memory map is not exercised: the harness
@@ -75,8 +76,10 @@ fuzz_target!(|data: &[u8]| {
     // Lucene's quantizer: the bytes after the first two as float32s, a
     // vector and then its centroid, under the similarity and bits those
     // two pick (9 included, which it refuses), packed as each encoding
-    // packs a record.
+    // packs a record; and the scorer of the vector as a query against the
+    // centroid as a stored vector.
     if let [similarity, bits, rest @ ..] = data {
+        use knn_recall::quantized_scorer::QuantizedScorer;
         use knn_recall::quantizer::{OptimizedScalarQuantizer, Similarity, quantize_record};
         let floats: Vec<f32> = rest
             .as_chunks::<4>()
@@ -93,7 +96,13 @@ fuzz_target!(|data: &[u8]| {
             for encoding in
                 (0..5).filter_map(knn_format::quantized_vectors::ScalarEncoding::from_wire_number)
             {
-                let _ = quantize_record(&quantizer, encoding, vector, centroid);
+                if let (Some((packed, terms)), Some(scorer)) = (
+                    quantize_record(&quantizer, encoding, centroid, centroid),
+                    QuantizedScorer::new(similarity, encoding, vector, centroid, 1.0),
+                ) {
+                    let _ = scorer.score(&packed, terms);
+                    let _ = scorer.score(&packed[..packed.len() / 2], terms);
+                }
             }
         }
     }
