@@ -1,9 +1,9 @@
 //! Any byte string must parse to `Ok` or `Err`, never panic, as a
 //! native file, a segment info file, a field infos file, a flat-vectors
 //! metadata file, and a scalar-quantized vectors metadata or data file,
-//! and every check,
-//! the graph statistics, and an HNSW search must run over whatever
-//! parsed (a graph without its vectors must refuse the search). Panics,
+//! and every check, the graph statistics, and an HNSW search must run
+//! over whatever parsed (a graph without its vectors must refuse the
+//! search), as must Lucene's quantizer over the bytes as float32s. Panics,
 //! including failed bounds checks, fail the run; AddressSanitizer
 //! covers the unsafe code inside dependencies (zerocopy's casts,
 //! crc32fast's SIMD). The memory map is not exercised: the harness
@@ -69,6 +69,31 @@ fuzz_target!(|data: &[u8]| {
                     let r = records.record(i).expect("a record that fits");
                     let _ = encoding.component_sum(r.packed);
                 }
+            }
+        }
+    }
+    // Lucene's quantizer: the bytes after the first two as float32s, a
+    // vector and then its centroid, under the similarity and bits those
+    // two pick (9 included, which it refuses), packed as each encoding
+    // packs a record.
+    if let [similarity, bits, rest @ ..] = data {
+        use knn_recall::quantizer::{OptimizedScalarQuantizer, Similarity, quantize_record};
+        let floats: Vec<f32> = rest
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|w| f32::from_le_bytes(*w))
+            .collect();
+        let (vector, centroid) = floats.split_at(floats.len() / 2);
+        let centroid = centroid.get(..vector.len()).unwrap_or_default();
+        if let Some(similarity) = Similarity::from_ordinal(i32::from(similarity % 4)) {
+            let quantizer = OptimizedScalarQuantizer::new(similarity);
+            let mut codes = vec![0_u8; vector.len()];
+            let _ = quantizer.scalar_quantize(vector, &mut codes, u32::from(bits % 10), centroid);
+            for encoding in
+                (0..5).filter_map(knn_format::quantized_vectors::ScalarEncoding::from_wire_number)
+            {
+                let _ = quantize_record(&quantizer, encoding, vector, centroid);
             }
         }
     }

@@ -15,6 +15,8 @@
 //! position field a live query returns. The tool's own result lists come
 //! from [`search_all`], an HNSW search over the file's graph that follows
 //! Faiss's; [`sample_queries`] draws queries from the file's vectors.
+//! [`quantizer`] ports Lucene's `OptimizedScalarQuantizer`, which wrote
+//! the quantized vectors Lucene keeps for a graph without its own.
 //!
 //! Distances are float32 sums in element order. That is how Faiss's
 //! portable scalar-quantizer code computes scalar-quantized distances; its
@@ -36,6 +38,7 @@
 //! with binary vectors, whose distances are small integers.
 
 mod hnsw;
+pub mod quantizer;
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};

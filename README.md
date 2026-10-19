@@ -299,7 +299,8 @@ no `.faiss` file, so `scan` does not see them.
 
 Fixtures and format notes target OpenSearch 3.9.0 with its bundled k-NN
 plugin 3.9.0.0 (Lucene 10.5.1, Faiss commit `5616caa`). Synthetic
-fixtures and baselines use faiss-cpu 1.15.1.
+fixtures and baselines use faiss-cpu 1.15.1, except the quantizer cases,
+whose results come from Lucene 10.5.1 itself.
 
 ## Fixtures
 
@@ -348,6 +349,11 @@ fixtures and baselines use faiss-cpu 1.15.1.
 - `fixtures/corrupted/` - files that each trip the structural check
   named for them, each derived from a clean fixture; `manifest.json`
   records the change and the check and severity it must trip
+- `fixtures/synthetic-quantizer/` - 1,600 vectors and centroids drawn
+  for every similarity, 1 to 8 bits, and dimensions 1 to 768
+  (`quantizer.cases`), and the codes and corrective terms Lucene's own
+  `OptimizedScalarQuantizer` gives them (`quantizer.expected`), which the
+  port in `knn_recall::quantizer` must match bit for bit
 
 Each real fixture directory also holds `vectors.f32`, the indexed vectors
 in doc-id order (row i is Faiss label i), or for a binary field
@@ -368,6 +374,14 @@ Synthetic and corrupted fixtures:
 ```
 .venv\Scripts\python tools\make_synthetic.py
 .venv\Scripts\python tools\make_corrupted.py
+```
+
+The quantizer cases need Docker and the OpenSearch 3.9.0 image, whose JDK
+runs Lucene's quantizer from its jar (`tools/QuantizerOracle.java`); no
+cluster is started:
+
+```
+.venv\Scripts\python tools\quantizer_oracle.py --out fixtures\synthetic-quantizer
 ```
 
 Real fixtures need Docker:
@@ -414,9 +428,10 @@ so rewrite them after regenerating either fixture set:
 ## Fuzzing
 
 `fuzz/` holds a cargo-fuzz target that feeds arbitrary bytes to the
-parser, every check, the graph statistics, the HNSW search, and the
-readers of Lucene's segment info and flat-vectors metadata; the rule is
-a result, never a panic. It needs nightly and Linux; see
+parser, every check, the graph statistics, the HNSW search, the readers
+of Lucene's segment info, field infos, flat-vectors metadata, and
+scalar-quantized vectors, and Lucene's quantizer; the rule is a result,
+never a panic. It needs nightly and Linux; see
 [fuzz/README.md](fuzz/README.md).
 
 ## Platform

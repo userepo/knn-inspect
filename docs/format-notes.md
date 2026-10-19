@@ -911,6 +911,37 @@ float32 sum of squares of finite but huge components is infinite, so
 `scan` compares rather than refuses, and warns only on a relative
 difference above 1e-4, far beyond float rounding.
 
+Lucene's `OptimizedScalarQuantizer` (`scalarQuantize`) wrote every
+record from the vector of the same ordinal and the field's centroid. It
+centers the vector on the centroid, sets an interval from the mean and
+standard deviation of the centered components at the minimum
+squared-error grid for the bit count (plus or minus 0.798 standard
+deviations for 1 bit, 1.493 for 2, 2.514 for 4) and clamped to the
+smallest and largest centered component, refines it by up to five steps
+of coordinate descent on a loss that weighs the error parallel to the
+vector by 0.9 and the whole error by 0.1 (not at all when the centered
+vector's squared norm is 0, or so small that 0.9 divided by it
+overflows), stopping when the loss would grow, the ends move less than
+1e-8, or the system for the ends is singular, and rounds each clamped
+component to one of the interval's `2^bits` points. The codes then pack
+as the encoding stores them: eight 1-bit codes to a byte, the first in
+the top bit; for 2 bits, the codes' low bits so packed in the first half
+of the bytes and their high bits in the second; for 4 bits, the first
+half of the codes in the high nibbles and the second half in the low
+ones. `knn_recall::quantizer` ports it operation for operation: float32
+where the Java computes in float, float64 where it widens (a product of
+two floats is rounded before it is widened), Java's `Math.round` (ties
+toward positive infinity), `Math.min` and `Math.max` (-0 below +0), and
+no fused multiply-add. It recomputes the codes and all four corrective
+terms of the fixtures' 2,500 records bit for bit.
+`tools/quantizer_oracle.py` runs Lucene's own quantizer, from the Lucene
+10.5.1 jar and the JDK in the OpenSearch 3.9.0 image
+(`tools/QuantizerOracle.java`), over 1,600 synthetic cases in
+`fixtures/synthetic-quantizer/`: every similarity, 1 to 8 bits,
+dimensions 1 to 768, and exact ties, signed zeros, subnormal, very
+small, and huge components, constant vectors, and vectors equal to their
+centroid. The port matches every one.
+
 ### Bytes
 
 Head of `nocfs/l2/_2_165_vec.faiss`:
