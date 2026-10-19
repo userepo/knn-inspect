@@ -170,38 +170,46 @@ exactly where it records the field; without one, or with a sound one in
 a format this tool does not read, `scan` searches the `.vec` at every
 offset Lucene could have used. A graph without its vectors has none to
 find there; `scan` checks the scalar-quantized vectors Lucene keeps for
-it instead. The segment's `.vemq` must record a field of the graph's
-dimension and vector count, quantized to 1, 2, or 4 bits into records of
-the graph's code size, with a similarity that fits the graph's metric
-and names the `--space` given (the `.vemq`, unlike the graph, tells
-`cosinesimil` from `innerproduct`); the `.veq` beside it must hold every
-record, each with the sum of its components and finite interval ends,
-under a finite centroid whose dot product is neither NaN nor negative;
-and the `.vec` and `.vemf` beside them must be there and sound, and the
-`.vemf` must record the same field; otherwise the file fails. Every
-field of the graph's shape that fits is held to this, since nothing else
-ties the graph to its field. Each record's additional correction,
-recomputed from its vector in the `.vec` and the stored centroid, and
-the centroid's dot product, recomputed from its components, must agree
-with the stored ones within a small relative tolerance (on the fixtures
-the corrections agree bit for bit), or `scan` warns; a sound `.vemf` in
-a format this tool does not read, or components other than float32,
-leave the comparison with the `.vec` out. A compound segment keeps these
-files inside the `.cfs` too, so this check is skipped there. The `.si`
-file gives the segment's document count, and every label in the ID map,
-which k-NN sets to a doc id, must be one of the segment's doc ids. A
-`.vec`, `.vemf`, `.vemq`, `.veq`, or `.si` that is there but cannot be
-read, or fails its own checksum, fails the native file too: the segment
-cannot be trusted as it stands. A sound `.si` in a format this tool does
-not read, as a newer Lucene may write, is skipped instead, as is a sound
-`.vemq` in such a format. `--space` applies to every file found; leave
-it out when the directory mixes space types. A sound file in a layout or
-scalar quantizer type this tool does not read is reported as
-`unsupported` rather than failed: `verify` alone fails it, but a scan of
-a whole index must not read it as corruption. Exit code 0 when every
-file is clean, 1 if any failed (or would not open, a subdirectory could
-not be read, or none was found), 2 if the worst verdict was a warning or
-an unsupported file.
+it instead. The segment's `.fnm` ties the graph to the field k-NN named
+the file for, which it must record as a k-NN field of the `--space`
+given, and names the `.vemq` that holds the field's quantized vectors.
+That `.vemq` must record the field with the graph's dimension and vector
+count, as the `.fnm` describes it, quantized to 1, 2, or 4 bits into
+records of the graph's code size, with a similarity that fits the
+graph's metric and names the `--space` given (the `.fnm` and `.vemq`,
+unlike the graph, tell `cosinesimil` from `innerproduct`); the `.veq`
+beside it must hold every record, each with the sum of its components
+and finite interval ends, under a finite centroid whose dot product is
+neither NaN nor negative; and the `.vec` and `.vemf` beside them must be
+there and sound, and the `.vemf` must record the same field; otherwise
+the file fails. The `.fnm` and `.vemq` must be the segment's, as its
+`.si` names it, and the `.vemq` the one Lucene opens for the field;
+matched by shape, each `.vemq` of the segment is held to the `.si` and
+to its own name the same way. Without a `.fnm` this tool can read (a
+missing one is not counted as damage), the field is matched by its shape
+instead, and every field of the graph's shape that fits is held to this.
+Each record's additional correction, recomputed from its vector in the
+`.vec` and the stored centroid, and the centroid's dot product,
+recomputed from its components, must agree with the stored ones within a
+small relative tolerance (on the fixtures the corrections agree bit for
+bit), or `scan` warns; a sound `.vemf` in a format this tool does not
+read, or components other than float32, leave the comparison with the
+`.vec` out. A compound segment keeps these files inside the `.cfs` too,
+so this check is skipped there. The `.si` file gives the segment's
+document count, and every label in the ID map, which k-NN sets to a doc
+id, must be one of the segment's doc ids. A `.vec`, `.vemf`, `.fnm`,
+`.vemq`, `.veq`, or `.si` that is there but cannot be read, or fails its
+own checksum, fails the native file too: the segment cannot be trusted
+as it stands. A sound `.si` in a format this tool does not read, as a
+newer Lucene may write, is skipped instead, as is a sound `.vemq` in
+such a format; a sound `.fnm` in one leaves the field matched by shape.
+`--space` applies to every file found; leave it out when the directory
+mixes space types. A sound file in a layout or scalar quantizer type
+this tool does not read is reported as `unsupported` rather than failed:
+`verify` alone fails it, but a scan of a whole index must not read it as
+corruption. Exit code 0 when every file is clean, 1 if any failed (or
+would not open, a subdirectory could not be read, or none was found), 2
+if the worst verdict was a warning or an unsupported file.
 
 ## Benchmarks
 

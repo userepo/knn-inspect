@@ -776,17 +776,24 @@ suffix also matches a field `my_vec`'s `_2_165_my_vec.faiss`, which the
 shortest-first order passes over; a field name can hold `_` but the
 build version does not, so the field's name is the file name less the
 `_2_165_` prefix and the extension. So the `.fnm` ties the file to a
-field number, and through the format name and suffix to the `.vemq`
-that holds the field's quantized vectors. The reader
+field number, and through the format name and suffix to the `.vemq` that
+holds the field's quantized vectors. The reader
 (`knn_format::field_infos`) checks each value's range as Lucene's reader
 does, refuses a field that is both the soft-deletes and the parent
 field, as `FieldInfo.checkConsistency` does, and a name or number two
-fields share and the soft-deletes or parent field flag on two fields,
-as Lucene's `FieldInfos` does, in Lucene's order, so the first fault it
+fields share and the soft-deletes or parent field flag on two fields, as
+Lucene's `FieldInfos` does, in Lucene's order, so the first fault it
 names is Lucene's; like Lucene, it decodes bytes that are not UTF-8 to
-U+FFFD and reads a negative attribute count as none. It reads versions
-0 to 2, and does not check the header's segment id and suffix, which are
-the caller's to compare with the segment's `.si`.
+U+FFFD and reads a negative attribute count as none. It reads versions 0
+to 2, and does not check the header's segment id and suffix, which are
+the caller's to compare. For a graph without its vectors, `scan` (since
+0.10.0) holds the `.fnm` to the `.si`'s segment id and the empty suffix,
+reads only the `.vemq` the `.fnm` names for the native file's field,
+which must carry the `.fnm`'s segment id and the segment suffix of the
+field's format and suffix
+(`Faiss1040ScalarQuantizedKnnVectorsFormat_0`), as Lucene's
+`checkIndexHeader` requires, and matches a field by the graph's shape
+only without a `.fnm` it can read.
 
 ### Flat-vectors metadata (`.vemf`)
 
@@ -841,7 +848,8 @@ names are Lucene's: `Lucene104ScalarQuantizedVectorsFormatMeta` for the
 version 0 at Lucene 10.5.1 (`writeMeta` and `writeVectors` in
 `Lucene104ScalarQuantizedVectorsWriter`). The float32 vectors stay in
 the `.vec` and `.vemf` of the same name, as for any other field. `scan`
-reads both files since 0.9.0.
+reads both files since 0.9.0, and since 0.10.0 only the `.vemq` the
+segment's `.fnm` names for the graph's field (see Field infos above).
 
 After the big-endian index header (109 bytes in the fixtures: the codec
 name and the segment suffix `Faiss1040ScalarQuantizedKnnVectorsFormat_0`

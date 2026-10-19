@@ -40,6 +40,9 @@ fn scan(dir: &Path, extra: &[&str]) -> (Option<i32>, serde_json::Value) {
 
 const VEMQ: &str = "_2_Faiss1040ScalarQuantizedKnnVectorsFormat_0.vemq";
 const VEQ: &str = "_2_Faiss1040ScalarQuantizedKnnVectorsFormat_0.veq";
+const FNM: &str = "_2.fnm";
+const SI: &str = "_2.si";
+const NATIVE: &str = "_2_165_vec.faiss";
 
 /// A copy of an `on_disk` fixture's segment in a directory of its own,
 /// removed on drop.
@@ -85,6 +88,70 @@ fn reseal(bytes: &mut [u8]) {
     }
 }
 
+/// Removes the segment's `.fnm`, so the field is looked for by the
+/// graph's shape in every `.vemq` of the segment.
+fn shape_only(s: &Scratch) {
+    std::fs::remove_file(s.0.join(FNM)).unwrap();
+}
+
+/// Where the Lucene string `text`, its one-byte length first, occurs in
+/// `b`: the one place.
+fn find_string(b: &[u8], text: &str) -> usize {
+    let mut needle = vec![u8::try_from(text.len()).unwrap()];
+    assert!(needle[0] < 0x80, "a one-byte length");
+    needle.extend_from_slice(text.as_bytes());
+    let at: Vec<usize> = b
+        .windows(needle.len())
+        .enumerate()
+        .filter(|(_, w)| *w == needle.as_slice())
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(at.len(), 1, "{text:?} occurs once");
+    at[0]
+}
+
+/// Replaces the Lucene string `old` in `b` with `new`.
+fn replace_string(b: &mut Vec<u8>, old: &str, new: &str) {
+    let at = find_string(b, old);
+    let mut to = vec![u8::try_from(new.len()).unwrap()];
+    to.extend_from_slice(new.as_bytes());
+    b.splice(at..=at + old.len(), to);
+}
+
+/// Makes the copy `name`, a file of field suffix 0 from any segment, one
+/// of the scratch segment's field of suffix 1, as Lucene would have
+/// written it: its header's segment id the `.si`'s and the last byte of
+/// its segment suffix, which ends the header, `1`; resealed.
+fn adopt(s: &Scratch, name: &str) {
+    let si = std::fs::read(s.0.join(SI)).unwrap();
+    let id = knn_format::envelope::Envelope::parse(&si)
+        .unwrap()
+        .header
+        .unwrap()
+        .segment_id;
+    s.edit(name, |b| {
+        let header = knn_format::envelope::Envelope::parse(b)
+            .unwrap()
+            .header
+            .unwrap();
+        let end = header.length;
+        assert_eq!(b[end - 1], b'0', "the field suffix");
+        b[end - 1] = b'1';
+        let at = end - 1 - header.suffix.len() - 16;
+        b[at..at + 16].copy_from_slice(&id);
+    });
+}
+
+/// Sets the value of the attribute `key` in a `.fnm`'s bytes.
+fn set_attribute(b: &mut Vec<u8>, key: &str, value: &str) {
+    let at = find_string(b, key) + 1 + key.len();
+    let old = usize::from(b[at]);
+    assert!(old < 0x80, "a one-byte length");
+    let mut to = vec![u8::try_from(value.len()).unwrap()];
+    to.extend_from_slice(value.as_bytes());
+    b.splice(at..=at + old, to);
+}
+
 fn detail(q: &serde_json::Value) -> &str {
     q["detail"].as_str().unwrap()
 }
@@ -121,6 +188,7 @@ fn every_on_disk_fixture_matches_its_quantized_vectors() {
         assert_eq!(q["bits"], bits, "{fixture}");
         assert_eq!(q["similarity"], similarity, "{fixture}");
         assert_eq!(q["offset"], 112, "{fixture}");
+        assert_eq!(q["field"], "vec", "{fixture}");
         assert!(q["file"].as_str().unwrap().ends_with(VEMQ), "{q}");
         assert!(q["data_file"].as_str().unwrap().ends_with(VEQ), "{q}");
         assert!(
@@ -168,14 +236,14 @@ fn files_with_their_own_vectors_skip_the_check_quietly() {
 }
 
 #[test]
-fn the_space_given_must_be_the_one_the_vemq_records() {
+fn the_space_given_must_be_the_fields() {
     // Both are inner-product graphs, which verify cannot tell apart; the
-    // .vemq records which space the field was created with.
+    // .fnm records the space the field was created with.
     let ip = fixtures().join("on-disk/innerproduct");
     let cosine = fixtures().join("on-disk/cosinesimil");
     for (dir, space, recorded) in [
-        (&ip, "cosinesimil", "maximum_inner_product"),
-        (&cosine, "innerproduct", "cosine"),
+        (&ip, "cosinesimil", "innerproduct"),
+        (&cosine, "innerproduct", "cosinesimil"),
     ] {
         let (code, f) = scan(dir, &["--space", space]);
         assert_eq!(code, Some(1), "{f}");
@@ -185,7 +253,7 @@ fn the_space_given_must_be_the_one_the_vemq_records() {
         assert_eq!(
             detail(q),
             format!(
-                "the .vemq records the {recorded} similarity for the field, which k-NN does not record for {space}"
+                "the .fnm records the {recorded} space type for field \"vec\", not the {space} given"
             )
         );
     }
@@ -193,6 +261,29 @@ fn the_space_given_must_be_the_one_the_vemq_records() {
         let (code, f) = scan(dir, &["--space", space]);
         assert_eq!(code, Some(0), "{f}");
         assert_eq!(f["lucene_quantized"]["status"], "match", "{f}");
+    }
+
+    // Without the .fnm, the similarity the .vemq records tells them apart.
+    for (fixture, space, recorded) in [
+        (
+            "on-disk/innerproduct",
+            "cosinesimil",
+            "maximum_inner_product",
+        ),
+        ("on-disk/cosinesimil", "innerproduct", "cosine"),
+    ] {
+        let s = Scratch::of(&format!("space-{space}"), fixture);
+        shape_only(&s);
+        let (code, f) = scan(&s.0, &["--space", space]);
+        assert_eq!(code, Some(1), "{f}");
+        let q = &f["lucene_quantized"];
+        assert_eq!(q["status"], "mismatch", "{q}");
+        assert_eq!(
+            detail(q),
+            format!(
+                "the .vemq records the {recorded} similarity for the field, which k-NN does not record for {space}; the field was matched by shape: no _2.fnm beside the native file"
+            )
+        );
     }
 }
 
@@ -280,10 +371,10 @@ fn damaged_quantized_vectors_fail_the_file() {
 
 #[test]
 fn a_field_the_graph_was_not_built_over_is_a_mismatch() {
-    // The 16x segment's quantized files beside the 32x graph: the shape
-    // fits, the records do not.
+    // The 32x graph in the 16x segment: the shape fits, the records do
+    // not.
     let s = Scratch::of("record", "on-disk/l2");
-    for name in [VEMQ, VEQ] {
+    for name in [VEMQ, VEQ, FNM, SI] {
         std::fs::copy(fixtures().join("on-disk-16x/l2").join(name), s.0.join(name)).unwrap();
     }
     let (code, f) = scan(&s.0, &[]);
@@ -297,7 +388,7 @@ fn a_field_the_graph_was_not_built_over_is_a_mismatch() {
 
     // An l2 graph over an inner-product field.
     let s = Scratch::of("similarity", "on-disk/l2");
-    for name in [VEMQ, VEQ] {
+    for name in [VEMQ, VEQ, FNM, SI] {
         std::fs::copy(
             fixtures().join("on-disk/innerproduct").join(name),
             s.0.join(name),
@@ -461,9 +552,26 @@ fn values_that_disagree_with_the_vec_warn() {
 }
 
 #[test]
-fn a_missing_vemq_is_skipped() {
+fn a_missing_vemq_is_damage_unless_nothing_ties_the_graph_to_it() {
+    // The .fnm keeps the field's quantized vectors in the .vemq it names:
+    // without that file the segment is incomplete.
     let s = Scratch::of("novemq", "on-disk/l2");
     std::fs::remove_file(s.0.join(VEMQ)).unwrap();
+    let (code, f) = scan(&s.0, &[]);
+    assert_eq!(code, Some(1), "{f}");
+    let q = &f["lucene_quantized"];
+    assert_eq!(q["status"], "damaged", "{q}");
+    assert_eq!(
+        detail(q),
+        format!(
+            "no {} beside the native file, where the .fnm keeps field \"vec\"'s quantized vectors",
+            shown(&s.0.join(VEMQ))
+        )
+    );
+
+    // Without the .fnm too, as beside a compound segment's native file,
+    // whose .fnm and .vemq are inside the .cfs: skipped.
+    shape_only(&s);
     let (code, f) = scan(&s.0, &[]);
     assert_eq!(code, Some(0), "{f}");
     let q = &f["lucene_quantized"];
@@ -550,9 +658,9 @@ fn a_damaged_vec_or_centroid_fails_the_file() {
     );
 }
 
-/// A `.vemq` built by hand under a real one's header: one 1-bit field of
-/// dimension 4 and 3 vectors, resealed.
-fn small_vemq(dir: &Path, name: &str) {
+/// A `.vemq` built by hand under a real one's header: one 1-bit field
+/// numbered `number` of dimension 4 and 3 vectors, resealed.
+fn small_vemq(dir: &Path, name: &str, number: i32) {
     let real = std::fs::read(fixtures().join("on-disk/l2").join(VEMQ)).unwrap();
     let header_len = knn_format::envelope::Envelope::parse(&real)
         .unwrap()
@@ -560,7 +668,7 @@ fn small_vemq(dir: &Path, name: &str) {
         .unwrap()
         .length;
     let mut file = real[..header_len].to_vec();
-    file.extend_from_slice(&7_i32.to_le_bytes());
+    file.extend_from_slice(&number.to_le_bytes());
     file.extend_from_slice(&1_i32.to_le_bytes());
     file.extend_from_slice(&0_i32.to_le_bytes());
     file.extend_from_slice(&[4, 112, 51, 3, 3]);
@@ -581,8 +689,10 @@ fn small_vemq(dir: &Path, name: &str) {
 
 #[test]
 fn vemq_files_that_cannot_be_used_are_said_so() {
-    // A .vemq that fails its checksum, alone: damaged.
+    // Without a .fnm, every .vemq of the segment is read for a field of
+    // the graph's shape. A .vemq that fails its checksum, alone: damaged.
     let s = Scratch::of("vemq-checksum", "on-disk/l2");
+    shape_only(&s);
     let vemq = s.0.join(VEMQ);
     let mut bytes = std::fs::read(&vemq).unwrap();
     bytes[150] ^= 0xFF;
@@ -598,7 +708,7 @@ fn vemq_files_that_cannot_be_used_are_said_so() {
         "{q}"
     );
     assert!(
-        detail(q).ends_with(".vemq fails its footer checksum"),
+        detail(q).ends_with(".vemq fails its footer checksum; the field was matched by shape: no _2.fnm beside the native file"),
         "{q}"
     );
 
@@ -614,6 +724,9 @@ fn vemq_files_that_cannot_be_used_are_said_so() {
             s.0.join(format!("{other}.{ext}")),
         )
         .unwrap();
+    }
+    for ext in ["vemq", "veq"] {
+        adopt(&s, &format!("{other}.{ext}"));
     }
     let (code, f) = scan(&s.0, &[]);
     assert_eq!(code, Some(1), "{f}");
@@ -645,6 +758,7 @@ fn vemq_files_that_cannot_be_used_are_said_so() {
     // A sound .vemq in a format this tool does not read: a .vemf under
     // the name.
     let s = Scratch::of("vemq-format", "on-disk/l2");
+    shape_only(&s);
     std::fs::copy(s.0.join(VEMQ).with_extension("vemf"), s.0.join(VEMQ)).unwrap();
     let (code, f) = scan(&s.0, &[]);
     assert_eq!(code, Some(0), "{f}");
@@ -661,14 +775,15 @@ fn vemq_files_that_cannot_be_used_are_said_so() {
 
     // A sound .vemq with no field of the graph's shape.
     let s = Scratch::of("vemq-shape", "on-disk/l2");
-    small_vemq(&s.0, VEMQ);
+    shape_only(&s);
+    small_vemq(&s.0, VEMQ, 7);
     let (code, f) = scan(&s.0, &[]);
     assert_eq!(code, Some(1), "{f}");
     let q = &f["lucene_quantized"];
     assert_eq!(q["status"], "mismatch", "{q}");
     assert_eq!(
         detail(q),
-        "no field of 500 vectors of dimension 16 in the segment's .vemq"
+        "no field of 500 vectors of dimension 16 in the segment's .vemq; the field was matched by shape: no _2.fnm beside the native file"
     );
 }
 
@@ -779,6 +894,7 @@ fn a_field_that_does_not_fit_decides_nothing_while_one_does() {
     // 16x field's records do not fit the 32x graph, and a warning on the
     // field that fits stays a warning.
     let s = Scratch::of("ranking", "on-disk/l2");
+    shape_only(&s);
     spoil_a_correction(&s);
     let other = "_2_Faiss1040ScalarQuantizedKnnVectorsFormat_1";
     for ext in ["vemq", "veq", "vemf", "vec"] {
@@ -790,6 +906,9 @@ fn a_field_that_does_not_fit_decides_nothing_while_one_does() {
             s.0.join(format!("{other}.{ext}")),
         )
         .unwrap();
+    }
+    for ext in ["vemq", "veq", "vemf", "vec"] {
+        adopt(&s, &format!("{other}.{ext}"));
     }
     let (code, f) = scan(&s.0, &[]);
     assert_eq!(code, Some(2), "{f}");
@@ -987,12 +1106,16 @@ fn every_field_of_the_graphs_shape_is_held_to_the_check() {
     // the first matches, and a warning in it warns.
     let other = "_2_Faiss1040ScalarQuantizedKnnVectorsFormat_1";
     let s = Scratch::of("twins", "on-disk/l2");
+    shape_only(&s);
     for ext in ["vemq", "veq", "vemf", "vec"] {
         std::fs::copy(
             s.0.join(VEMQ).with_extension(ext),
             s.0.join(format!("{other}.{ext}")),
         )
         .unwrap();
+    }
+    for ext in ["vemq", "veq", "vemf", "vec"] {
+        adopt(&s, &format!("{other}.{ext}"));
     }
     let (code, f) = scan(&s.0, &[]);
     assert_eq!(code, Some(0), "{f}");
@@ -1031,6 +1154,7 @@ fn a_space_given_picks_the_field_of_that_space() {
     // both fit the inner-product graph, and the space given picks one.
     let other = "_2_Faiss1040ScalarQuantizedKnnVectorsFormat_1";
     let s = Scratch::of("two-spaces", "on-disk/cosinesimil");
+    shape_only(&s);
     for ext in ["vemq", "veq", "vemf", "vec"] {
         std::fs::copy(
             fixtures()
@@ -1040,6 +1164,9 @@ fn a_space_given_picks_the_field_of_that_space() {
             s.0.join(format!("{other}.{ext}")),
         )
         .unwrap();
+    }
+    for ext in ["vemq", "veq", "vemf", "vec"] {
+        adopt(&s, &format!("{other}.{ext}"));
     }
     // Without a space both check out.
     let (code, f) = scan(&s.0, &[]);
@@ -1060,13 +1187,22 @@ fn a_space_given_picks_the_field_of_that_space() {
 }
 
 #[test]
-fn an_unreadable_vemq_beside_a_matching_field_is_still_damage() {
+fn an_unreadable_vemq_counts_only_when_matching_by_shape() {
+    // With the .fnm, an unreadable .vemq beside the field's is another
+    // field's.
     let s = Scratch::of("unreadable-beside", "on-disk/l2");
     let other =
         s.0.join("_2_Faiss1040ScalarQuantizedKnnVectorsFormat_9.vemq");
     let mut bytes = std::fs::read(s.0.join(VEMQ)).unwrap();
     bytes[150] ^= 0xFF;
     std::fs::write(&other, bytes).unwrap();
+    let (code, f) = scan(&s.0, &[]);
+    assert_eq!(code, Some(0), "{f}");
+    assert_eq!(f["lucene_quantized"]["status"], "match", "{f}");
+
+    // Without it, the field may be in that one: damage, whatever the field
+    // of the graph's shape came to.
+    shape_only(&s);
     let (code, f) = scan(&s.0, &[]);
     assert_eq!(code, Some(1), "{f}");
     let q = &f["lucene_quantized"];
@@ -1078,7 +1214,7 @@ fn an_unreadable_vemq_beside_a_matching_field_is_still_damage() {
         "{q}"
     );
     assert!(
-        detail(q).ends_with("_9.vemq fails its footer checksum"),
+        detail(q).ends_with("_9.vemq fails its footer checksum; the field was matched by shape: no _2.fnm beside the native file"),
         "{q}"
     );
 
@@ -1096,8 +1232,503 @@ fn an_unreadable_vemq_beside_a_matching_field_is_still_damage() {
     );
     assert!(detail(q).contains("first: record 7 stores"), "{q}");
     assert!(
-        detail(q).ends_with("_9.vemq fails its footer checksum"),
+        detail(q).ends_with("_9.vemq fails its footer checksum; the field was matched by shape: no _2.fnm beside the native file"),
         "{q}"
+    );
+}
+
+#[test]
+fn matching_by_shape_holds_each_vemq_to_the_segment() {
+    // A copy of the field's files under suffix 1 whose headers still say
+    // 0: not the files Lucene opens under that name.
+    let other = "_2_Faiss1040ScalarQuantizedKnnVectorsFormat_1";
+    let s = Scratch::of("shape-suffix", "on-disk/l2");
+    shape_only(&s);
+    for ext in ["vemq", "veq", "vemf", "vec"] {
+        std::fs::copy(
+            s.0.join(VEMQ).with_extension(ext),
+            s.0.join(format!("{other}.{ext}")),
+        )
+        .unwrap();
+    }
+    let (code, f) = scan(&s.0, &[]);
+    assert_eq!(code, Some(1), "{f}");
+    let q = &f["lucene_quantized"];
+    assert_eq!(q["status"], "damaged", "{q}");
+    assert!(
+        detail(q).contains(
+            "_1.vemq's header has the segment suffix \"Faiss1040ScalarQuantizedKnnVectorsFormat_0\", not \"Faiss1040ScalarQuantizedKnnVectorsFormat_1\", which its name gives"
+        ),
+        "{q}"
+    );
+    // As Lucene would have written them, the field checks out.
+    for ext in ["vemq", "veq", "vemf", "vec"] {
+        adopt(&s, &format!("{other}.{ext}"));
+    }
+    let (code, f) = scan(&s.0, &[]);
+    assert_eq!(code, Some(0), "{f}");
+    assert_eq!(f["lucene_quantized"]["status"], "match", "{f}");
+
+    // Another segment's .vemq, resealed.
+    let s = Scratch::of("shape-segment", "on-disk/l2");
+    shape_only(&s);
+    s.edit(VEMQ, |b| b[52] ^= 0x01);
+    let (code, f) = scan(&s.0, &[]);
+    assert_eq!(code, Some(1), "{f}");
+    let q = &f["lucene_quantized"];
+    assert_eq!(q["status"], "damaged", "{q}");
+    assert!(
+        detail(q).contains("_0.vemq's header names another segment than the .si's"),
+        "{q}"
+    );
+
+    // And one in a format this tool does not read under another field's
+    // name: not skipped as unread.
+    let s = Scratch::of("shape-unread-suffix", "on-disk/l2");
+    shape_only(&s);
+    std::fs::copy(s.0.join(VEMF), s.0.join(format!("{other}.vemq"))).unwrap();
+    let (code, f) = scan(&s.0, &[]);
+    assert_eq!(code, Some(1), "{f}");
+    let q = &f["lucene_quantized"];
+    assert_eq!(q["status"], "damaged", "{q}");
+    assert!(
+        detail(q).contains(
+            "_1.vemq's header has the segment suffix \"Faiss1040ScalarQuantizedKnnVectorsFormat_0\", not \"Faiss1040ScalarQuantizedKnnVectorsFormat_1\", which its name gives"
+        ),
+        "{q}"
+    );
+}
+
+#[test]
+fn the_field_infos_tie_the_graph_to_its_field() {
+    // A second field's files beside the first, damaged: the .fnm ties the
+    // graph to field vec and its suffix 0, so they are not read.
+    let other = "_2_Faiss1040ScalarQuantizedKnnVectorsFormat_1";
+    let s = Scratch::of("tie", "on-disk/l2");
+    for ext in ["vemq", "veq", "vemf", "vec"] {
+        std::fs::copy(
+            s.0.join(VEMQ).with_extension(ext),
+            s.0.join(format!("{other}.{ext}")),
+        )
+        .unwrap();
+    }
+    s.edit(&format!("{other}.veq"), |b| {
+        let at = 112 + 14;
+        b[at] = b[at].wrapping_add(1);
+    });
+    let (code, f) = scan(&s.0, &[]);
+    assert_eq!(code, Some(0), "{f}");
+    let q = &f["lucene_quantized"];
+    assert_eq!(q["status"], "match", "{q}");
+    assert_eq!(q["field"], "vec", "{q}");
+    assert!(q["file"].as_str().unwrap().ends_with("_0.vemq"), "{q}");
+    assert!(!detail(q).contains("matched by shape"), "{q}");
+
+    // With the suffix 1, the .fnm ties it to the copies, whose headers
+    // still say 0: not the files Lucene opens under the suffix 1.
+    s.edit(FNM, |b| {
+        set_attribute(b, "PerFieldKnnVectorsFormat.suffix", "1");
+    });
+    let (code, f) = scan(&s.0, &[]);
+    assert_eq!(code, Some(1), "{f}");
+    let q = &f["lucene_quantized"];
+    assert_eq!(q["status"], "damaged", "{q}");
+    assert!(
+        detail(q).ends_with(
+            "_1.vemq's header has the segment suffix \"Faiss1040ScalarQuantizedKnnVectorsFormat_0\", not \"Faiss1040ScalarQuantizedKnnVectorsFormat_1\", which its name gives"
+        ),
+        "{q}"
+    );
+
+    // With theirs set to 1, the .fnm ties the graph to the damaged copy.
+    for ext in ["vemq", "veq", "vemf", "vec"] {
+        adopt(&s, &format!("{other}.{ext}"));
+    }
+    let (code, f) = scan(&s.0, &[]);
+    assert_eq!(code, Some(1), "{f}");
+    let q = &f["lucene_quantized"];
+    assert_eq!(q["status"], "damaged", "{q}");
+    assert!(q["file"].as_str().unwrap().ends_with("_1.vemq"), "{q}");
+    assert!(
+        detail(q).contains("first: record 0 stores a component sum of"),
+        "{q}"
+    );
+
+    // A suffix with no files: the field's .vemq is missing.
+    s.edit(FNM, |b| {
+        set_attribute(b, "PerFieldKnnVectorsFormat.suffix", "9");
+    });
+    let (code, f) = scan(&s.0, &[]);
+    assert_eq!(code, Some(1), "{f}");
+    let q = &f["lucene_quantized"];
+    assert_eq!(q["status"], "damaged", "{q}");
+    let missing =
+        s.0.join("_2_Faiss1040ScalarQuantizedKnnVectorsFormat_9.vemq");
+    assert_eq!(
+        detail(q),
+        format!(
+            "no {} beside the native file, where the .fnm keeps field \"vec\"'s quantized vectors",
+            shown(&missing)
+        )
+    );
+
+    // A suffix that is not a number names no file.
+    s.edit(FNM, |b| {
+        set_attribute(b, "PerFieldKnnVectorsFormat.suffix", "../0");
+    });
+    let (code, f) = scan(&s.0, &[]);
+    assert_eq!(code, Some(1), "{f}");
+    let q = &f["lucene_quantized"];
+    assert_eq!(q["status"], "mismatch", "{q}");
+    assert_eq!(
+        detail(q),
+        "the .fnm records the vectors format suffix \"../0\" for field \"vec\", which is not a number"
+    );
+    assert!(q.get("file").is_none(), "{q}");
+}
+
+#[test]
+fn the_native_file_is_named_for_its_field() {
+    // A native file named for a field the .fnm does not have.
+    let s = Scratch::of("fnm-name", "on-disk/l2");
+    std::fs::rename(s.0.join(NATIVE), s.0.join("_2_165_vex.faiss")).unwrap();
+    let (code, f) = scan(&s.0, &[]);
+    assert_eq!(code, Some(1), "{f}");
+    let q = &f["lucene_quantized"];
+    assert_eq!(q["status"], "mismatch", "{q}");
+    assert_eq!(q["field"], "vex", "{q}");
+    assert_eq!(
+        detail(q),
+        "the .fnm records no field \"vex\", which the native file is named for"
+    );
+
+    // A name k-NN does not give a native file: matched by shape.
+    std::fs::rename(s.0.join("_2_165_vex.faiss"), s.0.join("_2.faiss")).unwrap();
+    let (code, f) = scan(&s.0, &[]);
+    assert_eq!(code, Some(0), "{f}");
+    let q = &f["lucene_quantized"];
+    assert_eq!(q["status"], "match", "{q}");
+    assert!(q.get("field").is_none(), "{q}");
+    assert!(
+        detail(q).ends_with(
+            "; the field was matched by shape: the native file's name does not name a field as k-NN names it"
+        ),
+        "{q}"
+    );
+}
+
+#[test]
+fn the_field_infos_must_record_a_quantized_k_nn_field() {
+    // A name, a change to the .fnm, and the status and detail it gives.
+    type Case = (&'static str, fn(&mut Vec<u8>), &'static str, &'static str);
+    let cases: [Case; 6] = [
+        (
+            "knn-field",
+            |b| replace_string(b, "knn_field", "knn_fielx"),
+            "mismatch",
+            "the .fnm records field \"vec\" without k-NN's attributes",
+        ),
+        (
+            "engine",
+            |b| set_attribute(b, "engine", "nmslib"),
+            "mismatch",
+            "the .fnm records field \"vec\" for the nmslib engine, not faiss",
+        ),
+        (
+            "native-format",
+            |b| {
+                set_attribute(
+                    b,
+                    "PerFieldKnnVectorsFormat.format",
+                    "NativeEngines990KnnVectorsFormat",
+                );
+            },
+            "mismatch",
+            "the .fnm records field \"vec\" in NativeEngines990KnnVectorsFormat, which keeps the vectors in the native file, not beside a graph without them",
+        ),
+        (
+            "newer-format",
+            |b| {
+                set_attribute(
+                    b,
+                    "PerFieldKnnVectorsFormat.format",
+                    "Faiss1050ScalarQuantizedKnnVectorsFormat",
+                );
+            },
+            "skipped",
+            "the .fnm records field \"vec\" in Faiss1050ScalarQuantizedKnnVectorsFormat, a vectors format this tool does not read",
+        ),
+        (
+            "no-format",
+            |b| {
+                replace_string(
+                    b,
+                    "PerFieldKnnVectorsFormat.format",
+                    "PerFieldKnnVectorsFormat.formax",
+                );
+            },
+            "mismatch",
+            "the .fnm records no per-field vectors format for field \"vec\"",
+        ),
+        (
+            "number",
+            |b| {
+                let at = find_string(b, "vec") + 4;
+                assert_eq!(b[at], 6, "the field number");
+                b[at] = 7;
+            },
+            "mismatch",
+            "the .vemq records no field 7, the number the .fnm gives field \"vec\"",
+        ),
+    ];
+    for (name, change, status, expected) in cases {
+        let s = Scratch::of(&format!("fnm-{name}"), "on-disk/l2");
+        s.edit(FNM, change);
+        let (code, f) = scan(&s.0, &[]);
+        assert_eq!(code, Some(i32::from(status != "skipped")), "{name}: {f}");
+        let q = &f["lucene_quantized"];
+        assert_eq!(q["status"], status, "{name}: {q}");
+        assert_eq!(q["field"], "vec", "{name}: {q}");
+        assert_eq!(detail(q), expected, "{name}");
+    }
+}
+
+#[test]
+fn the_field_infos_must_agree_with_the_vemq() {
+    // The vec field's record ends the .fnm: its dimension, encoding, and
+    // similarity are the three bytes before the footer.
+    type Case = (&'static str, fn(&mut Vec<u8>), &'static str);
+    let cases: [Case; 4] = [
+        (
+            "dimension",
+            |b| {
+                let at = b.len() - 19;
+                assert_eq!(b[at], 16, "the dimension");
+                b[at] = 15;
+            },
+            "the .fnm records dimension 15 for field \"vec\", the .vemq 16",
+        ),
+        (
+            "encoding",
+            |b| {
+                let at = b.len() - 18;
+                assert_eq!(b[at], 1, "the encoding, FLOAT32");
+                b[at] = 0;
+            },
+            "the .fnm records field \"vec\" as byte vectors, the .vemq as float32",
+        ),
+        (
+            "similarity",
+            |b| {
+                let at = b.len() - 17;
+                assert_eq!(b[at], 0, "the similarity, EUCLIDEAN");
+                b[at] = 3;
+            },
+            "the .fnm records the maximum_inner_product similarity for field \"vec\", the .vemq the euclidean",
+        ),
+        (
+            "bits",
+            |b| set_attribute(b, "sq_config", "bits=2"),
+            "the .fnm's sq_config gives field \"vec\" 2 bits a component, the .vemq 1 (SINGLE_BIT_QUERY_NIBBLE)",
+        ),
+    ];
+    for (name, change, expected) in cases {
+        let s = Scratch::of(&format!("fnm-{name}"), "on-disk/l2");
+        s.edit(FNM, change);
+        let (code, f) = scan(&s.0, &[]);
+        assert_eq!(code, Some(1), "{name}: {f}");
+        let q = &f["lucene_quantized"];
+        assert_eq!(q["status"], "mismatch", "{name}: {q}");
+        assert!(q["file"].as_str().unwrap().ends_with(VEMQ), "{name}: {q}");
+        assert_eq!(detail(q), expected, "{name}");
+    }
+}
+
+#[test]
+fn field_infos_that_cannot_be_used_are_said_so() {
+    // No .fnm: by shape, and the detail says so.
+    let s = Scratch::of("nofnm", "on-disk/l2");
+    shape_only(&s);
+    let (code, f) = scan(&s.0, &[]);
+    assert_eq!(code, Some(0), "{f}");
+    let q = &f["lucene_quantized"];
+    assert_eq!(q["status"], "match", "{q}");
+    assert!(q.get("field").is_none(), "{q}");
+    assert!(
+        detail(q).ends_with("; the field was matched by shape: no _2.fnm beside the native file"),
+        "{q}"
+    );
+
+    // A sound .fnm in a format this tool does not read: by shape too.
+    let s = Scratch::of("fnm-format", "on-disk/l2");
+    std::fs::copy(s.0.join(VEMF), s.0.join(FNM)).unwrap();
+    let (code, f) = scan(&s.0, &[]);
+    assert_eq!(code, Some(0), "{f}");
+    assert!(
+        detail(&f["lucene_quantized"]).ends_with(
+            "; the field was matched by shape: the .fnm is in a format this tool does not read (Lucene99FlatVectorsFormatMeta version 0)"
+        ),
+        "{f}"
+    );
+
+    // A .fnm that fails its checksum: damage.
+    let s = Scratch::of("fnm-checksum", "on-disk/l2");
+    let fnm = s.0.join(FNM);
+    let mut bytes = std::fs::read(&fnm).unwrap();
+    bytes[300] ^= 0xFF;
+    std::fs::write(&fnm, bytes).unwrap();
+    let (code, f) = scan(&s.0, &[]);
+    assert_eq!(code, Some(1), "{f}");
+    let q = &f["lucene_quantized"];
+    assert_eq!(q["status"], "damaged", "{q}");
+    assert_eq!(q["field"], "vec", "{q}");
+    assert_eq!(detail(q), "the .fnm fails its footer checksum");
+
+    // One Lucene's reader refuses, resealed: an unused flag bit.
+    let s = Scratch::of("fnm-flags", "on-disk/l2");
+    s.edit(FNM, |b| {
+        assert_eq!(b[50], 0x02, "_id's flags: omit norms");
+        b[50] = 0x42;
+    });
+    let (code, f) = scan(&s.0, &[]);
+    assert_eq!(code, Some(1), "{f}");
+    let q = &f["lucene_quantized"];
+    assert_eq!(q["status"], "damaged", "{q}");
+    assert_eq!(
+        detail(q),
+        "the .fnm could not be read: field flags at offset 50 is 66, which is not valid"
+    );
+
+    // A .fnm of another segment, resealed: Lucene opens it under the
+    // .si's id.
+    let s = Scratch::of("fnm-segment", "on-disk/l2");
+    s.edit(FNM, |b| b[30] ^= 0x01);
+    let (code, f) = scan(&s.0, &[]);
+    assert_eq!(code, Some(1), "{f}");
+    let q = &f["lucene_quantized"];
+    assert_eq!(q["status"], "damaged", "{q}");
+    assert_eq!(
+        detail(q),
+        "the .fnm's header names another segment than the .si's"
+    );
+    // Another segment's .fnm, .vemq, and .veq together: still not this
+    // segment's.
+    let s = Scratch::of("fnm-other-segment", "on-disk/l2");
+    for name in [FNM, VEMQ, VEQ] {
+        std::fs::copy(fixtures().join("on-disk-16x/l2").join(name), s.0.join(name)).unwrap();
+    }
+    let (code, f) = scan(&s.0, &[]);
+    assert_eq!(code, Some(1), "{f}");
+    assert_eq!(
+        detail(&f["lucene_quantized"]),
+        "the .fnm's header names another segment than the .si's"
+    );
+    // Without a sound .si, nothing to hold the .fnm to: lucene_docs says
+    // why.
+    std::fs::remove_file(s.0.join(SI)).unwrap();
+    let (_, f) = scan(&s.0, &[]);
+    assert_eq!(f["lucene_quantized"]["status"], "mismatch", "{f}");
+
+    // A segment suffix Lucene never gives field infos, resealed.
+    let s = Scratch::of("fnm-suffix", "on-disk/l2");
+    s.edit(FNM, |b| {
+        assert_eq!(b[43], 0, "the empty segment suffix");
+        b.splice(43..44, [1, b'x']);
+    });
+    let (code, f) = scan(&s.0, &[]);
+    assert_eq!(code, Some(1), "{f}");
+    assert_eq!(
+        detail(&f["lucene_quantized"]),
+        "the .fnm's header has the segment suffix \"x\", which Lucene never gives field infos"
+    );
+}
+
+#[test]
+fn a_vemq_of_another_segment_than_the_fnms_is_damage() {
+    // A .vemq of another segment than the .fnm's, resealed.
+    let s = Scratch::of("vemq-segment", "on-disk/l2");
+    s.edit(VEMQ, |b| b[52] ^= 0x01);
+    let (code, f) = scan(&s.0, &[]);
+    assert_eq!(code, Some(1), "{f}");
+    let q = &f["lucene_quantized"];
+    assert_eq!(q["status"], "damaged", "{q}");
+    assert!(q["file"].as_str().unwrap().ends_with(VEMQ), "{q}");
+    assert!(
+        detail(q).ends_with("_0.vemq's header names another segment than the .fnm's"),
+        "{q}"
+    );
+
+    // So does one in a format this tool does not read: a .vemf under the
+    // name, resealed.
+    let s = Scratch::of("vemq-segment-unread", "on-disk/l2");
+    std::fs::copy(s.0.join(VEMF), s.0.join(VEMQ)).unwrap();
+    s.edit(VEMQ, |b| b[50] ^= 0x01);
+    let (code, f) = scan(&s.0, &[]);
+    assert_eq!(code, Some(1), "{f}");
+    let q = &f["lucene_quantized"];
+    assert_eq!(q["status"], "damaged", "{q}");
+    assert!(
+        detail(q).ends_with("_0.vemq's header names another segment than the .fnm's"),
+        "{q}"
+    );
+}
+
+#[test]
+fn the_fields_vemq_must_hold_the_field() {
+    // The field's .vemq fails its checksum.
+    let s = Scratch::of("field-vemq-checksum", "on-disk/l2");
+    let vemq = s.0.join(VEMQ);
+    let mut bytes = std::fs::read(&vemq).unwrap();
+    bytes[150] ^= 0xFF;
+    std::fs::write(&vemq, bytes).unwrap();
+    let (code, f) = scan(&s.0, &[]);
+    assert_eq!(code, Some(1), "{f}");
+    let q = &f["lucene_quantized"];
+    assert_eq!(q["status"], "damaged", "{q}");
+    assert_eq!(q["field"], "vec", "{q}");
+    assert!(q["file"].as_str().unwrap().ends_with(VEMQ), "{q}");
+    assert!(
+        detail(q).ends_with("_0.vemq fails its footer checksum"),
+        "{q}"
+    );
+
+    // Sound, in a format this tool does not read.
+    let s = Scratch::of("field-vemq-format", "on-disk/l2");
+    std::fs::copy(s.0.join(VEMF), s.0.join(VEMQ)).unwrap();
+    let (code, f) = scan(&s.0, &[]);
+    assert_eq!(code, Some(0), "{f}");
+    let q = &f["lucene_quantized"];
+    assert_eq!(q["status"], "skipped", "{q}");
+    assert!(
+        detail(q).starts_with("the field's .vemq is in a format this tool does not read: "),
+        "{q}"
+    );
+    assert!(
+        detail(q).ends_with("(Lucene99FlatVectorsFormatMeta version 0)"),
+        "{q}"
+    );
+
+    // No record of the field's number.
+    let s = Scratch::of("field-vemq-number", "on-disk/l2");
+    small_vemq(&s.0, VEMQ, 7);
+    let (code, f) = scan(&s.0, &[]);
+    assert_eq!(code, Some(1), "{f}");
+    let q = &f["lucene_quantized"];
+    assert_eq!(q["status"], "mismatch", "{q}");
+    assert_eq!(
+        detail(q),
+        "the .vemq records no field 6, the number the .fnm gives field \"vec\""
+    );
+
+    // A record of the field's number in another shape.
+    small_vemq(&s.0, VEMQ, 6);
+    let (code, f) = scan(&s.0, &[]);
+    assert_eq!(code, Some(1), "{f}");
+    let q = &f["lucene_quantized"];
+    assert_eq!(q["status"], "mismatch", "{q}");
+    assert_eq!(
+        detail(q),
+        "the .vemq's field 6 holds 3 vectors of dimension 4, the graph 500 of dimension 16"
     );
 }
 

@@ -129,7 +129,8 @@ Each entry of `files`:
 | `lucene_docs.doc_count` | integer, optional | Documents in the segment, deleted ones included |
 | `lucene_docs.detail` | string | What was found, what is wrong with the Lucene file, or why the check was skipped |
 | `lucene_quantized.status` | string | `match`, `mismatch`, `damaged`, `warning`, or `skipped` (since 0.9.0) |
-| `lucene_quantized.file` | string, optional | The segment's `.vemq` file whose field was checked, or whose field was found unfit (since 0.9.0) |
+| `lucene_quantized.field` | string, optional | The field the segment's `.fnm` ties the native file to, the one k-NN named the file for: `vec` for `_2_165_vec.faiss`. Absent when the field was matched by shape (since 0.10.0) |
+| `lucene_quantized.file` | string, optional | The segment's `.vemq` file whose field was checked, or whose field was found unfit; tied by the `.fnm`, the one it names for the field, whether or not it could be read (since 0.9.0) |
 | `lucene_quantized.data_file` | string, optional | The `.veq` beside it that holds, or should hold, the field's records (since 0.9.0) |
 | `lucene_quantized.offset` | integer, optional | Where in the `.veq` the field's records begin (since 0.9.0) |
 | `lucene_quantized.encoding` | string, optional | Lucene's name for the field's scalar encoding: `SINGLE_BIT_QUERY_NIBBLE`, `DIBIT_QUERY_NIBBLE`, or `PACKED_NIBBLE` for the 1, 2, and 4 bits k-NN keeps; `UNSIGNED_BYTE` or `SEVEN_BIT` in a field k-NN did not write (since 0.9.0) |
@@ -143,12 +144,12 @@ file, the `--space` given (for `lucene_quantized`), or another file of
 the segment contradicts them; `damaged` means the Lucene file exists but
 cannot be trusted (it could not be opened or read, has no footer, fails
 its footer checksum, or holds what Lucene's writer never writes; or, for
-the files a `.vemq` needs beside it, is missing), so the segment cannot
-be trusted as it stands. Either fails the file. `warning`, which only
-`lucene_quantized` gives, means the files are consistent with each other
-and with Lucene's writer, but a value the tool recomputes differs from
-the one Lucene stored by more than a relative 1e-4, far beyond float
-rounding.
+the files a `.vemq` needs beside it and the `.vemq` the `.fnm` names, is
+missing), so the segment cannot be trusted as it stands. Either fails
+the file. `warning`, which only `lucene_quantized` gives, means the
+files are consistent with each other and with Lucene's writer, but a
+value the tool recomputes differs from the one Lucene stored by more
+than a relative 1e-4, far beyond float rounding.
 
 - `lucene_vectors` looks for the native file's stored vectors, byte for
   byte, inside the segment's `.vec` (Lucene flat vectors) files, which
@@ -193,31 +194,55 @@ rounding.
   or when the `.si` is sound but in a format this tool does not read, as a
   newer Lucene may write.
 - `lucene_quantized` (since 0.9.0), for a graph without its vectors,
-  reads the segment's `.vemq` files (Lucene's scalar-quantized vectors
-  metadata) for a field of the graph's dimension and vector count, and
-  checks it and its records in the `.veq` beside it. The field must be
-  one k-NN builds such a graph over: float32 vectors quantized to 1, 2,
-  or 4 bits, records of the graph's code size, and a similarity that
+  finds the graph's field among the segment's scalar-quantized vectors
+  (the `.vemq` metadata and the `.veq` records) and checks it and its
+  records. Since 0.10.0 the segment's `.fnm` ties the native file to its
+  field: the field k-NN named the file for (`vec` in `_2_165_vec.faiss`)
+  must be a k-NN field of the Faiss engine and of the space the
+  `--space` given names, in `Faiss1040ScalarQuantizedKnnVectorsFormat`,
+  whose suffix names the one `.vemq` read. The `.fnm` must name the
+  segment the `.si` does, when a sound `.si` lies beside it, and no
+  segment suffix; that `.vemq` must name the `.fnm`'s segment and the
+  suffix Lucene opens the field's files under
+  (`Faiss1040ScalarQuantizedKnnVectorsFormat_0` for suffix `0`), and
+  record a field of the `.fnm`'s field number with the graph's dimension
+  and vector count, and agree with the `.fnm` on the field's dimension,
+  vector encoding, similarity, and the bits of k-NN's `sq_config`. A
+  field the `.fnm` lacks or records otherwise is a `mismatch`, as is one
+  in a format of k-NN's that keeps the vectors in the native file, while
+  one in a format this tool does not know is `skipped`; a `.fnm` that is
+  not sound or not the segment's, or a `.vemq` it names that is missing,
+  not sound, or not the one Lucene opens, is `damaged`. The segment's
+  other `.vemq` files are other fields' and are not read. Without a
+  `.fnm` beside the native file (which is not counted as damage, so a
+  partial copy of a segment can still be checked), with a sound one in a
+  format this tool does not read, or for a native file not named as k-NN
+  names one, the field is matched by its shape, as before 0.10.0, and
+  `detail` ends by saying so and why, unless the check is skipped: the
+  segment's `.vemq` files are read for a field of the graph's dimension
+  and vector count; of several fields of that shape, every one that fits
+  is checked and the worst outcome is reported (`damaged`, then
+  `mismatch`, `warning`, `match`); the fields that do not fit decide
+  nothing while one fits, and when none fits, the first says why not, as
+  a `mismatch`, as is no field of the graph's shape at all; and a
+  `.vemq` of the segment that is not sound, or not the file Lucene opens
+  under its name (its header's segment suffix the one its name gives,
+  and its segment id the sound `.si`'s), is `damaged`, before any other
+  outcome, whether or not a field checked out. Either way the field must
+  be one k-NN builds such a graph over: float32 vectors quantized to 1,
+  2, or 4 bits, records of the graph's code size, and a similarity that
   fits the graph's metric (`euclidean` for `l2`, an inner-product one
-  otherwise). Nothing but its shape ties the graph to a field, so of
-  several fields of that shape, every one that fits is checked and the
-  worst outcome is reported (`damaged`, then `mismatch`, `warning`,
-  `match`); the fields that do not fit decide nothing while one fits,
-  and when none fits, the first says why not, as a `mismatch`, as is no
-  field of the graph's shape at all. A field whose similarity is not the
-  one k-NN records for the `--space` given does not fit either (the
+  otherwise) and is the one k-NN records for the `--space` given (the
   `.vemq`, unlike the graph, tells `cosinesimil` from `innerproduct`),
-  so with no other field it is a `mismatch` too, as is a `.vemf` that
-  records no field of the same number, or one with another dimension,
-  count, similarity, vector encoding, or docs-with-field kind. The
-  `.veq` must lie beside the `.vemq`, be sound, name the same segment,
-  and hold the field's records where the `.vemq` puts them, each with a
-  component sum equal to its components' and finite interval ends, and
-  the `.vemq` a finite centroid whose dot product is neither NaN nor
-  negative, or the check is `damaged`; so is a `.vemq` of the segment
-  that is not sound, before any other outcome, whether or not a field
-  checked out. Each record's additional correction is then compared with
-  the one Lucene's quantizer computes from the vector of the same
+  or it is a `mismatch`, as is a `.vemf` that records no field of the
+  same number, or one with another dimension, count, similarity, vector
+  encoding, or docs-with-field kind. The `.veq` must lie beside the
+  `.vemq`, be sound, name the same segment, and hold the field's records
+  where the `.vemq` puts them, each with a component sum equal to its
+  components' and finite interval ends, and the `.vemq` a finite
+  centroid whose dot product is neither NaN nor negative, or the check
+  is `damaged`. Each record's additional correction is then compared
+  with the one Lucene's quantizer computes from the vector of the same
   ordinal in the `.vec` and the stored centroid (the squared norm of
   their difference for `euclidean`, their dot product otherwise), which
   recomputes exactly where Lucene quantized the vectors the `.vec`
@@ -233,10 +258,13 @@ rounding.
   opens them with the quantized files. When the `.vemf` is sound but in
   a format this tool does not read, or the field's components are not
   float32, the comparison with the `.vec` is left out and `detail` says
-  why. It is skipped when the segment's files cannot be listed; when no
-  `.vemq` of the segment lies beside the native file, as in a compound
-  segment; when no sound `.vemq` holds a field the graph can have been
-  built over and one is in a format this tool does not read; when every
-  field of the graph's shape that fits records no vectors; and for a
-  file that holds its own vectors, which the text report then leaves
-  out.
+  why. Tied by the `.fnm`, the check is skipped when the field's `.vemq`
+  is sound, of the segment and suffix its name and the `.fnm` give, but
+  in a format this tool does not read. Matched by shape, it is skipped
+  when the segment's files cannot be listed; when no `.vemq` of the
+  segment lies beside the native file, as in a compound segment, whose
+  `.fnm` is inside the `.cfs` too; when no sound `.vemq` holds a field
+  the graph can have been built over and one is in a format this tool
+  does not read; and when every field of the graph's shape that fits
+  records no vectors. It is skipped for a file that holds its own
+  vectors, which the text report then leaves out.
