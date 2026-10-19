@@ -18,13 +18,15 @@
 //! product, and as `(1 + clamp(dot, -1, 1)) / 2` for cosine and dot
 //! product.
 //!
-//! For 1-bit fields, k-NN scores with a native kernel instead
-//! (`DefaultSQSimilarityFunction` and its SIMD builds), which computes the
-//! same expression and transforms. Whether a native build fuses its
-//! multiply-adds is up to its compiler (Arm's NEON build may), so a native
-//! score can differ from this one in its last bit, which matters only to
-//! a tie; and the native Euclidean clamp turns a NaN distance into 0, where
-//! Lucene's keeps it.
+//! For 1-bit fields, k-NN scores with a native kernel instead, which
+//! computes the same expression and transforms (see
+//! [`QuantizedScorer::knn_native_kernel`]): in k-NN's x86-64 build for
+//! AVX2 (`DefaultSQSimilarityFunction`, compiled with fused multiply-adds),
+//! each sum of the estimate is fused into the product after it, which can
+//! change its last bit, and the Euclidean clamp turns a NaN distance into
+//! 0, where Lucene's keeps it. Every first-pass score of every live result
+//! list the 1-bit fixtures record recomputes bit for bit that way. Other
+//! native builds (AVX-512, Arm) can fuse otherwise.
 
 use knn_format::quantized_vectors::{Record, ScalarEncoding};
 
@@ -67,6 +69,8 @@ pub struct QuantizedScorer {
     /// padding components 0.
     query: Vec<u8>,
     query_terms: QuantizationResult,
+    /// Whether to score as k-NN's native kernel does.
+    native_kernel: bool,
 }
 
 impl QuantizedScorer {
@@ -106,7 +110,19 @@ impl QuantizedScorer {
             centroid_dot_product,
             query: codes,
             query_terms,
+            native_kernel: false,
         })
+    }
+
+    /// Scores as k-NN's native kernel for 1-bit fields does in its x86-64
+    /// build for AVX2, instead of as Lucene's scorer: the estimate as
+    /// `fma(lx ly, cc, fma(ax ly, sy, fma(ax ay, d, ay lx sx)))`, each
+    /// product but the second fused with the sum before it, and the
+    /// Euclidean distance clamped as `std::max(0, distance)`, a NaN to 0.
+    #[must_use]
+    pub fn knn_native_kernel(mut self) -> Self {
+        self.native_kernel = true;
+        self
     }
 
     /// The quantized query's corrective terms.
@@ -147,10 +163,24 @@ impl QuantizedScorer {
         let ly = (q.upper - ay) * query_scale;
         let y1 = int_f32(q.component_sum);
         let d = dimension_f32(self.dimension);
-        let mut score = ax * ay * d + ay * lx * x1 + ax * ly * y1 + lx * ly * qc_dist;
+        let mut score = if self.native_kernel {
+            (lx * ly).mul_add(
+                qc_dist,
+                (ax * ly).mul_add(y1, (ax * ay).mul_add(d, ay * lx * x1)),
+            )
+        } else {
+            ax * ay * d + ay * lx * x1 + ax * ly * y1 + lx * ly * qc_dist
+        };
         Some(if self.similarity == Similarity::Euclidean {
+            // 2 x score is exact, so fusing it, as the native build may,
+            // changes nothing.
             score = q.additional + terms.additional - 2.0 * score;
-            1.0 / (1.0 + java_max_f32(score, 0.0))
+            let distance = if self.native_kernel {
+                if 0.0 < score { score } else { 0.0 }
+            } else {
+                java_max_f32(score, 0.0)
+            };
+            1.0 / (1.0 + distance)
         } else {
             score += q.additional + terms.additional - self.centroid_dot_product;
             if self.similarity == Similarity::MaximumInnerProduct {

@@ -30,6 +30,24 @@ only, and accepts only `hamming` for binary fields.
 Next to a binary field's segment, `vectors.u8` holds the packed bits in
 place of `vectors.f32`, the bytes of row i the bits of document i.
 
+With `--queries N` (on-disk only), the script also queries the live
+index, whose one segment is the one copied out, N times in each of the
+modes `QUERY_MODES` lists, and writes the queries as `queries.f32`
+(their own seeded draw, the same for every space) and each mode's
+results as doc ids with their scores: `results.jsonl` the 10 nearest
+with k-NN's default rescoring, `results-no-rescore.jsonl` with
+`"rescore": false`, `results-oversample-30.jsonl` with an
+`oversample_factor` of 30 (a first pass of 300), `results-ef-search-300.jsonl`
+with an `ef_search` of 300 (a beam of 300, cut to the first pass of
+100), and `results-k-150.jsonl` the 150 nearest (a first pass of 150, all
+of it kept, for 2 and 4 bits), and `results-no-rescore-ef-search-10.jsonl`
+without rescoring at an `ef_search` of 10 (a beam of 10). The manifest records each mode's `k` and
+query parameters. These are the baselines `knn-inspect recall` must
+match for a graph without its vectors. Before recording, it rescores every document a few hundred
+times, so that the JVM has compiled Lucene's vector code, which adds its
+SIMD lanes in another order once compiled, as a node that has served
+queries for a while runs it.
+
 Usage:
     docker compose -f tools/docker-compose.yml up -d
     python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0/nocfs
@@ -40,10 +58,10 @@ Usage:
     python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-byte/byte --encoding byte
     python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-binary/binary --encoding binary --dim 128
     python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-binary/binary-encoder --encoding binary-encoder --spaces l2
-    python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-binary/on-disk --encoding on-disk --spaces l2
-    python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-binary/on-disk --encoding on-disk --spaces innerproduct cosinesimil
-    python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-binary/on-disk-16x --encoding on-disk --compression 16x --spaces l2
-    python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-binary/on-disk-8x --encoding on-disk --compression 8x --spaces l2
+    python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-binary/on-disk --encoding on-disk --spaces l2 --queries 100
+    python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-binary/on-disk --encoding on-disk --spaces innerproduct cosinesimil --queries 100
+    python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-binary/on-disk-16x --encoding on-disk --compression 16x --spaces l2 --queries 100
+    python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-binary/on-disk-8x --encoding on-disk --compression 8x --spaces l2 --queries 100
 """
 
 from __future__ import annotations
@@ -77,6 +95,24 @@ EF_CONSTRUCTION = 100
 SEED = 20261013
 DATA_ROOT = "/usr/share/opensearch/data/nodes/0/indices"
 MAX_RESULT_WINDOW = 10_000  # OpenSearch default for index.max_result_window
+# The live queries --queries records: their own draw, the same for every
+# space and encoding, and per result file the k and the query's other
+# parameters, chosen so that the modes search with different plans.
+QUERY_SEED = 20261020
+QUERY_K = 10
+QUERY_MODES = {
+    "results.jsonl": (QUERY_K, {}),
+    "results-no-rescore.jsonl": (QUERY_K, {"rescore": False}),
+    "results-oversample-30.jsonl": (QUERY_K, {"rescore": {"oversample_factor": 30.0}}),
+    "results-ef-search-300.jsonl": (QUERY_K, {"method_parameters": {"ef_search": 300}}),
+    "results-k-150.jsonl": (150, {}),
+    "results-no-rescore-ef-search-10.jsonl": (QUERY_K, {"rescore": False, "method_parameters": {"ef_search": 10}}),
+}
+# Queries run before recording, each rescoring every document (a first
+# pass of up to 500): some 37,500 calls of Lucene's bulk scoring, past
+# where the JVM compiles it.
+WARM_UP_QUERIES = 300
+WARM_UP_OVERSAMPLE = 50.0
 
 
 def wait_for_cluster(host: str, timeout: float) -> dict:
@@ -221,6 +257,44 @@ def copy_shard(container: str, uuid: str, segment: str, dest: pathlib.Path) -> l
     return files
 
 
+def record_queries(host: str, index: str, dest: pathlib.Path, dim: int, count: int, pos_of_doc: list[int]) -> dict:
+    """Query the live index, whose one segment is the one copied out, and
+    write the queries and each rescoring's result lists as doc ids, the
+    Faiss labels, with their scores, one line per query in query order."""
+    warm_up = np.random.default_rng(QUERY_SEED + 1).standard_normal((WARM_UP_QUERIES, dim), dtype=np.float32)
+    for q in warm_up:
+        rescore = {"oversample_factor": WARM_UP_OVERSAMPLE}
+        body = {"size": QUERY_K, "query": {"knn": {"vec": {"vector": q.tolist(), "k": QUERY_K, "rescore": rescore}}}}
+        requests.post(f"{host}/{index}/_search", json=body, timeout=60).raise_for_status()
+    queries = np.random.default_rng(QUERY_SEED).standard_normal((count, dim), dtype=np.float32)
+    queries.astype("<f4").tofile(dest / "queries.f32")
+    doc_of_pos = {pos: doc for doc, pos in enumerate(pos_of_doc)}
+    for name, (k, extra) in QUERY_MODES.items():
+        lines = []
+        for q in queries:
+            body = {
+                "size": k,
+                "_source": ["pos"],
+                "query": {"knn": {"vec": {"vector": q.tolist(), "k": k, **extra}}},
+            }
+            r = requests.post(f"{host}/{index}/_search", json=body, timeout=60)
+            r.raise_for_status()
+            hits = r.json()["hits"]["hits"]
+            lines.append(json.dumps({
+                "labels": [doc_of_pos[h["_source"]["pos"]] for h in hits],
+                "scores": [h["_score"] for h in hits],
+            }))
+        with open(dest / name, "w", encoding="utf-8", newline="\n") as f:
+            f.write("\n".join(lines) + "\n")
+    return {
+        "queries_file": "queries.f32",
+        "queries_seed": QUERY_SEED,
+        "warm_up_queries": WARM_UP_QUERIES,
+        "warm_up_oversample_factor": WARM_UP_OVERSAMPLE,
+        "results_files": {name: {"k": k, "query": extra} for name, (k, extra) in QUERY_MODES.items()},
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument("--host", default="http://localhost:9200")
@@ -233,6 +307,7 @@ def main() -> None:
     parser.add_argument("--batches", type=int, default=2, help="bulk batches before the force merge")
     parser.add_argument("--encoding", default="float", choices=ENCODINGS, help="how the field stores its vectors")
     parser.add_argument("--compression", choices=COMPRESSIONS, help="on-disk only: the field's compression level, 32x when absent")
+    parser.add_argument("--queries", type=int, default=0, help="on-disk only: query the live index this many times and record the results")
     args = parser.parse_args()
     if args.count > MAX_RESULT_WINDOW:
         parser.error(f"--count above {MAX_RESULT_WINDOW} exceeds index.max_result_window, which doc_order reads in one page")
@@ -242,6 +317,8 @@ def main() -> None:
         parser.error(f"k-NN's Faiss engine refuses {', '.join(refused)} for {args.encoding} fields")
     if args.compression is not None and args.encoding != "on-disk":
         parser.error("--compression applies to --encoding on-disk only")
+    if args.queries and args.encoding != "on-disk":
+        parser.error("--queries applies to --encoding on-disk only")
     if args.encoding == "binary" and args.dim % 8:
         parser.error("--dim counts bits for binary fields, and k-NN requires a multiple of 8")
 
@@ -322,6 +399,8 @@ def main() -> None:
         }
         if args.encoding == "on-disk":
             manifest["compression_level"] = args.compression or "32x"
+        if args.queries:
+            manifest["live_queries"] = record_queries(args.host, index, dest, args.dim, args.queries, pos_of_doc)
         with open(dest / "manifest.json", "w", encoding="utf-8", newline="\n") as f:
             json.dump(manifest, f, indent=2)
             f.write("\n")

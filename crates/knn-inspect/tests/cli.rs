@@ -2449,13 +2449,14 @@ fn on_disk_graphs_are_read_without_their_vectors() {
     let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
     assert_eq!(v["nodes"], 500, "{v}");
 
-    // No vectors to search or score.
+    // Searched as k-NN searches it, against the field's float32 vectors
+    // (since 0.10.0; see tests/recall_on_disk.rs).
     let o = run(&["recall", path, "--sample", "5"]);
-    assert_eq!(o.status.code(), Some(1), "{}", stdout(&o));
-    let err = String::from_utf8_lossy(&o.stderr);
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
     assert!(
-        err.contains(&format!("{path}: the file holds the graph only")),
-        "{err}"
+        stdout(&o).contains("own search as k-NN runs it"),
+        "{}",
+        stdout(&o)
     );
 
     let o = run(&["scan", dir.to_str().unwrap(), "--json"]);

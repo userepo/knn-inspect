@@ -583,15 +583,16 @@ is refused when the file is parsed. `verify` skips the vector count,
 values, and norms, and checks `--space` against the ID map's metric, so
 an `l2` field's graph fails `innerproduct`, `cosinesimil`, and
 `hamming`. `stats` reads the graph as it reads any other, `recall`
-refuses the file, which holds nothing to search, and `scan` skips its
-`.vec` check, since the `.veq` holds the graph's vectors, checks its
-labels against the `.si`, and, since 0.9.0, checks the `.vemq` and
-`.veq` (see Scalar-quantized vectors below). faiss-cpu 1.15.1 cannot
-read the file: its binary reader has no case for `null`, and it requires
-code size = dimension / 8 of every binary header. So
-`tools/graph_stats.py` reads a copy with zero-filled `IBxF` storage in
-place of the `null` and plain binary headers, which leaves the graph's
-bytes as they are; `stats` matches the statistics it computes.
+searches it as k-NN does (since 0.10.0; see the search and rescoring
+under Scalar-quantized vectors below), and `scan` skips its `.vec`
+check, since the `.veq` holds the graph's vectors, checks its labels
+against the `.si`, and, since 0.9.0, checks the `.vemq` and `.veq` (see
+Scalar-quantized vectors below). faiss-cpu 1.15.1 cannot read the file:
+its binary reader has no case for `null`, and it requires code size =
+dimension / 8 of every binary header. So `tools/graph_stats.py` reads a
+copy with zero-filled `IBxF` storage in place of the `null` and plain
+binary headers, which leaves the graph's bytes as they are; `stats`
+matches the statistics it computes.
 
 k-NN's remote index build, which hands the graph to a GPU builder,
 writes a float CAGRA graph instead and leaves its storage out the same
@@ -959,10 +960,14 @@ products with the centroid less the centroid's own, scaled as
 `scaleMaxInnerProductScore` does (`1 + x` from 0 up, `1 / (1 - x)`
 below); for `COSINE`, the same sum clamped to [-1, 1] and mapped to `(1
 + x) / 2`. For 1-bit fields k-NN scores with a native kernel instead
-(`DefaultSQSimilarityFunction` and its SIMD builds), which computes the
-same expression and transforms; a build whose compiler fuses
-multiply-adds (Arm's NEON may) can give a last bit of its own, and its
-Euclidean clamp turns a NaN distance into 0.
+(`DefaultSQSimilarityFunction` in its x86-64 build for AVX2, and SIMD
+builds for AVX-512 and Arm), which computes the same expression and
+transforms; the AVX2 build's compiler fuses its multiply-adds, as
+`fma(lx ly, codes . codes, fma(ax ly, sy, fma(ax ay, d, ay lx sx)))`,
+which can change the last bit, and its Euclidean clamp turns a NaN
+distance into 0. `QuantizedScorer::knn_native_kernel` scores that way,
+and the 1-bit fixtures' live first-pass scores recompute bit for bit
+with it; another build can fuse otherwise.
 `knn_recall::quantized_scorer` ports Lucene's scorer operation for
 operation. `tools/scorer_oracle.py` runs Lucene's own scorer
 (`tools/ScorerOracle.java`) over the five `on_disk` fixtures' vectors
@@ -996,6 +1001,66 @@ synthetic graphs of `max_level` 2 and 3, with exact scores and mostly
 tied ones under shuffled doc ids, for beams of 1 to 600; the port
 matches all 100 searches exactly, results, order, scores, and visited
 counts.
+
+The query around that search (`NativeEngineKnnVectorQuery`) is what
+`recall` runs for such a file (`knn_recall::on_disk`). A cosine query is
+normalized first (`NormalizeVectorTransformer`,
+`VectorUtil.l2normalize`). For a field of `sq` 1, 2, or 4 bits, k-NN
+rescores by default (`ResolvedIndexSpec.getRescoreContext`): the first
+pass keeps `firstPassK = min(10000, max(100, ceil(k x f)))` results, `f`
+2 for 1 bit and 1 for 2 and 4 bits, or the query's `oversample_factor`
+(`RescoreContext.getFirstPassK`, in float32). The graph is searched with
+a beam of `max(firstPassK, k, ef_search)`, where `ef_search` is the
+query's `method_parameters.ef_search` or the index setting
+`index.knn.algo_param.ef_search`, 100 unless set; the `efSearch` the
+file records (256 in the fixtures) is not read. The first pass is cut to
+the results scoring at least the `firstPassK`-th
+(`ResultUtil.reduceToTopK`), and those are scored again in doc order
+against their float32 vectors in the `.vec` (`ExactSearcher`), with the
+field's `VectorSimilarityFunction` through Lucene's bulk scorer
+(`Lucene99MemorySegmentFloatVectorScorer.bulkScore`); the `k` best are
+kept, a tie going to the lower doc id, and a score below 0, or NaN, is
+dropped (`BulkVectorScorer` yields only scores from its least
+competitive one, 0 to begin with). k-NN accepts a `k` up to 10,000
+(`KNNQueryBuilder.K_MAX`). With `"rescore": false`, the beam is `max(k,
+ef_search)` and the first `k` results are kept. With the defaults and
+`k` 10, every fixture's beam and first pass are 100. Several segments,
+filters, deleted documents, and nested fields change this search, and
+are not ported.
+
+The float32 sums are the host's. With the JDK's vector module, which
+OpenSearch enables, Lucene sums in SIMD lanes as wide as the host's, 8
+float32 lanes with AVX2 on the fixtures' host, with fused multiply-adds
+where it finds them fast (`Constants.HAS_FAST_VECTOR_FMA` and
+`HAS_FAST_SCALAR_FMA`, both on there). The bulk scorer
+(`MemorySegmentBulkVectorOps`) keeps one accumulator per lane over the
+whole groups of lanes, reduces them, and folds the remaining components
+in; `l2normalize`'s dot product (`PanamaVectorUtilSupport.dotProduct`)
+sums up to 16 components in order, one fused multiply-add each, and a
+longer vector in four accumulators of lanes. The Vector API leaves the
+order of a lane reduction to the JVM: interpreted, it adds the lanes in
+order; compiled on x86-64, as a tree, `(l0 + l4) + (l2 + l6)` and `(l1 +
+l5) + (l3 + l7)`, then the two. So one node rescores the same vectors
+with different last bits before and after its JIT compiles the bulk
+scorer, some thousands of vectors into its life: the first baselines
+recorded here, on a fresh node, switched from one to the other partway
+through a fixture. `knn_recall::vector_util` follows the compiled order;
+`tools/extract_opensearch.py` warms the node up before it records, and
+`tools/rescore_oracle.py` runs Lucene's sums
+(`tools/RescoreOracle.java`) with the vector module, after a warm-up,
+over every similarity and 29 dimensions from 1 to 384: the port matches
+every normalized query and score bit for bit. On the fixtures, every
+result list the live index returned for 100 queries in each of six modes
+is reproduced bit for bit, doc ids and scores, 3,000 lists in all: the
+10 nearest with k-NN's default rescoring, without rescoring, with an
+`oversample_factor` of 30 (a first pass and beam of 300), and with an
+`ef_search` of 300 (a beam of 300, cut to the 100 best); the 150 nearest
+(a first pass of 150, all of it scored, for 2 and 4 bits); and the 10
+nearest without rescoring at an `ef_search` of 10, whose beam of 10
+returns other results than one of 100 does. Another host (16 lanes with
+AVX-512, 4 on Arm, products rounded on their own where Lucene finds
+fused multiply-adds slow, a JVM without the vector module) can differ in
+a last bit, which matters only to a tie.
 
 ### Bytes
 

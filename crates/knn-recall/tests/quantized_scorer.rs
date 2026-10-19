@@ -249,6 +249,38 @@ fn transforms_follow_the_similarity() {
 }
 
 #[test]
+fn the_native_kernel_clamps_a_nan_distance_to_0() {
+    // Java's Math.max keeps a NaN distance; std::max(0, NaN) is 0.
+    let nan = QuantizationResult {
+        lower: 0.0,
+        upper: 0.0,
+        additional: f32::NAN,
+        component_sum: 0,
+    };
+    let l2 = hand_scorer(Similarity::Euclidean);
+    assert!(l2.score(&[0], nan).unwrap().is_nan());
+    let native = l2.knn_native_kernel();
+    assert_eq!(native.score(&[0], nan), Some(1.0));
+    // Otherwise the transforms are the same.
+    let doc = QuantizationResult {
+        additional: 3.0,
+        ..nan
+    };
+    assert_eq!(native.score(&[0], doc), Some(0.25));
+    let ip = hand_scorer(Similarity::MaximumInnerProduct).knn_native_kernel();
+    assert_eq!(
+        ip.score(
+            &[0],
+            QuantizationResult {
+                additional: -3.0,
+                ..nan
+            }
+        ),
+        Some(0.25)
+    );
+}
+
+#[test]
 fn the_dot_product_of_the_codes_reads_every_packing() {
     // With a stored vector's lower end and component sum 0 and its step 1,
     // and the centroid's dot product equal to the query's, an inner-product

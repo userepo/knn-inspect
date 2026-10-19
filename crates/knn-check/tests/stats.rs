@@ -96,9 +96,10 @@ fn stats_match_faiss_python() {
         seen += 1;
     }
     assert_eq!(seen, 42, "18 synthetic and 24 real baselines");
-    // l2-4000x64 has unreachable nodes on levels 0 and 1, so the search
-    // itself is compared, not only the empty case.
-    assert_eq!(unreachable_seen, 8);
+    // l2-4000x64 has unreachable nodes on levels 0 and 1, and the build of
+    // on-disk-16x/l2 one on level 1, so the search itself is compared, not
+    // only the empty case.
+    assert_eq!(unreachable_seen, 9);
 }
 
 /// A graph spelled out per node: one neighbor list per level the node is

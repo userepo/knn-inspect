@@ -119,6 +119,21 @@ impl FlatField {
     }
 
     /// The field's vectors in `vec`, the `.vec` this record describes, as
+    /// one slice of float32 components, row after row: `None` unless the
+    /// field holds float32 components, four bytes each, all of them inside
+    /// the file.
+    #[must_use]
+    pub fn float32_components<'a>(&self, vec: &'a [u8]) -> Option<&'a [crate::F32]> {
+        use zerocopy::FromBytes as _;
+        if self.encoding != VectorEncoding::Float32 || self.component_bytes != 4 {
+            return None;
+        }
+        let start = usize::try_from(self.data_offset).ok()?;
+        let length = usize::try_from(self.vector_bytes()?).ok()?;
+        <[crate::F32]>::ref_from_bytes(vec.get(start..start.checked_add(length)?)?).ok()
+    }
+
+    /// The field's vectors in `vec`, the `.vec` this record describes, as
     /// float32 rows: `None` unless the field holds float32 components, four
     /// bytes each, all of them inside the file.
     #[must_use]

@@ -10,14 +10,14 @@ Rust, read-only, and does not link Faiss or talk to a cluster.
 ## Status
 
 Every command reads every layout listed under [Supported
-files](#supported-files), except that `recall` needs one that holds
-vectors. Each is checked against Faiss Python and Lucene's own files on
-the fixtures, real OpenSearch 3.9.0 segments included. The JSON output
-of each command is documented in [docs/json.md](docs/json.md) with a
-stability rule: fields are only added. The library crates' APIs may
-still change between minor versions.
-[docs/format-notes.md](docs/format-notes.md) describes the file formats
-byte by byte.
+files](#supported-files), except that `recall` on a graph without its
+vectors needs its segment's files loose, not in a compound file. Each is
+checked against Faiss Python and Lucene's own files on the fixtures,
+real OpenSearch 3.9.0 segments included. The JSON output of each command
+is documented in [docs/json.md](docs/json.md) with a stability rule:
+fields are only added. The library crates' APIs may still change between
+minor versions. [docs/format-notes.md](docs/format-notes.md) describes
+the file formats byte by byte.
 
 ## Install
 
@@ -37,7 +37,7 @@ cargo install --git https://github.com/userepo/knn-inspect --tag v0.9.0 knn-insp
 knn-inspect info <file.faiss> [--json]
 knn-inspect verify <file.faiss> [--space l2|innerproduct|cosine|hamming] [--max-findings N] [--json]
 knn-inspect stats <file.faiss> [--json]
-knn-inspect recall <file.faiss> (--queries <q.f32|q.u8> | --sample N [--seed S]) [--k N] [--ef-search N] [--json]
+knn-inspect recall <file.faiss> (--queries <q.f32|q.u8> | --sample N [--seed S]) [--k N] [--ef-search N] [--oversample F | --no-rescore] [--json]
 knn-inspect recall <file.faiss> --queries <q.f32|q.u8> --results <r.jsonl> [--k N] [--ids <ids.json>] [--json]
 knn-inspect scan <dir> [--space l2|innerproduct|cosine|hamming] [--max-findings N] [--json]
 ```
@@ -136,9 +136,32 @@ A label matches when its vector is at least as close to the query as the
 k-th nearest, so a tie with the k-th neighbor counts; a label repeated
 within a list counts once, and -1 (Faiss's "no result") never matches.
 The report gives recall@k, a histogram of matches per query, and counts
-of the anomalies above. A graph without its vectors has nothing to
-search or score, so `recall` refuses it. Exit code 0 when the results
-were scored, 1 otherwise.
+of the anomalies above. Exit code 0 when the results were scored, 1
+otherwise.
+
+A graph without its vectors (an `on_disk` field) is searched as k-NN 3.9
+searches it, since 0.10.0: the segment's `.fnm` names the field and its
+`.vemq`, and the graph is searched with Lucene's `HnswGraphSearcher`
+against the field's quantized vectors in the `.veq`, with Lucene's
+scorer (k-NN's native kernel for a 1-bit field), as k-NN's
+memory-optimized search does; the first pass is then rescored against
+the field's float32 vectors in the `.vec`, which also serve as the
+file's vectors for the brute force and for `--sample`. As k-NN does by
+default, the first pass keeps `min(10000, max(100, ceil(k x f)))`
+results, `f` 2 for a 1-bit (32x) field and 1 for 2 and 4 bits (16x, 8x),
+and the graph is searched with a beam of that or `max(k, ef_search)`,
+whichever is larger, where `ef_search` is the index setting
+`index.knn.algo_param.ef_search` (100 unless set), not the efSearch the
+file records: `--ef-search` gives the index's. `--k` is at most 10,000
+for such a file, as k-NN's query requires. `--oversample F` rescores
+with an `oversample_factor` of F, from 1 to 100, as a query that gives
+one does, and `--no-rescore` keeps the first pass's top k, as
+`"rescore": false` does. This is the search of a one-segment index
+without a filter, with the arithmetic k-NN runs on an x86-64 host with
+AVX2: on the fixtures, every result list the live index returned, with
+and without rescoring, is reproduced bit for bit, doc ids and scores. On
+another host, k-NN's own float32 sums can differ in a last bit (see
+[docs/format-notes.md](docs/format-notes.md)).
 
 `scan` finds every `.faiss` and `.faissc` file under a directory,
 subdirectories included, and runs `verify` on each, printing one summary
@@ -283,17 +306,18 @@ float fields with the binary encoder); and the same binary ID map and
 HNSW graph without its vectors, which k-NN 3.9's local build writes for
 an `on_disk` field or an `sq` encoder of 1, 2, or 4 bits, keeping the
 quantized vectors in Lucene's files; with or without the Lucene footer.
-Every command reads all of them, except that `recall` needs vectors to
-search. Fixtures and format notes target OpenSearch 3.9.0.
+Every command reads all of them, except that `recall` on a graph without
+its vectors needs the segment's `.fnm` and the field's `.vemq`, `.veq`,
+`.vemf`, and `.vec` loose, not in a compound file. Fixtures and format
+notes target OpenSearch 3.9.0.
 
-Not yet: other scalar-quantized storage, product quantization, IVF, a
-search over the quantized vectors of a graph without its vectors, which
-`recall` needs, and the float graph without its vectors (a CAGRA graph,
-`IHc2` or the older `IHNc`, over `null`) that k-NN's remote index build
-writes. Files in another layout or scalar quantizer type are refused
-rather than misread: `verify` fails them, and `scan` reports those whose
-footer verifies as `unsupported`. NMSLIB and Lucene-engine fields write
-no `.faiss` file, so `scan` does not see them.
+Not yet: other scalar-quantized storage, product quantization, IVF, and
+the float graph without its vectors (a CAGRA graph, `IHc2` or the older
+`IHNc`, over `null`) that k-NN's remote index build writes. Files in
+another layout or scalar quantizer type are refused rather than misread:
+`verify` fails them, and `scan` reports those whose footer verifies as
+`unsupported`. NMSLIB and Lucene-engine fields write no `.faiss` file,
+so `scan` does not see them.
 
 ## Pinned versions
 
@@ -334,7 +358,17 @@ whose results come from Lucene 10.5.1 itself.
   (`binary-encoder/l2/`); and of `on_disk` float fields, whose native
   files hold the graph only, at the default 32x compression for every
   space (`on-disk/`) and at 16x and 8x for `l2` (`on-disk-16x/l2/`,
-  `on-disk-8x/l2/`), with graph statistics but no recall baselines
+  `on-disk-8x/l2/`), with graph statistics and, in place of recall
+  baselines, the live index's own results: 100 queries (`queries.f32`)
+  and the doc ids and scores it returned for each, in six modes whose
+  `k` and query parameters `manifest.json` records: the 10 nearest with
+  k-NN's default rescoring (`results.jsonl`), without rescoring
+  (`results-no-rescore.jsonl`), with an `oversample_factor` of 30
+  (`results-oversample-30.jsonl`), and with an `ef_search` of 300
+  (`results-ef-search-300.jsonl`); the 150 nearest
+  (`results-k-150.jsonl`); and the 10 nearest without rescoring at an
+  `ef_search` of 10 (`results-no-rescore-ef-search-10.jsonl`), which
+  `recall`'s search must reproduce bit for bit
 - `*.stats.json` beside each synthetic fixture and `stats.json` beside
   each real one - the graph statistics Faiss Python computes from the
   same file (for a graph without its vectors, from a copy Faiss can
@@ -352,15 +386,20 @@ whose results come from Lucene 10.5.1 itself.
 - `fixtures/synthetic-quantizer/` - 1,600 vectors and centroids drawn
   for every similarity, 1 to 8 bits, and dimensions 1 to 768
   (`quantizer.cases`), and the codes and corrective terms Lucene's own
-  `OptimizedScalarQuantizer` gives them (`quantizer.expected`), which the
-  port in `knn_recall::quantizer` must match bit for bit; and the
-  `on_disk` fixtures' vectors and 160 synthetic sets over every similarity
-  and scalar encoding, with queries (`scorer.cases`), and the scores
-  Lucene's own scorer gives them (`scorer.expected`), which
+  `OptimizedScalarQuantizer` gives them (`quantizer.expected`), which
+  the port in `knn_recall::quantizer` must match bit for bit; and the
+  `on_disk` fixtures' vectors and 160 synthetic sets over every
+  similarity and scalar encoding, with queries (`scorer.cases`), and the
+  scores Lucene's own scorer gives them (`scorer.expected`), which
   `knn_recall::quantized_scorer` must match bit for bit; and fixture
   graphs with looked-up scores (`search.cases`), and the results k-NN's
-  own `FaissMemoryOptimizedSearcher` finds over them (`search.expected`),
-  which `knn_recall::lucene_search` must match exactly
+  own `FaissMemoryOptimizedSearcher` finds over them
+  (`search.expected`), which `knn_recall::lucene_search` must match
+  exactly; and float32 vectors and queries over every similarity and
+  dimensions 1 to 384 (`rescore.cases`), with each query as Lucene
+  normalizes it and every score as k-NN's rescoring computes it, with
+  the JDK's vector module, compiled (`rescore.expected`), which
+  `knn_recall::on_disk` must match bit for bit
 
 Each real fixture directory also holds `vectors.f32`, the indexed vectors
 in doc-id order (row i is Faiss label i), or for a binary field
@@ -383,16 +422,18 @@ Synthetic and corrupted fixtures:
 .venv\Scripts\python tools\make_corrupted.py
 ```
 
-The quantizer, scorer, and search cases need Docker and the OpenSearch
-3.9.0 image, whose JDK runs Lucene's quantizer and scorer and k-NN's
-searcher from its jars (`tools/QuantizerOracle.java`,
-`tools/ScorerOracle.java`, `tools/SearchOracle.java`); no cluster is
+The quantizer, scorer, search, and rescore cases need Docker and the
+OpenSearch 3.9.0 image, whose JDK runs Lucene's quantizer, scorer, and
+float32 sums and k-NN's searcher from its jars
+(`tools/QuantizerOracle.java`, `tools/ScorerOracle.java`,
+`tools/SearchOracle.java`, `tools/RescoreOracle.java`); no cluster is
 started:
 
 ```
 .venv\Scripts\python tools\quantizer_oracle.py --out fixtures\synthetic-quantizer
 .venv\Scripts\python tools\scorer_oracle.py --fixtures fixtures --out fixtures\synthetic-quantizer
 .venv\Scripts\python tools\search_oracle.py --fixtures fixtures --out fixtures\synthetic-quantizer
+.venv\Scripts\python tools\rescore_oracle.py --out fixtures\synthetic-quantizer
 ```
 
 Real fixtures need Docker:
@@ -407,10 +448,10 @@ docker compose -f tools\docker-compose.yml up -d
 .venv\Scripts\python tools\extract_opensearch.py --out fixtures\opensearch-3.9.0-byte\byte --encoding byte
 .venv\Scripts\python tools\extract_opensearch.py --out fixtures\opensearch-3.9.0-binary\binary --encoding binary --dim 128
 .venv\Scripts\python tools\extract_opensearch.py --out fixtures\opensearch-3.9.0-binary\binary-encoder --encoding binary-encoder --spaces l2
-.venv\Scripts\python tools\extract_opensearch.py --out fixtures\opensearch-3.9.0-binary\on-disk --encoding on-disk --spaces l2
-.venv\Scripts\python tools\extract_opensearch.py --out fixtures\opensearch-3.9.0-binary\on-disk --encoding on-disk --spaces innerproduct cosinesimil
-.venv\Scripts\python tools\extract_opensearch.py --out fixtures\opensearch-3.9.0-binary\on-disk-16x --encoding on-disk --compression 16x --spaces l2
-.venv\Scripts\python tools\extract_opensearch.py --out fixtures\opensearch-3.9.0-binary\on-disk-8x --encoding on-disk --compression 8x --spaces l2
+.venv\Scripts\python tools\extract_opensearch.py --out fixtures\opensearch-3.9.0-binary\on-disk --encoding on-disk --spaces l2 --queries 100
+.venv\Scripts\python tools\extract_opensearch.py --out fixtures\opensearch-3.9.0-binary\on-disk --encoding on-disk --spaces innerproduct cosinesimil --queries 100
+.venv\Scripts\python tools\extract_opensearch.py --out fixtures\opensearch-3.9.0-binary\on-disk-16x --encoding on-disk --compression 16x --spaces l2 --queries 100
+.venv\Scripts\python tools\extract_opensearch.py --out fixtures\opensearch-3.9.0-binary\on-disk-8x --encoding on-disk --compression 8x --spaces l2 --queries 100
 docker compose -f tools\docker-compose.yml down -v
 ```
 

@@ -4,7 +4,7 @@
 //! or for a graph without its vectors, against the scalar-quantized ones
 //! Lucene keeps for it (`.vemq` and `.veq`).
 
-mod quantized;
+pub(crate) mod quantized;
 
 use std::fmt::Write as _;
 use std::fs;

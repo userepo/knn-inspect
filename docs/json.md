@@ -84,8 +84,8 @@ Each entry of `layers`:
 | `sample` | object, optional | For `--sample`: `count` and `seed` |
 | `results_file` | string, optional | The `--results` file |
 | `ids_file` | string, optional | The `--ids` file |
-| `search` | object, optional | For the tool's own search: `ef_search` used and `search_ms` |
-| `dimension`, `vectors` | integer | Of the file; for binary storage, `dimension` is the bits of the code size, which the queries must have (since 0.7.0) |
+| `search` | object, optional | For the tool's own search: `ef_search` used and `search_ms`; for a graph without its vectors (since 0.10.0), the index's `ef_search` and also `beam` (the graph search's), `rescore` (whether the first pass was rescored against the field's float32 vectors), and, when it was, `first_pass_k` (the first pass's results rescored) |
+| `dimension`, `vectors` | integer | Of the file; for binary storage, `dimension` is the bits of the code size, which the queries must have (since 0.7.0); for a graph without its vectors, of the field's float32 vectors in the `.vec` (since 0.10.0) |
 | `metric` | string | As for `info` |
 | `ground_truth_ms` | integer | Time of the brute-force pass |
 | `k` | integer | The `--k` given |

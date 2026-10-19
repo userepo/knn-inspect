@@ -7,8 +7,9 @@
 //! float32 values is rounded to float32 before it is widened, as in
 //! `s * s`), Java's `Math.round` (ties toward positive infinity, NaN to 0,
 //! saturating), Java's `Math.min` and `Math.max` (NaN first, and -0 below
-//! +0), and no fused multiply-add: Java does not contract `a * b + c`, and
-//! neither does Rust. On every record of the fixtures, the codes and all
+//! +0), and no fused multiply-add but where Lucene calls one: Java does not
+//! contract `a * b + c`, and neither does Rust (see [`l2normalize`] for
+//! the one sum Lucene fuses). On every record of the fixtures, the codes and all
 //! four corrective terms recompute bit for bit from the `.vec`'s vector and
 //! the stored centroid.
 //!
@@ -345,17 +346,15 @@ fn pack_bits(codes: &[u8], packed: &mut [u8], bit: u32) {
 /// Returns whether `v` was divided, or `None` when its squared norm is 0
 /// (every square too small for float32 included), where Lucene throws.
 ///
-/// Lucene sums the squares in an order of its build's own (fused
-/// multiply-adds, SIMD lanes); this sums them in order. Whether the sum is
-/// 0 does not depend on the order, since no term is negative. Within the
-/// tolerance the vector is left as it is either way, as k-NN's normalized
-/// vectors are; outside it, a quotient can differ in its last bit.
+/// The squares are summed as Lucene's vector support sums them on the
+/// fixtures' host, with fused multiply-adds, in SIMD lanes past 16
+/// components (see [`crate::on_disk`]); another host can differ in the
+/// sum's last bit. Whether the sum is 0 does not depend on that, since no
+/// term is negative; within the tolerance the vector is left as it is
+/// either way, as k-NN's normalized vectors are; outside it, a quotient
+/// can differ in its last bit.
 pub fn l2normalize(v: &mut [f32]) -> Option<bool> {
-    let mut dot = 0.0_f32;
-    for &x in v.iter() {
-        dot += x * x;
-    }
-    let l1norm = f64::from(dot);
+    let l1norm = f64::from(crate::vector_util::self_dot_product(v));
     if l1norm == 0.0 {
         return None;
     }

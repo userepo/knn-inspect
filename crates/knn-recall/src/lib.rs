@@ -17,9 +17,10 @@
 //! Faiss's; [`sample_queries`] draws queries from the file's vectors.
 //! [`quantizer`] ports Lucene's `OptimizedScalarQuantizer`, which wrote
 //! the quantized vectors Lucene keeps for a graph without its own,
-//! [`quantized_scorer`] the scorer of a query against them, and
+//! [`quantized_scorer`] the scorer of a query against them,
 //! [`lucene_search`] the search k-NN runs with Lucene's searcher over the
-//! graph.
+//! graph, and [`on_disk`] the whole query k-NN runs against such a field,
+//! rescored against its float32 vectors.
 //!
 //! Distances are float32 sums in element order. That is how Faiss's
 //! portable scalar-quantizer code computes scalar-quantized distances; its
@@ -42,8 +43,10 @@
 
 mod hnsw;
 pub mod lucene_search;
+pub mod on_disk;
 pub mod quantized_scorer;
 pub mod quantizer;
+mod vector_util;
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -151,6 +154,58 @@ pub enum Error {
         /// Queries given.
         queries: usize,
     },
+    /// The file holds its own vectors, which Faiss's search reads.
+    #[error("the file holds its own vectors, not a graph over a field's quantized ones")]
+    HasVectors,
+    /// The field records no quantized vectors.
+    #[error("the field records no quantized vectors")]
+    NoQuantizedVectors,
+    /// The field's scalar encoding is not one k-NN writes.
+    #[error("the field's scalar encoding {name} is not one k-NN writes")]
+    Encoding {
+        /// Lucene's name for it.
+        name: &'static str,
+    },
+    /// The parts of an `on_disk` field disagree.
+    #[error("{what}: {graph} in the graph, {field} in the field's files")]
+    OnDiskShape {
+        /// What disagrees.
+        what: &'static str,
+        /// The graph's.
+        graph: usize,
+        /// The field files'.
+        field: usize,
+    },
+    /// A label is not a Lucene doc id.
+    #[error("label {label} is not a Lucene doc id")]
+    DocId {
+        /// The label.
+        label: i64,
+    },
+    /// A similarity ordinal Lucene does not define.
+    #[error("similarity ordinal {ordinal} is not one of Lucene's, 0 to 3")]
+    Similarity {
+        /// As recorded.
+        ordinal: i32,
+    },
+    /// The field's `.vemf` record puts no float32 vectors in its `.vec`.
+    #[error("the field's .vemf record puts no float32 vectors in its .vec")]
+    NoFloatVectors,
+    /// A `k` above the 10,000 k-NN accepts.
+    #[error("k-NN refuses a k above 10000, and {k} is")]
+    KnnK {
+        /// As given.
+        k: usize,
+    },
+    /// An oversample factor k-NN refuses.
+    #[error("oversample factor {factor} is not from 1 to 100")]
+    Oversample {
+        /// As given.
+        factor: f32,
+    },
+    /// A cosine query of norm 0, which k-NN cannot normalize.
+    #[error("a cosine query of norm 0 cannot be normalized")]
+    ZeroNormQuery,
     /// A search reached a node whose stored vector could not be scored.
     #[error("node {node} has no stored vector to score")]
     Unscored {

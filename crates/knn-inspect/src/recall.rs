@@ -11,8 +11,13 @@ use anyhow::{Context, bail};
 use clap::Args;
 use knn_format::NativeFile;
 use knn_format::faiss::{IdMapIndex, Storage};
+use knn_format::flat_vectors::FlatVectorsMeta;
+use knn_format::quantized_vectors::{DataFile, QuantizedVectors, QuantizedVectorsMeta};
+use knn_recall::on_disk::{DEFAULT_EF_SEARCH, OnDiskField, Plan, Rescore};
 use knn_recall::{Labels, Queries, Recall};
 use serde::Serialize;
+
+use crate::scan::quantized::field_files;
 
 /// Arguments of `recall`.
 #[derive(Debug, Args)]
@@ -44,9 +49,20 @@ pub struct RecallArgs {
     #[arg(long, default_value_t = 10)]
     pub k: usize,
     /// Candidate queue size for the tool's own search; the file's efSearch
-    /// when absent. At least 1: with 0 the search stops after one step.
+    /// when absent. At least 1: with 0 the search stops after one step. For
+    /// a graph without its vectors, the index's `ef_search` setting, which
+    /// k-NN reads instead of the file's: 100 when absent.
     #[arg(long, conflicts_with = "results", value_parser = clap::value_parser!(u64).range(1..))]
     pub ef_search: Option<u64>,
+    /// For a graph without its vectors: rescore the first pass with this
+    /// oversample factor, from 1 to 100, instead of k-NN's default (2 for a
+    /// 1-bit field, 1 for 2 and 4 bits).
+    #[arg(long, conflicts_with_all = ["results", "no_rescore"], value_parser = oversample_factor)]
+    pub oversample: Option<f32>,
+    /// For a graph without its vectors: keep the first pass's top k without
+    /// rescoring, as k-NN does for "rescore": false.
+    #[arg(long, conflicts_with = "results")]
+    pub no_rescore: bool,
     /// A JSON array naming node i as `ids[i]`, when --results use ids other
     /// than the file's labels (a stored position field, say).
     // The conflicts back up `requires`: see the note on --seed. Without
@@ -71,7 +87,7 @@ struct Output<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     ids_file: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    search: Option<Search>,
+    search: Option<OwnSearch>,
     dimension: usize,
     vectors: usize,
     metric: String,
@@ -87,19 +103,40 @@ struct Sample {
 }
 
 #[derive(Serialize)]
-struct Search {
+struct OwnSearch {
     ef_search: usize,
+    /// For a graph without its vectors: the graph search's beam.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    beam: Option<usize>,
+    /// For a graph without its vectors: whether the first pass was
+    /// rescored against the field's float32 vectors.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rescore: Option<bool>,
+    /// For a graph without its vectors, when rescored: the first pass's
+    /// results rescored.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    first_pass_k: Option<usize>,
     search_ms: u128,
+}
+
+/// `--oversample`: a factor k-NN accepts, from 1 to 100.
+fn oversample_factor(text: &str) -> Result<f32, String> {
+    let f: f32 = text.parse().map_err(|e| format!("{e}"))?;
+    if (1.0..=100.0).contains(&f) {
+        Ok(f)
+    } else {
+        Err(format!("{f} is not from 1 to 100"))
+    }
 }
 
 /// Runs `recall`; exit code 0 when the results were scored.
 ///
 /// # Errors
 ///
-/// Returns the open, parse, or read error, wrapped with the path; the
-/// refusal of a file that holds no vectors (a graph without them), also
-/// with the path; and any mismatch between the file, the queries, the
-/// results, and the ids.
+/// Returns the open, parse, or read error, wrapped with the path; for a
+/// graph without its vectors, why its field's files cannot be found, read,
+/// or searched, also with the path; and any mismatch between the file, the
+/// queries, the results, and the ids.
 pub fn run(args: &RecallArgs) -> anyhow::Result<ExitCode> {
     let path = &args.file;
     let file = NativeFile::open(path).with_context(|| format!("opening {}", path.display()))?;
@@ -107,12 +144,15 @@ pub fn run(args: &RecallArgs) -> anyhow::Result<ExitCode> {
         .parse()
         .with_context(|| format!("parsing {}", path.display()))?;
     let index = &parsed.index;
-    let storage = index
-        .index
-        .storage
-        .as_ref()
-        .ok_or(knn_recall::Error::NoVectors)
-        .with_context(|| path.display().to_string())?;
+    let Some(storage) = index.index.storage.as_ref() else {
+        return run_on_disk(args, index);
+    };
+    if args.oversample.is_some() || args.no_rescore {
+        bail!(
+            "{}: --oversample and --no-rescore apply to a graph without its vectors",
+            path.display()
+        );
+    }
     // The dimension queries must have: the file's, or for binary storage
     // the bits of its code size, which Faiss reads every vector by.
     let dimension = knn_recall::query_dimension(storage)
@@ -120,6 +160,120 @@ pub fn run(args: &RecallArgs) -> anyhow::Result<ExitCode> {
 
     let (queries, sample) = load_queries(args, storage, dimension)?;
     let (results, search) = results_for(args, index, &queries)?;
+    report(
+        args,
+        index,
+        storage,
+        dimension,
+        Searched {
+            queries,
+            sample,
+            results,
+            search,
+        },
+    )
+}
+
+/// `recall` on a graph without its vectors: the field the segment's `.fnm`
+/// ties it to, searched as k-NN searches it, against the field's float32
+/// vectors in the `.vec`.
+fn run_on_disk(args: &RecallArgs, index: &IdMapIndex<'_>) -> anyhow::Result<ExitCode> {
+    let path = &args.file;
+    let files = field_files(path).map_err(|why| anyhow::anyhow!("{}: {why}", path.display()))?;
+    let open = |ext: &str| {
+        let p = files.vemq.with_extension(ext);
+        NativeFile::open(&p).with_context(|| format!("opening {}", p.display()))
+    };
+    let (meta_file, data_file) = (open("vemq")?, open("veq")?);
+    let (raw_meta_file, raw_file) = (open("vemf")?, open("vec")?);
+    let shown = |ext: &str| files.vemq.with_extension(ext).display().to_string();
+    let meta = QuantizedVectorsMeta::parse(meta_file.bytes())
+        .with_context(|| format!("reading {}", shown("vemq")))?;
+    let field = meta
+        .fields
+        .iter()
+        .find(|f| u32::try_from(f.field_number).ok() == Some(files.number))
+        .with_context(|| format!("{}: no field {}", shown("vemq"), files.number))?;
+    let data =
+        DataFile::parse(data_file.bytes()).with_context(|| format!("reading {}", shown("veq")))?;
+    let records = QuantizedVectors::open(data_file.bytes(), &data, field)
+        .with_context(|| format!("reading {}", shown("veq")))?;
+    let flat = FlatVectorsMeta::parse(raw_meta_file.bytes())
+        .with_context(|| format!("reading {}", shown("vemf")))?;
+    let flat_field = flat
+        .fields
+        .iter()
+        .find(|f| u32::try_from(f.field_number).ok() == Some(files.number))
+        .with_context(|| format!("{}: no field {}", shown("vemf"), files.number))?;
+    let on_disk = OnDiskField::new(index, field, records, flat_field, raw_file.bytes())
+        .with_context(|| format!("{}: the field's files", path.display()))?;
+    let storage = on_disk.storage();
+    let dimension = knn_recall::query_dimension(&storage)
+        .with_context(|| format!("{}: no query can match it", path.display()))?;
+    let (queries, sample) = load_queries(args, &storage, dimension)?;
+    let (results, search) = if let Some(p) = &args.results {
+        (read_results(p)?, None)
+    } else {
+        let rescore = match (args.no_rescore, args.oversample) {
+            (true, _) => Rescore::Off,
+            (false, Some(f)) => Rescore::Oversample(f),
+            (false, None) => Rescore::Default,
+        };
+        let ef_search = args.ef_search.map_or(DEFAULT_EF_SEARCH, |ef| {
+            usize::try_from(ef).unwrap_or(usize::MAX)
+        });
+        let plan: Plan = on_disk.plan(args.k, ef_search, rescore)?;
+        let started = Instant::now();
+        let results = on_disk.search_all(&queries, &plan)?;
+        (
+            results,
+            Some(OwnSearch {
+                ef_search,
+                beam: Some(plan.beam),
+                rescore: Some(plan.first_pass_k.is_some()),
+                first_pass_k: plan.first_pass_k,
+                search_ms: started.elapsed().as_millis(),
+            }),
+        )
+    };
+    report(
+        args,
+        index,
+        &storage,
+        dimension,
+        Searched {
+            queries,
+            sample,
+            results,
+            search,
+        },
+    )
+}
+
+/// The queries and the result lists to score for them.
+struct Searched {
+    queries: Queries,
+    sample: Option<Sample>,
+    results: Vec<Vec<i64>>,
+    search: Option<OwnSearch>,
+}
+
+/// Scores the result lists against exact brute force over `storage`,
+/// whose rows the ID map labels, and prints the report.
+fn report(
+    args: &RecallArgs,
+    index: &IdMapIndex<'_>,
+    storage: &Storage<'_>,
+    dimension: usize,
+    searched: Searched,
+) -> anyhow::Result<ExitCode> {
+    let path = &args.file;
+    let Searched {
+        queries,
+        sample,
+        results,
+        search,
+    } = searched;
     let labels = load_labels(args, index, storage.row_count())?;
 
     let started = Instant::now();
@@ -179,7 +333,7 @@ fn results_for(
     args: &RecallArgs,
     index: &IdMapIndex<'_>,
     queries: &Queries,
-) -> anyhow::Result<(Vec<Vec<i64>>, Option<Search>)> {
+) -> anyhow::Result<(Vec<Vec<i64>>, Option<OwnSearch>)> {
     if let Some(p) = &args.results {
         return Ok((read_results(p)?, None));
     }
@@ -196,8 +350,11 @@ fn results_for(
         .collect();
     Ok((
         results,
-        Some(Search {
+        Some(OwnSearch {
             ef_search,
+            beam: None,
+            rescore: None,
+            first_pass_k: None,
             search_ms,
         }),
     ))
@@ -291,11 +448,23 @@ fn text(out: &Output<'_>) -> String {
                 |ids| format!("from {ids}")
             )
         ),
-        (None, Some(search)) => writeln!(
-            s,
-            "  results         own HNSW search, efSearch {}, {} ms",
-            search.ef_search, search.search_ms
-        ),
+        (None, Some(search)) => match search.beam {
+            Some(beam) => writeln!(
+                s,
+                "  results         own search as k-NN runs it, beam {beam} (ef_search {}), {}, {} ms",
+                search.ef_search,
+                search.first_pass_k.map_or_else(
+                    || "no rescoring".to_owned(),
+                    |f| format!("first {f} rescored against the .vec")
+                ),
+                search.search_ms
+            ),
+            None => writeln!(
+                s,
+                "  results         own HNSW search, efSearch {}, {} ms",
+                search.ef_search, search.search_ms
+            ),
+        },
         (None, None) => writeln!(s, "  results         {} lists", r.queries),
     }
     .expect("writing to a String cannot fail");

@@ -192,6 +192,35 @@ pub(super) fn lucene_quantized(path: &Path, graph: Graph, space: Option<Space>) 
     }
 }
 
+/// The `.vemq` of the field the segment's `.fnm` ties a graph without its
+/// vectors to, and the field's number: what `recall` searches.
+pub(crate) struct FieldFiles {
+    /// The `.vemq`; the `.veq`, `.vemf`, and `.vec` share its name.
+    pub(crate) vemq: PathBuf,
+    /// The field's number, which the `.vemq` and `.vemf` record it under.
+    pub(crate) number: u32,
+}
+
+/// Finds the files of the field the native file at `path` is a graph of,
+/// through the segment's `.fnm`, as [`lucene_quantized`] does.
+///
+/// # Errors
+///
+/// Returns why not, as text: the `.fnm` is missing, unread, not the
+/// segment's, or records the field otherwise than k-NN does.
+pub(crate) fn field_files(path: &Path) -> Result<FieldFiles, String> {
+    match tie(path, None) {
+        Tie::Field(t) => Ok(FieldFiles {
+            vemq: t.vemq,
+            number: t.info.number,
+        }),
+        Tie::Decided(outcome) => Err(outcome.detail),
+        Tie::Shape(why) => Err(format!(
+            "the field's quantized vectors are found through the segment's .fnm, and {why}"
+        )),
+    }
+}
+
 /// How the native file is tied to its field.
 enum Tie {
     /// By the segment's `.fnm`.

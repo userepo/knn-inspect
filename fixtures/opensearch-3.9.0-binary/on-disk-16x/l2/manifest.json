@@ -2,7 +2,7 @@
   "opensearch_version": "3.9.0",
   "knn_plugin_version": "3.9.0.0",
   "index": "knn-l2-on-disk-16x",
-  "index_uuid": "4fNOyqSPSe6SGLb37o6vLA",
+  "index_uuid": "W9O-loVLRSWzmz3DOVQ6cQ",
   "segment": "_2",
   "compound_files": false,
   "encoding": "on-disk",
@@ -637,5 +637,52 @@
       "size": 361
     }
   ],
-  "compression_level": "16x"
+  "compression_level": "16x",
+  "live_queries": {
+    "queries_file": "queries.f32",
+    "queries_seed": 20261020,
+    "warm_up_queries": 300,
+    "warm_up_oversample_factor": 50.0,
+    "results_files": {
+      "results.jsonl": {
+        "k": 10,
+        "query": {}
+      },
+      "results-no-rescore.jsonl": {
+        "k": 10,
+        "query": {
+          "rescore": false
+        }
+      },
+      "results-oversample-30.jsonl": {
+        "k": 10,
+        "query": {
+          "rescore": {
+            "oversample_factor": 30.0
+          }
+        }
+      },
+      "results-ef-search-300.jsonl": {
+        "k": 10,
+        "query": {
+          "method_parameters": {
+            "ef_search": 300
+          }
+        }
+      },
+      "results-k-150.jsonl": {
+        "k": 150,
+        "query": {}
+      },
+      "results-no-rescore-ef-search-10.jsonl": {
+        "k": 10,
+        "query": {
+          "rescore": false,
+          "method_parameters": {
+            "ef_search": 10
+          }
+        }
+      }
+    }
+  }
 }
