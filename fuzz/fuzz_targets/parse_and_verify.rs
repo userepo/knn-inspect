@@ -3,8 +3,8 @@
 //! metadata file, and a scalar-quantized vectors metadata or data file,
 //! and every check, the graph statistics, and an HNSW search must run
 //! over whatever parsed (a graph without its vectors must refuse the
-//! search), as must Lucene's quantizer and scorer over the bytes as
-//! float32s. Panics,
+//! search), as must the search k-NN runs with Lucene's searcher over any
+//! graph, and Lucene's quantizer and scorer over the bytes as float32s. Panics,
 //! including failed bounds checks, fail the run; AddressSanitizer
 //! covers the unsafe code inside dependencies (zerocopy's casts,
 //! crc32fast's SIMD). The memory map is not exercised: the harness
@@ -126,6 +126,25 @@ fuzz_target!(|data: &[u8]| {
         let _ = parsed.index.metric();
         let _ = parsed.index.code_size();
         let _ = parsed.index.layout();
+        // The search k-NN runs with Lucene's searcher, over any graph,
+        // with or without its vectors: scores from the node ids, many of
+        // them tied, for k below, at, and past the node count, with and
+        // without a visit limit.
+        let n = graph.node_count();
+        for k in [1, 3, n, n + 2] {
+            for limit in [u64::from(i32::MAX.unsigned_abs()), 4] {
+                let found = knn_recall::lucene_search::search(
+                    graph,
+                    n,
+                    k,
+                    limit,
+                    |node| Some(f32::from(u8::try_from(node % 7).unwrap_or(0))),
+                    |ord| i32::try_from(ord).unwrap_or(i32::MAX),
+                )
+                .expect("every node scores");
+                assert!(found.hits.len() <= k);
+            }
+        }
         'storage: {
             let Some(storage) = &parsed.index.index.storage else {
                 // A graph without its vectors: nothing to search.

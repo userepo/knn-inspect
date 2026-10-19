@@ -357,7 +357,10 @@ whose results come from Lucene 10.5.1 itself.
   `on_disk` fixtures' vectors and 160 synthetic sets over every similarity
   and scalar encoding, with queries (`scorer.cases`), and the scores
   Lucene's own scorer gives them (`scorer.expected`), which
-  `knn_recall::quantized_scorer` must match bit for bit
+  `knn_recall::quantized_scorer` must match bit for bit; and fixture
+  graphs with looked-up scores (`search.cases`), and the results k-NN's
+  own `FaissMemoryOptimizedSearcher` finds over them (`search.expected`),
+  which `knn_recall::lucene_search` must match exactly
 
 Each real fixture directory also holds `vectors.f32`, the indexed vectors
 in doc-id order (row i is Faiss label i), or for a binary field
@@ -380,14 +383,16 @@ Synthetic and corrupted fixtures:
 .venv\Scripts\python tools\make_corrupted.py
 ```
 
-The quantizer and scorer cases need Docker and the OpenSearch 3.9.0
-image, whose JDK runs Lucene's quantizer and scorer from its jar
-(`tools/QuantizerOracle.java`, `tools/ScorerOracle.java`); no cluster is
+The quantizer, scorer, and search cases need Docker and the OpenSearch
+3.9.0 image, whose JDK runs Lucene's quantizer and scorer and k-NN's
+searcher from its jars (`tools/QuantizerOracle.java`,
+`tools/ScorerOracle.java`, `tools/SearchOracle.java`); no cluster is
 started:
 
 ```
 .venv\Scripts\python tools\quantizer_oracle.py --out fixtures\synthetic-quantizer
 .venv\Scripts\python tools\scorer_oracle.py --fixtures fixtures --out fixtures\synthetic-quantizer
+.venv\Scripts\python tools\search_oracle.py --fixtures fixtures --out fixtures\synthetic-quantizer
 ```
 
 Real fixtures need Docker:
@@ -434,11 +439,11 @@ so rewrite them after regenerating either fixture set:
 ## Fuzzing
 
 `fuzz/` holds a cargo-fuzz target that feeds arbitrary bytes to the
-parser, every check, the graph statistics, the HNSW search, the readers
-of Lucene's segment info, field infos, flat-vectors metadata, and
-scalar-quantized vectors, and Lucene's quantizer and scorer; the rule is
-a result, never a panic. It needs nightly and Linux; see
-[fuzz/README.md](fuzz/README.md).
+parser, every check, the graph statistics, the HNSW search and the one
+k-NN runs with Lucene's searcher, the readers of Lucene's segment info,
+field infos, flat-vectors metadata, and scalar-quantized vectors, and
+Lucene's quantizer and scorer; the rule is a result, never a panic. It
+needs nightly and Linux; see [fuzz/README.md](fuzz/README.md).
 
 ## Platform
 

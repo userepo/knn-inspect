@@ -16,8 +16,10 @@
 //! from [`search_all`], an HNSW search over the file's graph that follows
 //! Faiss's; [`sample_queries`] draws queries from the file's vectors.
 //! [`quantizer`] ports Lucene's `OptimizedScalarQuantizer`, which wrote
-//! the quantized vectors Lucene keeps for a graph without its own, and
-//! [`quantized_scorer`] the scorer of a query against them.
+//! the quantized vectors Lucene keeps for a graph without its own,
+//! [`quantized_scorer`] the scorer of a query against them, and
+//! [`lucene_search`] the search k-NN runs with Lucene's searcher over the
+//! graph.
 //!
 //! Distances are float32 sums in element order. That is how Faiss's
 //! portable scalar-quantizer code computes scalar-quantized distances; its
@@ -39,6 +41,7 @@
 //! with binary vectors, whose distances are small integers.
 
 mod hnsw;
+pub mod lucene_search;
 pub mod quantized_scorer;
 pub mod quantizer;
 
@@ -147,6 +150,12 @@ pub enum Error {
         truth: usize,
         /// Queries given.
         queries: usize,
+    },
+    /// A search reached a node whose stored vector could not be scored.
+    #[error("node {node} has no stored vector to score")]
+    Unscored {
+        /// The node.
+        node: usize,
     },
     /// More sample queries asked for than the file has vectors.
     #[error("cannot sample {count} queries from {rows} vectors")]

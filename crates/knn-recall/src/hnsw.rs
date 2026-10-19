@@ -233,7 +233,7 @@ impl Searcher {
 
 /// The neighbors of `node` on `level` as a search reads them: up to the
 /// first negative slot. Ids are not checked against the node count.
-fn neighbor_list<'g>(
+pub(crate) fn neighbor_list<'g>(
     graph: &'g HnswGraph<'_>,
     node: usize,
     level: usize,

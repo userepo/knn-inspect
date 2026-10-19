@@ -971,6 +971,32 @@ three queries, every similarity and scalar encoding; the port matches
 all 28,840 scores bit for bit, and scoring the fixtures' own `.veq`
 records gives the same.
 
+k-NN 3.9 searches these records with Lucene, not Faiss: its
+`FaissMemoryOptimizedSearcher` hands the graph to Lucene's
+`HnswGraphSearcher` through `FaissHnswGraph`, and a one-segment search
+collects into a `TopKnnCollector` of the beam it was given, with no
+visit limit (`Integer.MAX_VALUE`) and through
+`OrdinalTranslatedKnnCollector`, which reports doc ids. When the beam
+reaches the vector count, it scores every vector in batches of 64
+instead. `FaissHnswGraph` reports Faiss's `max_level` as Lucene's number
+of levels, so the greedy descent starts one level below the top (and the
+fixtures' graphs, of `max_level` 1, have none); the descent keeps one
+visited set across its levels. Level 0 is searched best first with an
+unbounded candidate queue; once the beam is full, a candidate must score
+above the beam's lowest to join it, and the search stops when the best
+candidate does not, after exploring one tied with it. Both queues order
+by Lucene's 64-bit key, the score's sortable bits above the id's
+complement, so ties go to the lower node id among candidates and the
+lower doc id among results. There is no `efSearch`: Faiss's stored one
+is not read. `knn_recall::lucene_search` ports this step for step.
+`tools/search_oracle.py` runs k-NN's own searcher from the OpenSearch
+3.9.0 image (`tools/SearchOracle.java`), with the scores looked up in a
+table so only the search is tested, over the two `on_disk` graphs and
+synthetic graphs of `max_level` 2 and 3, with exact scores and mostly
+tied ones under shuffled doc ids, for beams of 1 to 600; the port
+matches all 100 searches exactly, results, order, scores, and visited
+counts.
+
 ### Bytes
 
 Head of `nocfs/l2/_2_165_vec.faiss`:
