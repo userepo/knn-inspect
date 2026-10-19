@@ -17,14 +17,15 @@ default), `sq-fp16` (the `sq` encoder with `type: fp16`, `bits: 16`),
 `sq-bf16` (the same with `type: bf16`), `half-float` (the `half_float`
 data type), `byte` (the `byte` data type), `binary` (the `binary` data
 type), `binary-encoder` (a float field with the `binary` encoder,
-`bits: 1`), or `on-disk` (a float field in `on_disk` mode, at its default
-32x compression). The vectors indexed are the same for every encoding,
-except that `byte` scales them by 32, rounds them, and clips them to
-[-128, 127], the only values a byte field takes, and `binary` keeps one
-bit per component of the `l2` draw, set where the value is positive,
-packed eight to a byte; `--dim` counts bits for `binary`. k-NN's Faiss
-engine refuses `cosinesimil` for byte fields, so `byte` indexes `l2` and
-`innerproduct` only, and accepts only `hamming` for binary fields.
+`bits: 1`), or `on-disk` (a float field in `on_disk` mode, at its
+default 32x compression, or the `--compression` given: 32x, 16x, or 8x).
+The vectors indexed are the same for every encoding, except that `byte`
+scales them by 32, rounds them, and clips them to [-128, 127], the only
+values a byte field takes, and `binary` keeps one bit per component of
+the `l2` draw, set where the value is positive, packed eight to a byte;
+`--dim` counts bits for `binary`. k-NN's Faiss engine refuses
+`cosinesimil` for byte fields, so `byte` indexes `l2` and `innerproduct`
+only, and accepts only `hamming` for binary fields.
 
 Next to a binary field's segment, `vectors.u8` holds the packed bits in
 place of `vectors.f32`, the bytes of row i the bits of document i.
@@ -40,6 +41,9 @@ Usage:
     python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-binary/binary --encoding binary --dim 128
     python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-binary/binary-encoder --encoding binary-encoder --spaces l2
     python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-binary/on-disk --encoding on-disk --spaces l2
+    python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-binary/on-disk --encoding on-disk --spaces innerproduct cosinesimil
+    python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-binary/on-disk-16x --encoding on-disk --compression 16x --spaces l2
+    python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-binary/on-disk-8x --encoding on-disk --compression 8x --spaces l2
 """
 
 from __future__ import annotations
@@ -65,6 +69,9 @@ BYTE_SPACES = ["l2", "innerproduct"]
 # else.
 BINARY_SPACES = ["hamming"]
 ENCODINGS = ["float", "sq-fp16", "sq-bf16", "half-float", "byte", "binary", "binary-encoder", "on-disk"]
+# The compression levels at which an on_disk Faiss field quantizes to 1,
+# 2, or 4 bits a component; 32x is its default.
+COMPRESSIONS = ["32x", "16x", "8x"]
 M = 16
 EF_CONSTRUCTION = 100
 SEED = 20261013
@@ -96,7 +103,7 @@ def plugin_version(host: str, name: str) -> str | None:
     return None
 
 
-def create_index(host: str, index: str, space: str, dim: int, compound: bool, encoding: str) -> dict:
+def create_index(host: str, index: str, space: str, dim: int, compound: bool, encoding: str, compression: str | None) -> dict:
     parameters: dict = {"m": M, "ef_construction": EF_CONSTRUCTION}
     if encoding in ("sq-fp16", "sq-bf16"):
         # Indexes created by 3.6.0 or later must give the encoder's bits;
@@ -114,6 +121,8 @@ def create_index(host: str, index: str, space: str, dim: int, compound: bool, en
         field["data_type"] = "binary"
     elif encoding == "on-disk":
         field["mode"] = "on_disk"
+        if compression is not None:
+            field["compression_level"] = compression
     field["space_type"] = space
     field["method"] = {"name": "hnsw", "engine": "faiss", "parameters": parameters}
     body = {
@@ -223,6 +232,7 @@ def main() -> None:
     parser.add_argument("--spaces", nargs="+", choices=SPACES + BINARY_SPACES, help="default: every space the encoding allows")
     parser.add_argument("--batches", type=int, default=2, help="bulk batches before the force merge")
     parser.add_argument("--encoding", default="float", choices=ENCODINGS, help="how the field stores its vectors")
+    parser.add_argument("--compression", choices=COMPRESSIONS, help="on-disk only: the field's compression level, 32x when absent")
     args = parser.parse_args()
     if args.count > MAX_RESULT_WINDOW:
         parser.error(f"--count above {MAX_RESULT_WINDOW} exceeds index.max_result_window, which doc_order reads in one page")
@@ -230,6 +240,8 @@ def main() -> None:
     spaces = args.spaces or allowed
     if refused := [s for s in spaces if s not in allowed]:
         parser.error(f"k-NN's Faiss engine refuses {', '.join(refused)} for {args.encoding} fields")
+    if args.compression is not None and args.encoding != "on-disk":
+        parser.error("--compression applies to --encoding on-disk only")
     if args.encoding == "binary" and args.dim % 8:
         parser.error("--dim counts bits for binary fields, and k-NN requires a multiple of 8")
 
@@ -238,7 +250,7 @@ def main() -> None:
     knn_version = plugin_version(args.host, "opensearch-knn")
     print(
         f"OpenSearch {os_version}, k-NN plugin {knn_version}, compound files {'on' if args.compound else 'off'}, "
-        f"encoding {args.encoding}"
+        f"encoding {args.encoding}" + (f", compression {args.compression}" if args.compression else "")
     )
 
     # One draw per space in a fixed order, so a space gets the same vectors
@@ -259,12 +271,16 @@ def main() -> None:
             vectors = np.clip(np.rint(vectors * 32), -128, 127).astype(np.int8)
         # Float indexes keep the names they had before `--encoding` existed.
         index = f"knn-{space}" if args.encoding == "float" else f"knn-{space}-{args.encoding}"
+        # 32x is the default; given or not, the index is the same.
+        compression = None if args.compression == "32x" else args.compression
+        if compression is not None:
+            index += f"-{compression}"
         dest = args.out / space
         if dest.exists():
             shutil.rmtree(dest)
         dest.mkdir(parents=True)
 
-        body = create_index(args.host, index, space, args.dim, args.compound, args.encoding)
+        body = create_index(args.host, index, space, args.dim, args.compound, args.encoding, compression)
         bulk_index(args.host, index, vectors, args.batches)
         segment = force_merge(args.host, index)
         pos_of_doc = doc_order(args.host, index, args.count)
@@ -304,6 +320,8 @@ def main() -> None:
             "request": body,
             "files": files,
         }
+        if args.encoding == "on-disk":
+            manifest["compression_level"] = args.compression or "32x"
         with open(dest / "manifest.json", "w", encoding="utf-8", newline="\n") as f:
             json.dump(manifest, f, indent=2)
             f.write("\n")

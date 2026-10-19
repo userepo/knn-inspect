@@ -68,7 +68,7 @@ REAL_SETS = (
 
 # Real sets whose native file holds a graph without its vectors (a `null`
 # storage): there is nothing to search or score.
-NO_VECTORS = ("on-disk",)
+NO_VECTORS = ("on-disk", "on-disk-16x", "on-disk-8x")
 
 
 def payload(path: pathlib.Path) -> np.ndarray:

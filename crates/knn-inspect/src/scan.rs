@@ -1,6 +1,10 @@
 //! The `scan` command: every native file under a directory, each verified
 //! and summarized, plus a cross-check of its vectors against the Lucene
-//! flat-vector file (`.vec`) of the same segment when one lies beside it.
+//! flat-vector file (`.vec`) of the same segment when one lies beside it,
+//! or for a graph without its vectors, against the scalar-quantized ones
+//! Lucene keeps for it (`.vemq` and `.veq`).
+
+mod quantized;
 
 use std::fmt::Write as _;
 use std::fs;
@@ -19,6 +23,7 @@ use knn_format::segment_info::SegmentInfo;
 use knn_format::{NativeFile, view_offset};
 use serde::Serialize;
 
+use self::quantized::{Graph, HOLDS_ITS_VECTORS, LuceneQuantized, lucene_quantized};
 use crate::verify::SpaceArg;
 
 /// Arguments of `scan`.
@@ -124,6 +129,9 @@ struct FileReport {
     checks: Option<Vec<knn_check::CheckResult>>,
     lucene_vectors: LuceneVectors,
     lucene_docs: LuceneDocs,
+    /// For a graph without its vectors, the quantized vectors Lucene keeps
+    /// for it.
+    lucene_quantized: LuceneQuantized,
 }
 
 /// The vectors compared with the segment's Lucene flat-vector file.
@@ -182,13 +190,23 @@ impl LuceneDocs {
 enum CrossCheck {
     /// The native file agrees with the Lucene file.
     Match,
-    /// The Lucene file is sound and the native file contradicts it.
+    /// The Lucene files are sound, and the native file, the `--space`
+    /// given, or another file of the segment contradicts them.
     Mismatch,
-    /// A Lucene file (a `.vec`, the `.vemf` beside it, or the `.si`)
-    /// exists but cannot be trusted: it could not be opened or read, has
-    /// no footer, or fails its footer checksum. The segment cannot be
-    /// trusted as it stands, so the file fails.
+    /// A Lucene file (a `.vec`, the `.vemf` beside it, a `.vemq`, the
+    /// `.veq` beside it, or the `.si`) exists but cannot be trusted: it
+    /// could not be opened or read, has no footer, fails its footer
+    /// checksum, names another segment, or holds what Lucene's writer
+    /// never writes; or a file a `.vemq` needs beside it (its `.veq`,
+    /// `.vemf`, or `.vec`) is missing. The segment cannot be trusted as
+    /// it stands, so the file fails.
     Damaged,
+    /// The files are consistent with each other and with Lucene's writer,
+    /// but a value the tool recomputes (from the `.vec`, or from the
+    /// centroid's own components) differs from the one Lucene stored by
+    /// more than a small relative tolerance. Only the quantized vectors'
+    /// cross-check says this; it warns, not fails.
+    Warning,
     /// Not compared: the Lucene file is not beside the native file (a
     /// compound segment keeps its `.vec` inside the `.cfs`), is a sound
     /// file in a format this tool does not read, repeats its values too
@@ -368,6 +386,9 @@ fn scan_file(path: &Path, options: &Options) -> FileReport {
                     "the native file could not be opened".to_owned(),
                 ),
                 lucene_docs: LuceneDocs::skipped("the native file could not be opened".to_owned()),
+                lucene_quantized: LuceneQuantized::skipped(
+                    "the native file could not be opened".to_owned(),
+                ),
             };
         }
     };
@@ -397,19 +418,40 @@ fn scan_file(path: &Path, options: &Options) -> FileReport {
     let parsed = parsed.ok();
     let idx = parsed.as_ref().map(|p| &p.index);
 
-    let (lucene_vectors, lucene_docs) = if let Some(p) = &parsed {
-        (lucene_vectors(path, bytes, p), lucene_docs(path, p))
+    let (lucene_vectors, lucene_docs, lucene_quantized) = if let Some(p) = &parsed {
+        let index = &p.index;
+        let quantized = if index.index.storage.is_some() {
+            LuceneQuantized::skipped(HOLDS_ITS_VECTORS.to_owned())
+        } else {
+            let graph = Graph {
+                dimension: index.header.d,
+                count: index.header.ntotal,
+                code_size: index.code_size(),
+                metric: index.metric(),
+            };
+            lucene_quantized(path, graph, options.space)
+        };
+        (
+            lucene_vectors(path, bytes, p),
+            lucene_docs(path, p),
+            quantized,
+        )
     } else {
         (
             LuceneVectors::skipped(why.to_owned()),
             LuceneDocs::skipped(why.to_owned()),
+            LuceneQuantized::skipped(why.to_owned()),
         )
     };
-    let crossed = lucene_vectors.status.fails() || lucene_docs.status.fails();
+    let crossed = lucene_vectors.status.fails()
+        || lucene_docs.status.fails()
+        || lucene_quantized.status.fails();
     let status = if crossed {
         Verdict::Failed
     } else if unsupported {
         Verdict::Unsupported
+    } else if lucene_quantized.status == CrossCheck::Warning && report.status == Status::Clean {
+        Verdict::Warnings
     } else {
         report.status.into()
     };
@@ -428,6 +470,7 @@ fn scan_file(path: &Path, options: &Options) -> FileReport {
         checks: Some(report.checks),
         lucene_vectors,
         lucene_docs,
+        lucene_quantized,
     }
 }
 
@@ -547,7 +590,7 @@ fn lucene_footer(bytes: &[u8]) -> Result<(), String> {
 }
 
 /// Why a graph without its vectors has none to look for in a `.vec`.
-const GRAPH_ONLY: &str = "the native file holds the graph only: k-NN keeps the field's quantized vectors in Lucene's .veq file, which this tool does not read";
+const GRAPH_ONLY: &str = "the native file holds the graph only: k-NN keeps the field's quantized vectors in Lucene's .veq file, checked under lucene_quantized";
 
 /// The bytes to look for in a `.vec`, how else the `.vec` may hold them,
 /// and the stored vectors' shape; or why there is nothing to look for.
@@ -606,7 +649,7 @@ fn lucene_vectors(path: &Path, bytes: &[u8], parsed: &knn_format::Parsed<'_>) ->
     let Some(all) = parsed.index.index.storage else {
         return skipped(GRAPH_ONLY.to_owned());
     };
-    let candidates = match segment_vec_files(path) {
+    let candidates = match segment_files(path, "vec") {
         Ok(c) => c,
         Err(e) => return skipped(format!("could not list the segment's files: {e}")),
     };
@@ -761,11 +804,11 @@ impl Misses {
     }
 }
 
-/// The `.vec` files of the native file's segment, in name order. A
-/// segment's files share the prefix up to the first `_` after the leading
-/// one: `_2_165_vec.faiss` and `_2_NativeEngines990KnnVectorsFormat_0.vec`
-/// both belong to segment `_2`.
-fn segment_vec_files(path: &Path) -> std::io::Result<Vec<PathBuf>> {
+/// The files of the native file's segment with `extension`, in name
+/// order. A segment's files share the prefix up to the first `_` after the
+/// leading one: `_2_165_vec.faiss` and
+/// `_2_NativeEngines990KnnVectorsFormat_0.vec` both belong to segment `_2`.
+fn segment_files(path: &Path, extension: &str) -> std::io::Result<Vec<PathBuf>> {
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         return Ok(Vec::new());
     };
@@ -777,7 +820,7 @@ fn segment_vec_files(path: &Path) -> std::io::Result<Vec<PathBuf>> {
         let Some(n) = p.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        if p.extension().and_then(|e| e.to_str()) == Some("vec") && segment_of(n) == segment {
+        if p.extension().and_then(|e| e.to_str()) == Some(extension) && segment_of(n) == segment {
             out.push(p);
         }
     }
@@ -1456,6 +1499,18 @@ fn text(out: &Output) -> String {
             r.lucene_docs.detail
         )
         .expect("writing to a String cannot fail");
+        // Left out only for a file that holds its own vectors, where it
+        // does not apply.
+        if r.lucene_quantized.detail != HOLDS_ITS_VECTORS {
+            writeln!(
+                s,
+                "    {:<VERDICT_WIDTH$} {:<20} {}",
+                cross_tag(r.lucene_quantized.status),
+                "lucene_quantized",
+                r.lucene_quantized.detail
+            )
+            .expect("writing to a String cannot fail");
+        }
     }
     for u in &out.unreadable {
         writeln!(s, "  {}", u.path).expect("writing to a String cannot fail");
@@ -1485,6 +1540,7 @@ fn cross_tag(status: CrossCheck) -> &'static str {
     match status {
         CrossCheck::Match => "pass",
         CrossCheck::Mismatch | CrossCheck::Damaged => "FAIL",
+        CrossCheck::Warning => "WARN",
         CrossCheck::Skipped => "skip",
     }
 }

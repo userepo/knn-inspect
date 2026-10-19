@@ -3,10 +3,11 @@
 One libFuzzer target, `parse_and_verify`, feeds arbitrary bytes to
 `knn_format::parse`, `knn_check::verify`, `knn_check::graph_stats`, and
 an HNSW search (`knn_recall::Searcher`) over whatever graph parsed (one
-without its vectors must refuse the search), and to the segment info and
-flat-vectors metadata readers
-(`knn_format::segment_info`, `knn_format::flat_vectors`). The rule under
-test: any input yields a result, never a panic or an out-of-bounds read.
+without its vectors must refuse the search), and to the segment info,
+flat-vectors metadata, and scalar-quantized vectors readers
+(`knn_format::segment_info`, `knn_format::flat_vectors`,
+`knn_format::quantized_vectors`). The rule under test: any input yields
+a result, never a panic or an out-of-bounds read.
 
 cargo-fuzz needs a nightly toolchain and does not support Windows MSVC;
 run it on Linux (WSL works). CI does not run it.
@@ -19,12 +20,11 @@ cargo +nightly fuzz run parse_and_verify -- -max_len=200000
 ```
 
 `seed.sh` fills `corpus/parse_and_verify/` with the committed fixtures,
-clean and corrupted, and the real segments' `.si` and `.vemf` files for
-the segment info and flat-vectors metadata readers, skipping any larger
-than the 200,000-byte `-max_len`: libFuzzer would only see their first
-200 KB, which is just another truncated file, a case the truncation
-tests already cover. libFuzzer adds to the corpus as it finds new
-coverage.
+clean and corrupted, and the real segments' `.si`, `.vemf`, `.vemq`, and
+`.veq` files for the readers of those, skipping any larger than the
+200,000-byte `-max_len`: libFuzzer would only see their first 200 KB,
+which is just another truncated file, a case the truncation tests
+already cover. libFuzzer adds to the corpus as it finds new coverage.
 
 The build has debug assertions, overflow checks, and AddressSanitizer on
 by default, so an integer overflow fails a run as surely as a panic

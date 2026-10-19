@@ -1,11 +1,12 @@
-//! Any byte string must parse to `Ok` or `Err`, never panic, as a native
-//! file, a segment info file, and a flat-vectors metadata file, and every
-//! check, the graph statistics, and an HNSW search must run over whatever
+//! Any byte string must parse to `Ok` or `Err`, never panic, as a
+//! native file, a segment info file, a flat-vectors metadata file, and
+//! a scalar-quantized vectors metadata or data file, and every check,
+//! the graph statistics, and an HNSW search must run over whatever
 //! parsed (a graph without its vectors must refuse the search). Panics,
-//! including failed bounds checks, fail the run;
-//! AddressSanitizer covers the unsafe code inside dependencies
-//! (zerocopy's casts, crc32fast's SIMD). The memory map is not exercised:
-//! the harness parses bytes, not files.
+//! including failed bounds checks, fail the run; AddressSanitizer
+//! covers the unsafe code inside dependencies (zerocopy's casts,
+//! crc32fast's SIMD). The memory map is not exercised: the harness
+//! parses bytes, not files.
 
 #![no_main]
 
@@ -20,6 +21,47 @@ fuzz_target!(|data: &[u8]| {
         let _ = meta.format.codec();
         for field in &meta.fields {
             let _ = field.vector_bytes();
+        }
+    }
+    if let Ok(meta) = knn_format::quantized_vectors::QuantizedVectorsMeta::parse(data) {
+        for field in &meta.fields {
+            let _ = field.record_size();
+        }
+    }
+    // As a .veq: its records under every scalar encoding, as many as fit
+    // after the header, for a field of the dimension the two bytes after
+    // the header say, 0 included.
+    if let Ok(veq) = knn_format::quantized_vectors::DataFile::parse(data) {
+        use knn_format::quantized_vectors::{QuantizedField, QuantizedVectors, ScalarEncoding};
+        let at = veq.header.length;
+        let dimension = u32::from(u16::from_le_bytes([
+            data.get(at).copied().unwrap_or(0),
+            data.get(at + 1).copied().unwrap_or(0),
+        ]));
+        let room = veq.end.saturating_sub(veq.header.length) as u64;
+        for encoding in (0..5).filter_map(ScalarEncoding::from_wire_number) {
+            let record = encoding.record_size(dimension);
+            let count = u32::try_from(room / record).unwrap_or(u32::MAX);
+            let field = QuantizedField {
+                field_number: 0,
+                encoding: knn_format::flat_vectors::VectorEncoding::Float32,
+                similarity: 0,
+                dimension,
+                data_offset: veq.header.length as u64,
+                data_length: record * u64::from(count),
+                count,
+                scalar_encoding: Some(encoding),
+                centroid: Vec::new(),
+                centroid_dot_product: 0.0,
+                sparse: false,
+            };
+            if let Ok(records) = QuantizedVectors::open(data, &veq, &field) {
+                assert_eq!(records.len(), count as usize);
+                for i in 0..records.len().min(64) {
+                    let r = records.record(i).expect("a record that fits");
+                    let _ = encoding.component_sum(r.packed);
+                }
+            }
         }
     }
     // The parser alone, and then every check, under each space option:

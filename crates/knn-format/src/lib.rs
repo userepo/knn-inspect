@@ -23,7 +23,9 @@
 //! [`segment_info`] reads one more Lucene file of the segment, as far as
 //! the document count: the segment info (`.si`). [`flat_vectors`] reads
 //! another, the flat-vectors metadata (`.vemf`), which says where in the
-//! segment's `.vec` each field's vectors lie.
+//! segment's `.vec` each field's vectors lie. [`quantized_vectors`] reads
+//! the scalar-quantized vectors Lucene keeps for a graph without its own
+//! (`.vemq` and `.veq`).
 //!
 //! Only little-endian targets are supported. The views here decode the
 //! payload's little-endian fields explicitly, but the crates above are
@@ -39,6 +41,7 @@ mod error;
 pub mod faiss;
 pub mod flat_vectors;
 mod mmap;
+pub mod quantized_vectors;
 mod reader;
 pub mod segment_info;
 

@@ -635,5 +635,6 @@
       "name": "segments_3",
       "size": 361
     }
-  ]
+  ],
+  "compression_level": "32x"
 }

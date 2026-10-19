@@ -50,6 +50,8 @@ fn baselines() -> Vec<PathBuf> {
         "opensearch-3.9.0-binary/binary",
         "opensearch-3.9.0-binary/binary-encoder",
         "opensearch-3.9.0-binary/on-disk",
+        "opensearch-3.9.0-binary/on-disk-16x",
+        "opensearch-3.9.0-binary/on-disk-8x",
     ] {
         for entry in fs::read_dir(fixtures().join(set)).unwrap() {
             out.push(entry.unwrap().path().join("stats.json"));
@@ -93,7 +95,7 @@ fn stats_match_faiss_python() {
         unreachable_seen += stats.layers.iter().map(|l| l.unreachable).sum::<usize>();
         seen += 1;
     }
-    assert_eq!(seen, 38, "18 synthetic and 20 real baselines");
+    assert_eq!(seen, 42, "18 synthetic and 24 real baselines");
     // l2-4000x64 has unreachable nodes on levels 0 and 1, so the search
     // itself is compared, not only the empty case.
     assert_eq!(unreachable_seen, 8);

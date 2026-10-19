@@ -584,13 +584,14 @@ values, and norms, and checks `--space` against the ID map's metric, so
 an `l2` field's graph fails `innerproduct`, `cosinesimil`, and
 `hamming`. `stats` reads the graph as it reads any other, `recall`
 refuses the file, which holds nothing to search, and `scan` skips its
-`.vec` check, since the `.veq` holds the graph's vectors, and checks its
-labels against the `.si`. faiss-cpu 1.15.1 cannot read the file: its
-binary reader has no case for `null`, and it requires code size =
-dimension / 8 of every binary header. So `tools/graph_stats.py` reads a
-copy with zero-filled `IBxF` storage in place of the `null` and plain
-binary headers, which leaves the graph's bytes as they are; `stats`
-matches the statistics it computes.
+`.vec` check, since the `.veq` holds the graph's vectors, checks its
+labels against the `.si`, and, since 0.9.0, checks the `.vemq` and
+`.veq` (see Scalar-quantized vectors below). faiss-cpu 1.15.1 cannot
+read the file: its binary reader has no case for `null`, and it requires
+code size = dimension / 8 of every binary header. So
+`tools/graph_stats.py` reads a copy with zero-filled `IBxF` storage in
+place of the `null` and plain binary headers, which leaves the graph's
+bytes as they are; `stats` matches the statistics it computes.
 
 k-NN's remote index build, which hands the graph to a GPU builder,
 writes a float CAGRA graph instead and leaves its storage out the same
@@ -654,13 +655,18 @@ layout with `d` 16 and code size 2, 1,000 bytes of codes, and efSearch
 `.vemf` records a float32 field, and its quantization state lies beside
 them as `_2_NativeEngines990KnnVectorsFormat_0.osknnqstate`.
 
-`--encoding on-disk` indexes the same draw into an `on_disk` float field
-(`on-disk/l2/`). Its native file, 75,846 bytes, has `IBHf`'s code size
-18 and `null` at offset 71,818, where the storage of the other two
-begins. Both headers record dimension 16 and metric type 1, the field
-being `l2`, and the ID map's code size is 2. The labels follow the
-`null` directly: their count, 500, at 71,822, and the labels, doc ids 0
-to 499, up to 75,830, where the footer begins.
+`--encoding on-disk` indexes the same draws into `on_disk` float fields:
+each space at the default 32x compression (`on-disk/l2/`,
+`on-disk/innerproduct/`, `on-disk/cosinesimil/`), and `l2` at
+`--compression 16x` and `8x` (`on-disk-16x/l2/`, `on-disk-8x/l2/`). Every
+native file is 75,846 bytes, with `null` at offset 71,818, where the
+storage of the other two begins, and `IBHf`'s code size 18, 20, or 24 at
+32x, 16x, or 8x. Both headers record dimension 16 and the field's metric
+type, 1 for `l2` and 0 for the other two spaces, and the ID map's code
+size is 2. The labels follow the `null` directly: their count, 500, at
+71,822, and the labels, doc ids 0 to 499, up to 75,830, where the footer
+begins. The quantized vectors are in the Lucene files described under
+Scalar-quantized vectors below.
 
 ## Real files from OpenSearch 3.9.0
 
@@ -756,6 +762,79 @@ A field number of -1 ends the records, and the footer follows. Every
 fixture's `.vemf` holds one field: 150 bytes in Lucene's format, 162 in
 k-NN's, and 148 for byte fields, whose offset and length are shorter
 vlongs.
+
+### Scalar-quantized vectors (`.vemq`, `.veq`)
+
+An `on_disk` field's graph holds no vectors (see Binary storage above);
+k-NN keeps them, quantized, in Lucene's
+`Lucene104ScalarQuantizedVectorsFormat`, which its
+`Faiss1040ScalarQuantizedKnnVectorsFormat` wraps unchanged, so the codec
+names are Lucene's: `Lucene104ScalarQuantizedVectorsFormatMeta` for the
+`.vemq` and `Lucene104ScalarQuantizedVectorsFormatData` for the `.veq`,
+version 0 at Lucene 10.5.1 (`writeMeta` and `writeVectors` in
+`Lucene104ScalarQuantizedVectorsWriter`). The float32 vectors stay in
+the `.vec` and `.vemf` of the same name, as for any other field. `scan`
+reads both files since 0.9.0.
+
+After the big-endian index header (109 bytes in the fixtures: the codec
+name and the segment suffix `Faiss1040ScalarQuantizedKnnVectorsFormat_0`
+are long) the `.vemq` holds one little-endian record per field:
+
+| Field | Type | Fixtures |
+| --- | --- | --- |
+| field number | int32 | 6 |
+| vector encoding | int32 | 1 (`FLOAT32`): Lucene's writer quantizes float32 fields only |
+| similarity function | int32 | 0 (`EUCLIDEAN`) for `l2`, 3 (`MAXIMUM_INNER_PRODUCT`) for `innerproduct`, 2 (`COSINE`) for `cosinesimil` |
+| dimension | vint | 16 |
+| vector data offset | vlong | 112: the first multiple of 4 after the `.veq`'s header |
+| vector data length | vlong | 9,000, 10,000, and 12,000 at 32x, 16x, and 8x |
+| vector count | vint | 500 |
+| scalar encoding, when there are vectors | vint | 3 (`SINGLE_BIT_QUERY_NIBBLE`) at 32x, 4 (`DIBIT_QUERY_NIBBLE`) at 16x, 1 (`PACKED_NIBBLE`) at 8x |
+| centroid, when there are vectors | dimension x float32 | the vectors' mean, normalized for `cosinesimil` |
+| centroid's dot product with itself, when there are vectors | float32 | |
+| docs-with-field block | as in the `.vemf` | dense: -1, 0, -1, -1 |
+
+The order differs from the `.vemf`'s: the dimension comes before the
+offset, and the count is a vint. Lucene also defines wire numbers 0
+(`UNSIGNED_BYTE`) and 2 (`SEVEN_BIT`), which k-NN does not write here,
+and refuses any other, as `scan` does; its reader also refuses a data
+length other than the count times the record size, and so does `scan`.
+A field number of -1 ends the records, and the footer follows; the
+file is 235 bytes in every fixture.
+
+The `.veq` holds each vector's record in ordinal order, which is the
+graph's node order: its quantized components, packed, then the lower and
+upper end of its quantization interval and an additional correction
+(float32 each), and the sum of its quantized components (int32). Lucene
+packs the components as the encoding says: one bit each, component 0 in
+the first byte's top bit (`packAsBinary`), in `ceil(d / 8)` bytes; two
+bits each as two such planes, the low bits' then the high bits'
+(`transposeDibit`), in `2 x ceil(d / 8)` bytes; or four bits each, byte i
+holding component i in its high nibble and component i + `ceil(d / 2)`
+in its low one (`packNibbles`), in `ceil(d / 2)` bytes. A record is that
+plus 16 bytes, which is the graph's code size: 18, 20, and 24 bytes for
+the fixtures' 16 components. The `.veq` is 9,128, 10,128, and 12,128
+bytes. The first record of the 32x `l2` fixture packs `ab 95`, 9 bits
+set, and stores a component sum of 9.
+
+The centroid is the mean of the field's vectors, normalized for cosine.
+A merge recomputes it from every source segment's vectors
+(`calculateCentroid`, which k-NN's merges always reach, since Lucene
+reuses stored centroids only from its own reader), and those include the
+vectors of deleted documents, which the merged `.vec` no longer holds;
+so `scan` does not compare the centroid with the `.vec`'s vectors, only
+its stored dot product with the one its components give. The additional
+correction is the squared norm of the vector less the centroid for
+`EUCLIDEAN` and the vector's dot product with the centroid otherwise,
+which `OptimizedScalarQuantizer` computes in float32, component by
+component; from the `.vec`'s vectors and the stored centroid it
+recomputes bit for bit for all 2,500 records of the fixtures, the cosine
+ones' too, whose `.vec` holds k-NN's normalized vectors, which Lucene's
+merge leaves as they are. A flushed segment of a cosine field divides
+each vector by its magnitude once more, which can move a last bit, and a
+float32 sum of squares of finite but huge components is infinite, so
+`scan` compares rather than refuses, and warns only on a relative
+difference above 1e-4, far beyond float rounding.
 
 ### Bytes
 

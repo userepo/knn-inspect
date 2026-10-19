@@ -49,7 +49,7 @@ const BLOCK_SHIFTS: std::ops::RangeInclusive<u32> = 2..=22;
 
 /// The `VectorSimilarityFunction` ordinals Lucene's reader accepts: 0
 /// `EUCLIDEAN`, 1 `DOT_PRODUCT`, 2 `COSINE`, 3 `MAXIMUM_INNER_PRODUCT`.
-const SIMILARITY_FUNCTIONS: std::ops::RangeInclusive<i32> = 0..=3;
+pub(crate) const SIMILARITY_FUNCTIONS: std::ops::RangeInclusive<i32> = 0..=3;
 
 /// Which format wrote the file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,6 +117,61 @@ impl FlatField {
             .checked_mul(u64::from(self.dimension))?
             .checked_mul(u64::from(self.component_bytes))
     }
+
+    /// The field's vectors in `vec`, the `.vec` this record describes, as
+    /// float32 rows: `None` unless the field holds float32 components, four
+    /// bytes each, all of them inside the file.
+    #[must_use]
+    pub fn float32_rows<'a>(&self, vec: &'a [u8]) -> Option<Float32Rows<'a>> {
+        if self.encoding != VectorEncoding::Float32 || self.component_bytes != 4 {
+            return None;
+        }
+        let start = usize::try_from(self.data_offset).ok()?;
+        let length = usize::try_from(self.vector_bytes()?).ok()?;
+        let data = vec.get(start..start.checked_add(length)?)?;
+        Some(Float32Rows {
+            words: data.as_chunks::<4>().0,
+            dimension: usize::try_from(self.dimension).ok()?,
+        })
+    }
+}
+
+/// A float32 field's vectors in a `.vec`, row i the vector of ordinal i.
+#[derive(Debug, Clone, Copy)]
+pub struct Float32Rows<'a> {
+    words: &'a [[u8; 4]],
+    dimension: usize,
+}
+
+impl Float32Rows<'_> {
+    /// Rows held in full; none for a dimension of 0.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.words.len().checked_div(self.dimension).unwrap_or(0)
+    }
+
+    /// Whether no row is held.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Components per row.
+    #[must_use]
+    pub fn dimension(&self) -> usize {
+        self.dimension
+    }
+
+    /// Row `i`'s components, or `None` past the last row.
+    #[must_use]
+    pub fn row(&self, i: usize) -> Option<impl ExactSizeIterator<Item = f32> + '_> {
+        if i >= self.len() {
+            return None;
+        }
+        let start = i.checked_mul(self.dimension)?;
+        let words = self.words.get(start..start.checked_add(self.dimension)?)?;
+        Some(words.iter().map(|w| f32::from_le_bytes(*w)))
+    }
 }
 
 /// What a `.vemf` says about the `.vec` beside it.
@@ -181,6 +236,39 @@ impl FlatVectorsMeta {
     }
 }
 
+/// Reads the docs-with-field block that ends a field's record, as
+/// Lucene's `OrdToDocDISIReaderConfiguration.writeStoredMeta` writes it
+/// for both `.vemf` and `.vemq` files, for a field of `count` vectors.
+/// Returns whether the field is sparse: some documents lack a vector, so
+/// the data file also holds a docs-with-field set and an ord-to-doc table
+/// after the vectors.
+pub(crate) fn read_docs_with_field(cur: &mut Cursor<'_>, count: u32) -> Result<bool> {
+    let docs_with_field_offset = cur.i64("docs-with-field offset")?;
+    cur.i64("docs-with-field length")?;
+    cur.i16("jump table entry count")?;
+    cur.u8("dense rank power")?;
+    let sparse = docs_with_field_offset >= 0;
+    if sparse {
+        cur.i64("ord-to-doc addresses offset")?;
+        let shift_offset = cur.offset();
+        let shift = cur.vint("ord-to-doc block shift")?;
+        if !BLOCK_SHIFTS.contains(&shift) {
+            return Err(Error::InvalidValue {
+                offset: shift_offset,
+                what: "ord-to-doc block shift",
+                value: i64::from(shift),
+            });
+        }
+        // Blocks of 2^shift vectors, the last one partial: at most 2^30
+        // of them, so the table's size cannot overflow.
+        let blocks = u64::from(count).div_ceil(1_u64 << shift);
+        let table = usize::try_from(blocks.saturating_mul(BLOCK_ENTRY)).unwrap_or(usize::MAX);
+        cur.take(table, "ord-to-doc block table")?;
+        cur.i64("ord-to-doc addresses length")?;
+    }
+    Ok(sparse)
+}
+
 /// Reads one record after its field number.
 fn read_field(cur: &mut Cursor<'_>, format: MetaFormat, field_number: i32) -> Result<FlatField> {
     let encoding_offset = cur.offset();
@@ -229,29 +317,7 @@ fn read_field(cur: &mut Cursor<'_>, format: MetaFormat, field_number: i32) -> Re
         what: "vector count",
         value: i64::from(count),
     })?;
-    let docs_with_field_offset = cur.i64("docs-with-field offset")?;
-    cur.i64("docs-with-field length")?;
-    cur.i16("jump table entry count")?;
-    cur.u8("dense rank power")?;
-    let sparse = docs_with_field_offset >= 0;
-    if sparse {
-        cur.i64("ord-to-doc addresses offset")?;
-        let shift_offset = cur.offset();
-        let shift = cur.vint("ord-to-doc block shift")?;
-        if !BLOCK_SHIFTS.contains(&shift) {
-            return Err(Error::InvalidValue {
-                offset: shift_offset,
-                what: "ord-to-doc block shift",
-                value: i64::from(shift),
-            });
-        }
-        // Blocks of 2^shift vectors, the last one partial: at most 2^30
-        // of them, so the table's size cannot overflow.
-        let blocks = u64::from(count).div_ceil(1_u64 << shift);
-        let table = usize::try_from(blocks.saturating_mul(BLOCK_ENTRY)).unwrap_or(usize::MAX);
-        cur.take(table, "ord-to-doc block table")?;
-        cur.i64("ord-to-doc addresses length")?;
-    }
+    let sparse = read_docs_with_field(cur, count)?;
     let component_bytes = match (format, encoding) {
         (_, VectorEncoding::Byte) => 1,
         (MetaFormat::Lucene99, VectorEncoding::Float32) => 4,

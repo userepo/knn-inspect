@@ -202,6 +202,8 @@ fn real_fixtures_are_clean_with_their_space() {
         "opensearch-3.9.0-binary/binary",
         "opensearch-3.9.0-binary/binary-encoder",
         "opensearch-3.9.0-binary/on-disk",
+        "opensearch-3.9.0-binary/on-disk-16x",
+        "opensearch-3.9.0-binary/on-disk-8x",
     ] {
         for entry in fs::read_dir(fixtures().join(set)).unwrap() {
             let dir = entry.unwrap().path();
@@ -228,8 +230,8 @@ fn real_fixtures_are_clean_with_their_space() {
         }
     }
     assert_eq!(
-        seen, 20,
-        "six float, six fp16, three bf16, two byte, one binary, one binary-encoder, and one on_disk real fixtures"
+        seen, 24,
+        "six float, six fp16, three bf16, two byte, one binary, one binary-encoder, and five on_disk real fixtures"
     );
 }
 

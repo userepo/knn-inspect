@@ -110,6 +110,24 @@ const CASES: &[Case] = &[
     },
     Case {
         set: "opensearch-3.9.0-binary/on-disk",
+        spaces: ALL,
+        meta: ON_DISK_VEMF,
+        format: MetaFormat::Lucene99,
+        encoding: VectorEncoding::Float32,
+        data_offset: 128,
+        component_bytes: 4,
+    },
+    Case {
+        set: "opensearch-3.9.0-binary/on-disk-16x",
+        spaces: &["l2"],
+        meta: ON_DISK_VEMF,
+        format: MetaFormat::Lucene99,
+        encoding: VectorEncoding::Float32,
+        data_offset: 128,
+        component_bytes: 4,
+    },
+    Case {
+        set: "opensearch-3.9.0-binary/on-disk-8x",
         spaces: &["l2"],
         meta: ON_DISK_VEMF,
         format: MetaFormat::Lucene99,
@@ -170,8 +188,8 @@ fn real_fixtures_record_one_field_of_500_vectors() {
         }
     }
     assert_eq!(
-        seen, 17,
-        "three float, six fp16, three bf16, two byte, one binary, one binary-encoder, one on-disk"
+        seen, 21,
+        "three float, six fp16, three bf16, two byte, one binary, one binary-encoder, five on-disk"
     );
 }
 
@@ -520,4 +538,40 @@ fn values_lucene_does_not_define_are_errors() {
         ),
         "{err:?}"
     );
+}
+
+#[test]
+fn float32_rows_read_the_vectors_where_the_record_puts_them() {
+    let dir = fixtures().join("opensearch-3.9.0/nocfs/l2");
+    let meta = FlatVectorsMeta::parse(&fs::read(dir.join(LUCENE_VEMF)).unwrap()).unwrap();
+    let field = meta.fields[0];
+    let vec = fs::read(dir.join(LUCENE_VEMF).with_extension("vec")).unwrap();
+    let rows = field.float32_rows(&vec).unwrap();
+    assert_eq!((rows.len(), rows.dimension()), (500, 16));
+    // The fixture's vectors.f32 holds the same rows, in doc-id order.
+    let indexed = fs::read(dir.join("vectors.f32")).unwrap();
+    let (words, _) = indexed.as_chunks::<4>();
+    for i in [0, 1, 499] {
+        let row: Vec<f32> = rows.row(i).unwrap().collect();
+        let want: Vec<f32> = words[i * 16..(i + 1) * 16]
+            .iter()
+            .map(|w| f32::from_le_bytes(*w))
+            .collect();
+        assert_eq!(row, want, "row {i}");
+    }
+    assert!(rows.row(500).is_none());
+
+    // Not float32, or not all inside the file: no rows.
+    let byte_field = FlatField {
+        encoding: VectorEncoding::Byte,
+        component_bytes: 1,
+        ..field
+    };
+    assert!(byte_field.float32_rows(&vec).is_none());
+    assert!(field.float32_rows(&vec[..vec.len() / 2]).is_none());
+    let past = FlatField {
+        data_offset: u64::MAX,
+        ..field
+    };
+    assert!(past.float32_rows(&vec).is_none());
 }

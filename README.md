@@ -164,26 +164,44 @@ encoder does). A byte field's `.vec` holds the int8 values the codes are
 bits byte for byte. A float field with the binary encoder writes a
 binary index over bits that quantize its float32 vectors, which its
 `.vec` holds; the check is skipped for it, since the bits cannot be
-compared with the floats without the field's quantization state. It is
-skipped for a graph without its vectors too, whose quantized vectors are
-in Lucene's `.veq`, which this tool does not read. Where the segment's
-`.vemf` lies beside the `.vec`, the vectors must be exactly where it
-records the field; without one, or with a sound one in a format this
-tool does not read, `scan` searches the `.vec` at every offset Lucene
-could have used. The `.si` file gives the segment's document count, and
-every label in the ID map, which k-NN sets to a doc id, must be one of
-the segment's doc ids. A `.vec`, `.vemf`, or `.si` that is there but
-cannot be read, or fails its own checksum, fails the native file too:
-the segment cannot be trusted as it stands. A sound `.si` in a format
-this tool does not read, as a newer Lucene may write, is skipped
-instead. `--space` applies to every file found; leave it out when the
-directory mixes space types. A sound file in a layout or scalar
-quantizer type this tool does not read is reported as `unsupported`
-rather than failed: `verify` alone fails it, but a scan of a whole index
-must not read it as corruption. Exit code 0 when every file is clean, 1
-if any failed (or would not open, a subdirectory could not be read, or
-none was found), 2 if the worst verdict was a warning or an unsupported
-file.
+compared with the floats without the field's quantization state. Where
+the segment's `.vemf` lies beside the `.vec`, the vectors must be
+exactly where it records the field; without one, or with a sound one in
+a format this tool does not read, `scan` searches the `.vec` at every
+offset Lucene could have used. A graph without its vectors has none to
+find there; `scan` checks the scalar-quantized vectors Lucene keeps for
+it instead. The segment's `.vemq` must record a field of the graph's
+dimension and vector count, quantized to 1, 2, or 4 bits into records of
+the graph's code size, with a similarity that fits the graph's metric
+and names the `--space` given (the `.vemq`, unlike the graph, tells
+`cosinesimil` from `innerproduct`); the `.veq` beside it must hold every
+record, each with the sum of its components and finite interval ends,
+under a finite centroid whose dot product is neither NaN nor negative;
+and the `.vec` and `.vemf` beside them must be there and sound, and the
+`.vemf` must record the same field; otherwise the file fails. Every
+field of the graph's shape that fits is held to this, since nothing else
+ties the graph to its field. Each record's additional correction,
+recomputed from its vector in the `.vec` and the stored centroid, and
+the centroid's dot product, recomputed from its components, must agree
+with the stored ones within a small relative tolerance (on the fixtures
+the corrections agree bit for bit), or `scan` warns; a sound `.vemf` in
+a format this tool does not read, or components other than float32,
+leave the comparison with the `.vec` out. A compound segment keeps these
+files inside the `.cfs` too, so this check is skipped there. The `.si`
+file gives the segment's document count, and every label in the ID map,
+which k-NN sets to a doc id, must be one of the segment's doc ids. A
+`.vec`, `.vemf`, `.vemq`, `.veq`, or `.si` that is there but cannot be
+read, or fails its own checksum, fails the native file too: the segment
+cannot be trusted as it stands. A sound `.si` in a format this tool does
+not read, as a newer Lucene may write, is skipped instead, as is a sound
+`.vemq` in such a format. `--space` applies to every file found; leave
+it out when the directory mixes space types. A sound file in a layout or
+scalar quantizer type this tool does not read is reported as
+`unsupported` rather than failed: `verify` alone fails it, but a scan of
+a whole index must not read it as corruption. Exit code 0 when every
+file is clean, 1 if any failed (or would not open, a subdirectory could
+not be read, or none was found), 2 if the worst verdict was a warning or
+an unsupported file.
 
 ## Benchmarks
 
@@ -260,14 +278,14 @@ quantized vectors in Lucene's files; with or without the Lucene footer.
 Every command reads all of them, except that `recall` needs vectors to
 search. Fixtures and format notes target OpenSearch 3.9.0.
 
-Not yet: other scalar-quantized storage, product quantization, IVF, the
-quantized vectors of a graph without its vectors, in Lucene's `.veq`,
-and the float graph without its vectors (a CAGRA graph, `IHc2` or the
-older `IHNc`, over `null`) that k-NN's remote index build writes. Files
-in another layout or scalar quantizer type are refused rather than
-misread: `verify` fails them, and `scan` reports those whose footer
-verifies as `unsupported`. NMSLIB and Lucene-engine fields write no
-`.faiss` file, so `scan` does not see them.
+Not yet: other scalar-quantized storage, product quantization, IVF, a
+search over the quantized vectors of a graph without its vectors, which
+`recall` needs, and the float graph without its vectors (a CAGRA graph,
+`IHc2` or the older `IHNc`, over `null`) that k-NN's remote index build
+writes. Files in another layout or scalar quantizer type are refused
+rather than misread: `verify` fails them, and `scan` reports those whose
+footer verifies as `unsupported`. NMSLIB and Lucene-engine fields write
+no `.faiss` file, so `scan` does not see them.
 
 ## Pinned versions
 
@@ -304,9 +322,10 @@ fixtures and baselines use faiss-cpu 1.15.1.
 - `fixtures/opensearch-3.9.0-binary/` - real segments of a binary field
   of 128 bits, the signs of the `l2` vectors (`binary/hamming/`); of a
   float field with the binary encoder, one bit per component
-  (`binary-encoder/l2/`); and of an `on_disk` float field, whose native
-  file holds the graph only (`on-disk/l2/`), with graph statistics but
-  no recall baselines
+  (`binary-encoder/l2/`); and of `on_disk` float fields, whose native
+  files hold the graph only, at the default 32x compression for every
+  space (`on-disk/`) and at 16x and 8x for `l2` (`on-disk-16x/l2/`,
+  `on-disk-8x/l2/`), with graph statistics but no recall baselines
 - `*.stats.json` beside each synthetic fixture and `stats.json` beside
   each real one - the graph statistics Faiss Python computes from the
   same file (for a graph without its vectors, from a copy Faiss can
@@ -356,6 +375,9 @@ docker compose -f tools\docker-compose.yml up -d
 .venv\Scripts\python tools\extract_opensearch.py --out fixtures\opensearch-3.9.0-binary\binary --encoding binary --dim 128
 .venv\Scripts\python tools\extract_opensearch.py --out fixtures\opensearch-3.9.0-binary\binary-encoder --encoding binary-encoder --spaces l2
 .venv\Scripts\python tools\extract_opensearch.py --out fixtures\opensearch-3.9.0-binary\on-disk --encoding on-disk --spaces l2
+.venv\Scripts\python tools\extract_opensearch.py --out fixtures\opensearch-3.9.0-binary\on-disk --encoding on-disk --spaces innerproduct cosinesimil
+.venv\Scripts\python tools\extract_opensearch.py --out fixtures\opensearch-3.9.0-binary\on-disk-16x --encoding on-disk --compression 16x --spaces l2
+.venv\Scripts\python tools\extract_opensearch.py --out fixtures\opensearch-3.9.0-binary\on-disk-8x --encoding on-disk --compression 8x --spaces l2
 docker compose -f tools\docker-compose.yml down -v
 ```
 

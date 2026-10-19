@@ -115,10 +115,10 @@ Each entry of `files`:
 | --- | --- | --- |
 | `file` | string | The file's path |
 | `size` | integer, nullable | Bytes; `null` when the file would not open |
-| `error` | string, optional | Why the file would not open; `failures`, `warnings`, and `checks` are then absent, and both cross-checks are `skipped` |
+| `error` | string, optional | Why the file would not open; `failures`, `warnings`, and `checks` are then absent, and every cross-check is `skipped` |
 | `layout`, `dimension`, `count`, `metric` | optional | As for `info`; absent when the file did not parse |
 | `code_size` | integer, optional | As for `info`, for binary storage (since 0.7.0) and a graph without its vectors (since 0.8.0) |
-| `status` | string | `clean`, `warnings`, or `failed`, counting both Lucene cross-checks; or `unsupported` (since 0.7.0): a file whose footer verifies, in a layout or scalar quantizer type this tool does not read, which fails only the structure check. `verify` fails such a file; `scan` does not count it as failed, since nothing is known to be wrong with it |
+| `status` | string | `clean`, `warnings`, or `failed`, counting the Lucene cross-checks (a `warning` from `lucene_quantized` makes a file `warnings` that is otherwise clean, since 0.9.0); or `unsupported` (since 0.7.0): a file whose footer verifies, in a layout or scalar quantizer type this tool does not read, which fails only the structure check. `verify` fails such a file; `scan` does not count it as failed, since nothing is known to be wrong with it |
 | `failures`, `warnings`, `checks` | optional | As for `verify` |
 | `lucene_vectors.status` | string | `match`, `mismatch`, `damaged`, or `skipped` (`damaged` since 0.3.0) |
 | `lucene_vectors.file` | string, optional | The segment's `.vec` file the vectors were found in, or the first one looked in |
@@ -128,13 +128,27 @@ Each entry of `files`:
 | `lucene_docs.file` | string, optional | The segment's `.si` file that was read |
 | `lucene_docs.doc_count` | integer, optional | Documents in the segment, deleted ones included |
 | `lucene_docs.detail` | string | What was found, what is wrong with the Lucene file, or why the check was skipped |
+| `lucene_quantized.status` | string | `match`, `mismatch`, `damaged`, `warning`, or `skipped` (since 0.9.0) |
+| `lucene_quantized.file` | string, optional | The segment's `.vemq` file whose field was checked, or whose field was found unfit (since 0.9.0) |
+| `lucene_quantized.data_file` | string, optional | The `.veq` beside it that holds, or should hold, the field's records (since 0.9.0) |
+| `lucene_quantized.offset` | integer, optional | Where in the `.veq` the field's records begin (since 0.9.0) |
+| `lucene_quantized.encoding` | string, optional | Lucene's name for the field's scalar encoding: `SINGLE_BIT_QUERY_NIBBLE`, `DIBIT_QUERY_NIBBLE`, or `PACKED_NIBBLE` for the 1, 2, and 4 bits k-NN keeps; `UNSIGNED_BYTE` or `SEVEN_BIT` in a field k-NN did not write (since 0.9.0) |
+| `lucene_quantized.bits` | integer, optional | Bits a stored component is quantized to (since 0.9.0) |
+| `lucene_quantized.similarity` | string, optional | The similarity function the `.vemq` records for the field: `euclidean`, `dot_product`, `cosine`, or `maximum_inner_product`; k-NN records `euclidean` for `l2`, `maximum_inner_product` for `innerproduct`, and `cosine` for `cosinesimil` (since 0.9.0) |
+| `lucene_quantized.detail` | string | What was found, what is wrong with the Lucene files, or why the check was skipped (since 0.9.0) |
 
-The two Lucene cross-checks compare the native file with files of the
-same segment. `mismatch` means the Lucene file is sound and the native
-file contradicts it; `damaged` means the Lucene file exists but cannot be
-trusted (it could not be opened or read, has no footer, or fails its
-footer checksum), so the segment cannot be trusted as it stands. Either
-fails the file.
+The Lucene cross-checks compare the native file with files of the same
+segment. `mismatch` means the Lucene files are sound, and the native
+file, the `--space` given (for `lucene_quantized`), or another file of
+the segment contradicts them; `damaged` means the Lucene file exists but
+cannot be trusted (it could not be opened or read, has no footer, fails
+its footer checksum, or holds what Lucene's writer never writes; or, for
+the files a `.vemq` needs beside it, is missing), so the segment cannot
+be trusted as it stands. Either fails the file. `warning`, which only
+`lucene_quantized` gives, means the files are consistent with each other
+and with Lucene's writer, but a value the tool recomputes differs from
+the one Lucene stored by more than a relative 1e-4, far beyond float
+rounding.
 
 - `lucene_vectors` looks for the native file's stored vectors, byte for
   byte, inside the segment's `.vec` (Lucene flat vectors) files, which
@@ -166,10 +180,10 @@ fails the file.
   float field with k-NN's binary encoder writes a binary index over bits
   that quantize the float32 vectors its `.vec` holds, which the bits
   cannot be checked against (since 0.7.0); and always for a graph
-  without its vectors, whose quantized vectors are in Lucene's `.veq`,
-  which this tool does not read (since 0.8.0). Before 0.3.0, a `.vec`
-  that could not be opened was reported as `mismatch`, and a failing
-  checksum was only mentioned in `detail`.
+  without its vectors, whose quantized vectors are in Lucene's `.veq`
+  (since 0.8.0), which `lucene_quantized` checks instead (since 0.9.0).
+  Before 0.3.0, a `.vec` that could not be opened was reported
+  as `mismatch`, and a failing checksum was only mentioned in `detail`.
 - `lucene_docs` reads the document count from the segment's `.si` and
   checks that every label in the ID map, which k-NN sets to a doc id,
   lies in `0..doc_count`, with no more labels than documents. The `.si`
@@ -178,3 +192,51 @@ fails the file.
   it holds. It is skipped when there is no `.si` beside the native file,
   or when the `.si` is sound but in a format this tool does not read, as a
   newer Lucene may write.
+- `lucene_quantized` (since 0.9.0), for a graph without its vectors,
+  reads the segment's `.vemq` files (Lucene's scalar-quantized vectors
+  metadata) for a field of the graph's dimension and vector count, and
+  checks it and its records in the `.veq` beside it. The field must be
+  one k-NN builds such a graph over: float32 vectors quantized to 1, 2,
+  or 4 bits, records of the graph's code size, and a similarity that
+  fits the graph's metric (`euclidean` for `l2`, an inner-product one
+  otherwise). Nothing but its shape ties the graph to a field, so of
+  several fields of that shape, every one that fits is checked and the
+  worst outcome is reported (`damaged`, then `mismatch`, `warning`,
+  `match`); the fields that do not fit decide nothing while one fits,
+  and when none fits, the first says why not, as a `mismatch`, as is no
+  field of the graph's shape at all. A field whose similarity is not the
+  one k-NN records for the `--space` given does not fit either (the
+  `.vemq`, unlike the graph, tells `cosinesimil` from `innerproduct`),
+  so with no other field it is a `mismatch` too, as is a `.vemf` that
+  records no field of the same number, or one with another dimension,
+  count, similarity, vector encoding, or docs-with-field kind. The
+  `.veq` must lie beside the `.vemq`, be sound, name the same segment,
+  and hold the field's records where the `.vemq` puts them, each with a
+  component sum equal to its components' and finite interval ends, and
+  the `.vemq` a finite centroid whose dot product is neither NaN nor
+  negative, or the check is `damaged`; so is a `.vemq` of the segment
+  that is not sound, before any other outcome, whether or not a field
+  checked out. Each record's additional correction is then compared with
+  the one Lucene's quantizer computes from the vector of the same
+  ordinal in the `.vec` and the stored centroid (the squared norm of
+  their difference for `euclidean`, their dot product otherwise), which
+  recomputes exactly where Lucene quantized the vectors the `.vec`
+  holds, as it did the fixtures', and the centroid's stored dot product
+  with the one its components give; a relative difference above 1e-4,
+  far beyond float rounding, is a `warning`. The centroid itself is not
+  compared with the `.vec`'s vectors: a merge recomputes it from every
+  source segment's vectors, deleted documents' included, which the
+  merged `.vec` no longer holds. A `.vec` or `.vemf` that is missing
+  beside the `.vemq`, is not sound, or names another segment, a `.vemf`
+  whose field length or offset Lucene's reader would refuse, or a `.vec`
+  that holds a value that is not finite, is `damaged`, since Lucene
+  opens them with the quantized files. When the `.vemf` is sound but in
+  a format this tool does not read, or the field's components are not
+  float32, the comparison with the `.vec` is left out and `detail` says
+  why. It is skipped when the segment's files cannot be listed; when no
+  `.vemq` of the segment lies beside the native file, as in a compound
+  segment; when no sound `.vemq` holds a field the graph can have been
+  built over and one is in a format this tool does not read; when every
+  field of the graph's shape that fits records no vectors; and for a
+  file that holds its own vectors, which the text report then leaves
+  out.
