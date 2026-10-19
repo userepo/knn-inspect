@@ -1,6 +1,7 @@
 //! Any byte string must parse to `Ok` or `Err`, never panic, as a
-//! native file, a segment info file, a flat-vectors metadata file, and
-//! a scalar-quantized vectors metadata or data file, and every check,
+//! native file, a segment info file, a field infos file, a flat-vectors
+//! metadata file, and a scalar-quantized vectors metadata or data file,
+//! and every check,
 //! the graph statistics, and an HNSW search must run over whatever
 //! parsed (a graph without its vectors must refuse the search). Panics,
 //! including failed bounds checks, fail the run; AddressSanitizer
@@ -14,9 +15,16 @@ use knn_check::{Options, Space};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    // The segment info and flat-vectors metadata readers take the same
-    // untrusted bytes.
+    // The segment info, field infos, and flat-vectors metadata readers
+    // take the same untrusted bytes.
     let _ = knn_format::segment_info::SegmentInfo::parse(data);
+    if let Ok(infos) = knn_format::field_infos::FieldInfos::parse(data) {
+        for field in infos.knn_fields() {
+            let _ = field.sq_bits();
+            let _ = infos.by_name(&field.name);
+            let _ = infos.by_number(field.number);
+        }
+    }
     if let Ok(meta) = knn_format::flat_vectors::FlatVectorsMeta::parse(data) {
         let _ = meta.format.codec();
         for field in &meta.fields {

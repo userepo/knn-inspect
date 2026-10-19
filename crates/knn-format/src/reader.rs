@@ -61,6 +61,16 @@ impl<'a> Cursor<'a> {
             .map(|b| b.first().copied().unwrap_or_default())
     }
 
+    /// A string as Lucene's `DataOutput.writeString` writes it: a vint
+    /// byte length, then that many bytes of UTF-8. Bytes that are not
+    /// UTF-8 decode to U+FFFD, as `DataInput.readString` decodes them
+    /// (Java's `new String(bytes, UTF_8)`), rather than failing.
+    pub(crate) fn string(&mut self, what: &'static str) -> Result<String> {
+        let len = usize::try_from(self.vint(what)?).unwrap_or(usize::MAX);
+        let bytes = self.take(len, what)?;
+        Ok(String::from_utf8_lossy(bytes).into_owned())
+    }
+
     pub(crate) fn fourcc(&mut self, what: &'static str) -> Result<[u8; 4]> {
         let bytes = self.take(4, what)?;
         let mut tag = [0_u8; 4];

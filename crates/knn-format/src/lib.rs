@@ -25,7 +25,10 @@
 //! another, the flat-vectors metadata (`.vemf`), which says where in the
 //! segment's `.vec` each field's vectors lie. [`quantized_vectors`] reads
 //! the scalar-quantized vectors Lucene keeps for a graph without its own
-//! (`.vemq` and `.veq`).
+//! (`.vemq` and `.veq`). [`field_infos`] reads the segment's field infos
+//! (`.fnm`): every field by name and number, with the attributes k-NN
+//! stores on a vector field, which tie a native file to its field and to
+//! the Lucene files that hold the field's vectors.
 //!
 //! Only little-endian targets are supported. The views here decode the
 //! payload's little-endian fields explicitly, but the crates above are
@@ -39,6 +42,7 @@
 pub mod envelope;
 mod error;
 pub mod faiss;
+pub mod field_infos;
 pub mod flat_vectors;
 mod mmap;
 pub mod quantized_vectors;

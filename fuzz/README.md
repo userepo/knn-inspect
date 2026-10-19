@@ -20,8 +20,9 @@ cargo +nightly fuzz run parse_and_verify -- -max_len=200000
 ```
 
 `seed.sh` fills `corpus/parse_and_verify/` with the committed fixtures,
-clean and corrupted, and the real segments' `.si`, `.vemf`, `.vemq`, and
-`.veq` files for the readers of those, skipping any larger than the
+clean and corrupted, and the real segments' `.si`, `.fnm`, `.vemf`,
+`.vemq`, and `.veq` files for the readers of those, skipping any larger
+than the
 200,000-byte `-max_len`: libFuzzer would only see their first 200 KB,
 which is just another truncated file, a case the truncation tests
 already cover. libFuzzer adds to the corpus as it finds new coverage.

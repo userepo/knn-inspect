@@ -721,6 +721,73 @@ checksum verifies, `scan` reports it as a format this tool does not
 read and skips the check, since a newer Lucene may write one; without a
 verifying footer, the file is reported as damaged.
 
+### Field infos (`.fnm`)
+
+The segment's `.fnm` lists every field by name and number with the
+attributes its writer stored on it; a compound segment keeps it inside
+the `.cfs`. The layout is `Lucene94FieldInfosFormat` at Lucene 10.5.1,
+codec name `Lucene94FieldInfos`, version 2 (versions 0 and 1 lack the
+doc-values skip index byte, and version 0 the parent field flag). After
+the 44-byte big-endian `CodecUtil` index header come the field count
+(vint) and one record per field:
+
+| Field | Type | The `vec` field of the fixtures |
+| --- | --- | --- |
+| name | vint length, UTF-8 | `vec` |
+| field number | vint | 6 |
+| flags | int8: 0x1 term vectors, 0x2 omit norms, 0x4 payloads, 0x8 soft deletes, 0x10 parent field, 0x20 doc-values skip index | 0 |
+| index options | int8, 0 to 5 | 0 (`NONE`) |
+| doc-values type | int8, 0 to 5 | 0 (`NONE`) |
+| doc-values skip index type | int8, 0 or 1 | 0 (`NONE`) |
+| doc-values generation | int64 | -1 |
+| attributes | vint count, then key and value strings | 9, listed below |
+| point data dimension count | vint; when not 0, the index dimension count and bytes per dimension follow (vint each) | 0 |
+| vector dimension | vint | 16 |
+| vector encoding | int8: 0 `BYTE`, 1 `FLOAT32` | 1; 0 for byte and binary fields |
+| vector similarity function | int8: 0 `EUCLIDEAN`, 1 `DOT_PRODUCT`, 2 `COSINE`, 3 `MAXIMUM_INNER_PRODUCT` | 0 for `l2` and `hamming`, 3 for `innerproduct`, 2 for `cosinesimil` |
+
+Every fixture's `.fnm` holds the same seven fields in the same order,
+OpenSearch's `_id`, `_seq_no`, `_primary_term`, `_source`, and `_version`
+(0 to 4), then the mapping's `pos` (5) and `vec` (6), which is the field
+number the segment's `.vemf` and `.vemq` record. A field without vectors
+records dimension 0 with the float32 encoding and the euclidean
+function, `FieldInfo`'s defaults. k-NN's field mapper puts these
+attributes on a vector field (`KNNVectorFieldMapper`, tag 3.9.0.0), and
+Lucene's per-field format adds the last two:
+
+| Attribute | Fixtures |
+| --- | --- |
+| `knn_field` | `true`; k-NN reads only for the key |
+| `engine` | `faiss` |
+| `spaceType` | the mapping's space type, `cosinesimil` included, where the `parameters` JSON and the graph say `innerproduct` |
+| `data_type` | `float`, `half_float`, `byte`, or `binary` |
+| `dimension` | `16`; `128` for the binary field, whose vector dimension counts bytes |
+| `parameters` | the resolved method as JSON: `index_description`, `name`, `spaceType`, `data_type`, and `parameters` with `ef_search`, `ef_construction`, `m`, and the encoder |
+| `sq_config` | `bits=1`, `bits=2`, or `bits=4` on the `on_disk` fields; absent elsewhere |
+| `qframe_config` | `type=binary,bits=1,random_rotation=false,enable_adc=false` on the field with the `binary` encoder; absent elsewhere |
+| `PerFieldKnnVectorsFormat.format` | `Faiss1040ScalarQuantizedKnnVectorsFormat` for the `on_disk` fields, `NativeEngines990HalfFloatKnnVectorsFormat` for `half_float`, `NativeEngines990KnnVectorsFormat` otherwise |
+| `PerFieldKnnVectorsFormat.suffix` | `0` |
+
+k-NN names a native file after its segment, its build version, and its
+field, `_2_165_vec.faiss` (`.faissc` in a compound segment), and finds
+it the other way around (`KNNCodecUtil.getEngineFiles`): among the
+segment's files, the ones ending in `_vec.faiss`, shortest first. That
+suffix also matches a field `my_vec`'s `_2_165_my_vec.faiss`, which the
+shortest-first order passes over; a field name can hold `_` but the
+build version does not, so the field's name is the file name less the
+`_2_165_` prefix and the extension. So the `.fnm` ties the file to a
+field number, and through the format name and suffix to the `.vemq`
+that holds the field's quantized vectors. The reader
+(`knn_format::field_infos`) checks each value's range as Lucene's reader
+does, refuses a field that is both the soft-deletes and the parent
+field, as `FieldInfo.checkConsistency` does, and a name or number two
+fields share and the soft-deletes or parent field flag on two fields,
+as Lucene's `FieldInfos` does, in Lucene's order, so the first fault it
+names is Lucene's; like Lucene, it decodes bytes that are not UTF-8 to
+U+FFFD and reads a negative attribute count as none. It reads versions
+0 to 2, and does not check the header's segment id and suffix, which are
+the caller's to compare with the segment's `.si`.
+
 ### Flat-vectors metadata (`.vemf`)
 
 Beside each `.vec` lies a `.vemf` of the same name, which says where in

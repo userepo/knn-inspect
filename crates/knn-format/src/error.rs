@@ -135,6 +135,20 @@ pub enum Error {
         /// Where the string's bytes start.
         offset: usize,
     },
+
+    /// Two field infos share a name or a number, or both carry the
+    /// soft-deletes or the parent field flag, which Lucene's `FieldInfos`
+    /// refuses.
+    #[error("the field info at offset {offset} repeats an earlier field's {what}, {shown}")]
+    DuplicateField {
+        /// Where the later field's record starts.
+        offset: usize,
+        /// `name`, `number`, `soft-deletes flag`, or `parent field flag`.
+        what: &'static str,
+        /// The name, quoted, or the number; for a flag, the earlier
+        /// field's name, quoted.
+        shown: String,
+    },
 }
 
 impl Error {
@@ -151,7 +165,8 @@ impl Error {
             | Self::UnexpectedCodec { offset, .. }
             | Self::UnknownChecksumAlgorithm { offset, .. }
             | Self::InvalidChecksum { offset, .. }
-            | Self::InvalidString { offset } => Some(*offset),
+            | Self::InvalidString { offset }
+            | Self::DuplicateField { offset, .. } => Some(*offset),
             Self::Io(_) | Self::ChecksumMismatch { .. } => None,
         }
     }
