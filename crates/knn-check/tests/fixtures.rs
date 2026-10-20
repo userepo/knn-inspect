@@ -231,8 +231,8 @@ fn real_fixtures_are_clean_with_their_space() {
         }
     }
     assert_eq!(
-        seen, 25,
-        "six float, six fp16, three bf16, two byte, one binary, one binary-encoder, and six on_disk real fixtures"
+        seen, 27,
+        "six float, six fp16, three bf16, two byte, one binary, one binary-encoder, and eight on_disk real fixtures"
     );
 }
 

@@ -96,7 +96,7 @@ fn stats_match_faiss_python() {
         unreachable_seen += stats.layers.iter().map(|l| l.unreachable).sum::<usize>();
         seen += 1;
     }
-    assert_eq!(seen, 43, "18 synthetic and 25 real baselines");
+    assert_eq!(seen, 45, "18 synthetic and 27 real baselines");
     // l2-4000x64 has unreachable nodes on levels 0 and 1, and the build of
     // on-disk-16x/l2 one on level 1, so the search itself is compared, not
     // only the empty case.

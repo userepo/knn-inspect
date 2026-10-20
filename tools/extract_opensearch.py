@@ -32,23 +32,30 @@ only, and accepts only `hamming` for binary fields.
 Next to a binary field's segment, `vectors.u8` holds the packed bits in
 place of `vectors.f32`, the bytes of row i the bits of document i.
 
-With `--queries N` (on-disk only), the script also queries the live
-index, whose one segment is the one copied out, N times in each of the
-modes `QUERY_MODES` lists, and writes the queries as `queries.f32`
-(their own seeded draw, the same for every space) and each mode's
-results as doc ids with their scores: `results.jsonl` the 10 nearest
-with k-NN's default rescoring, `results-no-rescore.jsonl` with
-`"rescore": false`, `results-oversample-30.jsonl` with an
-`oversample_factor` of 30 (a first pass of 300), `results-ef-search-300.jsonl`
-with an `ef_search` of 300 (a beam of 300, cut to the first pass of
-100), and `results-k-150.jsonl` the 150 nearest (a first pass of 150, all
-of it kept, for 2 and 4 bits), and `results-no-rescore-ef-search-10.jsonl`
-without rescoring at an `ef_search` of 10 (a beam of 10). The manifest records each mode's `k` and
-query parameters. These are the baselines `knn-inspect recall` must
-match for a graph without its vectors. Before recording, it rescores every document a few hundred
-times, so that the JVM has compiled Lucene's vector code, which adds its
-SIMD lanes in another order once compiled, as a node that has served
-queries for a while runs it.
+With `--queries N` (the on-disk encodings only), the script also queries
+the live index, whose one segment is the one copied out, N times in each
+of the modes `QUERY_MODES` lists, or those `--modes` names, and writes
+the queries as `queries.f32` (their own seeded draw, the same for every
+space) and each mode's results as doc ids with their scores:
+`results.jsonl` the 10 nearest with k-NN's default rescoring,
+`results-no-rescore.jsonl` with `"rescore": false`,
+`results-oversample-30.jsonl` with an `oversample_factor` of 30 (a first
+pass of 300), `results-ef-search-300.jsonl` with an `ef_search` of 300
+(a beam of 300, cut to the first pass of 100), and `results-k-150.jsonl`
+the 150 nearest (a first pass of 150, all of it kept, for 2 and 4 bits),
+and `results-no-rescore-ef-search-10.jsonl` without rescoring at an
+`ef_search` of 10 (a beam of 10). The manifest records each mode's `k`
+and query parameters. These are the baselines `knn-inspect recall` must
+match for a graph without its vectors. Before recording, it rescores
+every document a few hundred times, so that the JVM has compiled
+Lucene's vector code, which adds its SIMD lanes in another order once
+compiled, as a node that has served queries for a while runs it. For a
+`half_float` field, which k-NN rescores with its native library, the
+manifest also records the library, as the node's log names it, in
+`live_queries.simd_library` (the node's, which loads it once), and the
+script refuses any but the AVX2 one, whose sums `recall` follows, before
+it writes the queries, results, and manifest (the segment's files are
+copied by then).
 
 Usage:
     docker compose -f tools/docker-compose.yml up -d
@@ -64,7 +71,7 @@ Usage:
     python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-binary/on-disk --encoding on-disk --spaces innerproduct cosinesimil --queries 100
     python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-binary/on-disk-16x --encoding on-disk --compression 16x --spaces l2 --queries 100
     python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-binary/on-disk-8x --encoding on-disk --compression 8x --spaces l2 --queries 100
-    python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-binary/on-disk-half-float --encoding on-disk-half-float --spaces l2
+    python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-binary/on-disk-half-float --encoding on-disk-half-float --queries 100 --modes results.jsonl results-no-rescore.jsonl results-oversample-30.jsonl
 """
 
 from __future__ import annotations
@@ -72,6 +79,7 @@ from __future__ import annotations
 import argparse
 import json
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -111,6 +119,10 @@ QUERY_MODES = {
     "results-k-150.jsonl": (150, {}),
     "results-no-rescore-ef-search-10.jsonl": (QUERY_K, {"rescore": False, "method_parameters": {"ef_search": 10}}),
 }
+# The native library whose kernels k-NN rescores a half_float field with,
+# which the Rust port follows: k-NN loads the widest its CPU runs, and this
+# one on an x86-64 CPU with AVX2 but not AVX-512.
+HALF_FLOAT_SIMD_LIBRARY = "opensearchknn_simd_avx2"
 # Queries run before recording, each rescoring every document (a first
 # pass of up to 500): some 37,500 calls of Lucene's bulk scoring, past
 # where the JVM compiles it.
@@ -262,19 +274,45 @@ def copy_shard(container: str, uuid: str, segment: str, dest: pathlib.Path) -> l
     return files
 
 
-def record_queries(host: str, index: str, dest: pathlib.Path, dim: int, count: int, pos_of_doc: list[int]) -> dict:
+def simd_library(container: str) -> str | None:
+    """The SIMD library the node's k-NN plugin loaded since the container
+    last started, as its log names it. It loads once per node, for the
+    first query that needs it, so every index of a run is rescored with
+    the one the first index's warm-up loaded."""
+    started = subprocess.run(
+        ["docker", "inspect", "--format", "{{.State.StartedAt}}", container],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    logs = subprocess.run(["docker", "logs", "--since", started, container], capture_output=True, text=True, check=True)
+    names = re.findall(r"Loaded library: (opensearchknn_simd\w*)", logs.stdout + logs.stderr)
+    return names[-1] if names else None
+
+
+def record_queries(host: str, index: str, dest: pathlib.Path, dim: int, count: int, pos_of_doc: list[int], modes: list[str], simd_container: str | None) -> dict:
     """Query the live index, whose one segment is the one copied out, and
     write the queries and each rescoring's result lists as doc ids, the
-    Faiss labels, with their scores, one line per query in query order."""
+    Faiss labels, with their scores, one line per query in query order.
+    With `simd_container`, the node's container, a half_float field's
+    rescoring library is checked once the warm-up has loaded it, before
+    anything is written."""
     warm_up = np.random.default_rng(QUERY_SEED + 1).standard_normal((WARM_UP_QUERIES, dim), dtype=np.float32)
     for q in warm_up:
         rescore = {"oversample_factor": WARM_UP_OVERSAMPLE}
         body = {"size": QUERY_K, "query": {"knn": {"vec": {"vector": q.tolist(), "k": QUERY_K, "rescore": rescore}}}}
         requests.post(f"{host}/{index}/_search", json=body, timeout=60).raise_for_status()
+    library = None
+    if simd_container is not None:
+        # Rescored by the native library, whose sums are the host's.
+        library = simd_library(simd_container)
+        if library is None:
+            sys.exit(f"{index}: the node's log names no SIMD library k-NN loaded since the container started")
+        if library != HALF_FLOAT_SIMD_LIBRARY:
+            sys.exit(f"{index}: k-NN rescored with {library}, not {HALF_FLOAT_SIMD_LIBRARY}, whose sums recall follows")
     queries = np.random.default_rng(QUERY_SEED).standard_normal((count, dim), dtype=np.float32)
     queries.astype("<f4").tofile(dest / "queries.f32")
     doc_of_pos = {pos: doc for doc, pos in enumerate(pos_of_doc)}
-    for name, (k, extra) in QUERY_MODES.items():
+    recorded = {name: QUERY_MODES[name] for name in modes}
+    for name, (k, extra) in recorded.items():
         lines = []
         for q in queries:
             body = {
@@ -291,13 +329,16 @@ def record_queries(host: str, index: str, dest: pathlib.Path, dim: int, count: i
             }))
         with open(dest / name, "w", encoding="utf-8", newline="\n") as f:
             f.write("\n".join(lines) + "\n")
-    return {
+    recording = {
         "queries_file": "queries.f32",
         "queries_seed": QUERY_SEED,
         "warm_up_queries": WARM_UP_QUERIES,
         "warm_up_oversample_factor": WARM_UP_OVERSAMPLE,
-        "results_files": {name: {"k": k, "query": extra} for name, (k, extra) in QUERY_MODES.items()},
+        "results_files": {name: {"k": k, "query": extra} for name, (k, extra) in recorded.items()},
     }
+    if library is not None:
+        recording["simd_library"] = library
+    return recording
 
 
 def main() -> None:
@@ -312,7 +353,8 @@ def main() -> None:
     parser.add_argument("--batches", type=int, default=2, help="bulk batches before the force merge")
     parser.add_argument("--encoding", default="float", choices=ENCODINGS, help="how the field stores its vectors")
     parser.add_argument("--compression", choices=COMPRESSIONS, help="the on-disk encodings only: the field's compression level, 32x when absent")
-    parser.add_argument("--queries", type=int, default=0, help="on-disk only: query the live index this many times and record the results")
+    parser.add_argument("--queries", type=int, default=0, help="the on-disk encodings only: query the live index this many times and record the results")
+    parser.add_argument("--modes", nargs="+", choices=list(QUERY_MODES), help="with --queries: the modes to record, by result file; default: every mode")
     args = parser.parse_args()
     if args.count > MAX_RESULT_WINDOW:
         parser.error(f"--count above {MAX_RESULT_WINDOW} exceeds index.max_result_window, which doc_order reads in one page")
@@ -322,8 +364,12 @@ def main() -> None:
         parser.error(f"k-NN's Faiss engine refuses {', '.join(refused)} for {args.encoding} fields")
     if args.compression is not None and not args.encoding.startswith("on-disk"):
         parser.error("--compression applies to the on-disk encodings only")
-    if args.queries and args.encoding != "on-disk":
-        parser.error("--queries applies to --encoding on-disk only")
+    if args.queries and not args.encoding.startswith("on-disk"):
+        parser.error("--queries applies to the on-disk encodings only")
+    if args.modes is not None and not args.queries:
+        parser.error("--modes applies with --queries only")
+    if args.modes is None:
+        args.modes = list(QUERY_MODES)
     if args.encoding == "binary" and args.dim % 8:
         parser.error("--dim counts bits for binary fields, and k-NN requires a multiple of 8")
 
@@ -405,7 +451,8 @@ def main() -> None:
         if args.encoding.startswith("on-disk"):
             manifest["compression_level"] = args.compression or "32x"
         if args.queries:
-            manifest["live_queries"] = record_queries(args.host, index, dest, args.dim, args.queries, pos_of_doc)
+            simd_container = args.container if args.encoding == "on-disk-half-float" else None
+            manifest["live_queries"] = record_queries(args.host, index, dest, args.dim, args.queries, pos_of_doc, args.modes, simd_container)
         with open(dest / "manifest.json", "w", encoding="utf-8", newline="\n") as f:
             json.dump(manifest, f, indent=2)
             f.write("\n")

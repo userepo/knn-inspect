@@ -138,7 +138,7 @@ const CASES: &[Case] = &[
     // the float one under its own name.
     Case {
         set: "opensearch-3.9.0-binary/on-disk-half-float",
-        spaces: &["l2"],
+        spaces: &["l2", "innerproduct", "cosinesimil"],
         data_type: "half_float",
         format: "Faiss1040HalfFloatScalarQuantizedKnnVectorsFormat",
         encoding: VectorEncoding::Float32,
@@ -218,8 +218,8 @@ fn real_fixtures_describe_the_same_seven_fields() {
         }
     }
     assert_eq!(
-        seen, 22,
-        "three float, six fp16, three bf16, two byte, one binary, one binary-encoder, six on-disk"
+        seen, 24,
+        "three float, six fp16, three bf16, two byte, one binary, one binary-encoder, eight on-disk"
     );
 }
 

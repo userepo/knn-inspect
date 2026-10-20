@@ -15,8 +15,8 @@ use std::path::{Path, PathBuf};
 use knn_format::Error;
 use knn_format::envelope::Envelope;
 use knn_format::flat_vectors::{
-    FlatField, FlatVectorsMeta, KNN1040_HALF_FLOAT_CODEC, LUCENE99_CODEC, MetaFormat,
-    VectorEncoding,
+    FlatField, FlatVectorsMeta, KNN1040_HALF_FLOAT_CODEC, KNN1040_HALF_FLOAT_DATA_CODEC,
+    LUCENE99_CODEC, LUCENE99_DATA_CODEC, MetaFormat, VectorEncoding,
 };
 
 fn fixtures() -> PathBuf {
@@ -140,7 +140,7 @@ const CASES: &[Case] = &[
     },
     Case {
         set: "opensearch-3.9.0-binary/on-disk-half-float",
-        spaces: &["l2"],
+        spaces: &["l2", "innerproduct", "cosinesimil"],
         meta: ON_DISK_HALF_FLOAT_VEMF,
         format: MetaFormat::Knn1040HalfFloat,
         encoding: VectorEncoding::Float32,
@@ -200,8 +200,8 @@ fn real_fixtures_record_one_field_of_500_vectors() {
         }
     }
     assert_eq!(
-        seen, 22,
-        "three float, six fp16, three bf16, two byte, one binary, one binary-encoder, six on-disk"
+        seen, 24,
+        "three float, six fp16, three bf16, two byte, one binary, one binary-encoder, eight on-disk"
     );
 }
 
@@ -651,4 +651,55 @@ fn vector_rows_read_float32_and_fp16_alike() {
         ..field
     };
     assert!(byte_field.vector_rows(&vec).is_none());
+}
+
+#[test]
+fn each_format_names_its_codecs() {
+    for format in [MetaFormat::Lucene99, MetaFormat::Knn1040HalfFloat] {
+        assert_eq!(MetaFormat::of_codec(format.codec()), Some(format));
+    }
+    assert_eq!(MetaFormat::Lucene99.data_codec(), LUCENE99_DATA_CODEC);
+    assert_eq!(
+        MetaFormat::Knn1040HalfFloat.data_codec(),
+        KNN1040_HALF_FLOAT_DATA_CODEC
+    );
+    // A data codec, or any other, names no metadata format.
+    assert_eq!(MetaFormat::of_codec(LUCENE99_DATA_CODEC), None);
+    assert_eq!(
+        MetaFormat::of_codec("Lucene104ScalarQuantizedVectorsFormatMeta"),
+        None
+    );
+}
+
+#[test]
+fn vector_data_is_the_fields_bytes_whatever_their_encoding() {
+    let field = FlatField {
+        field_number: 0,
+        encoding: VectorEncoding::Byte,
+        similarity: None,
+        data_offset: 2,
+        data_length: 6,
+        dimension: 3,
+        count: 2,
+        component_bytes: 1,
+        sparse: false,
+    };
+    let vec: Vec<u8> = (0..10).collect();
+    assert_eq!(field.vector_data(&vec), Some(&vec[2..8]));
+    // Short of the end, or past it.
+    assert_eq!(field.vector_data(&vec[..7]), None);
+    let past = FlatField {
+        data_offset: 9,
+        ..field
+    };
+    assert_eq!(past.vector_data(&vec), None);
+    // Two-byte components: three of them a row.
+    let halves = FlatField {
+        encoding: VectorEncoding::Float32,
+        component_bytes: 2,
+        data_offset: 0,
+        count: 1,
+        ..field
+    };
+    assert_eq!(halves.vector_data(&vec), Some(&vec[..6]));
 }

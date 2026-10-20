@@ -2,7 +2,8 @@
 //! without a filter: its graph searched with Lucene's searcher over the
 //! field's quantized vectors (see [`crate::lucene_search`] and
 //! [`crate::quantized_scorer`]), and the results rescored against the
-//! field's float32 vectors in the `.vec`.
+//! field's vectors in the `.vec`: float32, or for a `half_float` field
+//! fp16.
 //!
 //! k-NN normalizes a cosine query first (`NormalizeVectorTransformer`, that
 //! is `VectorUtil.l2normalize`). With rescoring, its default for a field of
@@ -11,16 +12,17 @@
 //! where `f` is 2 for 1 bit and 1 for 2 and 4 bits, or the
 //! `oversample_factor` the query gives (`RescoreContext.getFirstPassK`).
 //! The graph is searched with a beam of `max(firstPassK, k, ef_search)`,
-//! `ef_search` being the index setting `index.knn.algo_param.ef_search`, 100
-//! unless set, and not the `efSearch` the file records. The first pass is
-//! cut to the results scoring at least the `firstPassK`-th
+//! `ef_search` being the index setting `index.knn.algo_param.ef_search`,
+//! 100 unless set, and not the `efSearch` the file records. The first pass
+//! is cut to the results scoring at least the `firstPassK`-th
 //! (`ResultUtil.reduceToTopK`); those are scored again, in doc order,
-//! against their float32 vectors (`ExactSearcher`), and the `k` best kept,
-//! a tie going to the lower doc id, a score below 0 or NaN dropped. Without
-//! rescoring, the beam is `max(k, ef_search)` and the first `k` results are
-//! kept. k-NN accepts a `k` up to [`MAX_K`].
+//! against their vectors in the `.vec` (`ExactSearcher`), and the `k` best
+//! kept, a tie going to the lower doc id, a score below 0 or NaN dropped.
+//! Without rescoring, the beam is `max(k, ef_search)` and the first `k`
+//! results are kept. k-NN accepts a `k` up to [`MAX_K`].
 //!
-//! The exact scores are Lucene's (`VectorSimilarityFunction.compare`):
+//! A float32 field's exact scores are Lucene's
+//! (`VectorSimilarityFunction.compare`):
 //! `1 / (1 + d^2)` for Euclidean, the dot product scaled as
 //! `scaleMaxInnerProductScore` for the maximum inner product, and
 //! `max((1 + cosine) / 2, 0)` for cosine, as k-NN's rescoring computes
@@ -43,22 +45,35 @@
 //! live result list the fixtures record recomputes bit for bit, and
 //! `tools/RescoreOracle.java` holds the sums to Lucene's, compiled, over
 //! every similarity and 29 dimensions from 1 to 384.
+//!
+//! A `half_float` field's `.vec` holds fp16 vectors (k-NN's half-float
+//! format, `KNN1040HalfFloatFlatVectorsValues`), which k-NN rescores with
+//! its native library instead (see [`fp16_exact_score`]): Faiss's scalar
+//! quantizer distance computer for `QT_fp16` over the decoded components,
+//! then k-NN's conversion to Lucene's scores. These sums are the library's
+//! that k-NN loads on an x86-64 CPU with AVX2,
+//! `libopensearchknn_simd_avx2`, unless the node's settings disable it; the
+//! AVX-512 and generic ones add in other orders. Every live result list the
+//! fixtures record of such a field recomputes bit for bit too, and
+//! `tools/Fp16RescoreOracle.java` holds the scores to k-NN's own, over
+//! every similarity and 27 dimensions from 1 to 384.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
-use knn_format::F32;
 use knn_format::faiss::{
-    FlatStorage, FourCc, HeaderKind, IdMapIndex, IndexHeader, Metric, Storage,
+    CodeFormat, FlatStorage, FourCc, HeaderKind, IdMapIndex, IndexHeader, Metric, QT_FP16,
+    ScalarQuantizer, SqStorage, Storage, f16_to_f32,
 };
-use knn_format::flat_vectors::FlatField;
+use knn_format::flat_vectors::{FlatField, VectorEncoding};
 use knn_format::quantized_vectors::{QuantizedField, QuantizedVectors, ScalarEncoding};
+use knn_format::{F32, U16};
 use rayon::prelude::*;
 
 use crate::lucene_search::{self, ScoredDoc};
 use crate::quantized_scorer::QuantizedScorer;
 use crate::quantizer::{Similarity, int_f32, java_max_f32, l2normalize};
-use crate::vector_util::bulk_sum;
+use crate::vector_util::{bulk_sum, dot_product, faiss_sum};
 use crate::{Error, Labels, Queries, Query, Result};
 
 /// k-NN's default `index.knn.algo_param.ef_search`, for indexes created by
@@ -76,22 +91,32 @@ pub const MAX_K: usize = 10_000;
 /// leaves a vector whose squared norm is within 1e-4 of 1 as it is
 /// (`VectorUtil.l2normalize`) and normalizes any other to within float32
 /// rounding of 1; the norm is summed here in f64, so twice that bound.
-const UNIT_TOLERANCE: f64 = 2e-4;
+pub const UNIT_TOLERANCE: f64 = 2e-4;
 
-/// The float32 vectors of the field of a graph without its vectors,
-/// `index`, as storage of the graph's metric, row `i` node `i`'s: `flat`
-/// is the field's record in the `.vemf`, which places them in `vec`, the
-/// `.vec`. They serve as the file's own vectors for ground truth and
-/// sampling, and are what k-NN rescores against.
+/// [`UNIT_TOLERANCE`] for a `half_float` field's fp16 vectors: k-NN
+/// normalizes the float32 vector, then rounds each component to the
+/// nearest fp16, at most 2^-11 of itself away (a subnormal's error adds
+/// far less), so the squared norm moves by at most about 2^-10 more,
+/// 1.1e-3 in all with the 1e-4 above; twice that.
+pub const FP16_UNIT_TOLERANCE: f64 = 2.2e-3;
+
+/// The vectors of the field of a graph without its vectors, `index`, as
+/// storage of the graph's metric, row `i` node `i`'s: `flat` is the field's
+/// record in the `.vemf`, which places them in `vec`, the `.vec`, as
+/// float32 components, or as fp16 ones in k-NN's half-float format, which
+/// are fp16 storage here. They serve as the file's own vectors for ground
+/// truth and sampling, and are what k-NN rescores against.
 ///
 /// # Errors
 ///
 /// Returns an error when the file holds its own vectors, its metric is
 /// neither L2 nor inner product, its ID map holds another number of
 /// labels than the graph has nodes or a label that is not a doc id, the
-/// `.vemf` places no float32 vectors in the `.vec`, they disagree with the
-/// graph on the dimension or the vector count, one holds a value that is
-/// not finite, which k-NN refuses, or, for a field of the cosine
+/// `.vemf` records no float32 or fp16 vectors, they disagree with the
+/// graph on the dimension or the vector count, the `.vemf` records them
+/// another length than they take, which Lucene's reader refuses, or places
+/// them past the end of the `.vec`, one holds a value that is not finite,
+/// which k-NN refuses, or, for a field of the cosine
 /// similarity, one is not of unit length: the ground truth of the graph's
 /// inner product is the cosine's only over k-NN's normalized vectors.
 pub fn field_vectors<'a>(
@@ -99,7 +124,7 @@ pub fn field_vectors<'a>(
     similarity: Similarity,
     flat: &FlatField,
     vec: &'a [u8],
-) -> Result<FlatStorage<'a>> {
+) -> Result<Storage<'a>> {
     if index.index.storage.is_some() {
         return Err(Error::HasVectors);
     }
@@ -131,49 +156,109 @@ pub fn field_vectors<'a>(
         return Err(Error::DocId { label });
     }
     shape(
-        "float32 dimension",
+        ".vec dimension",
         dimension,
         usize::try_from(flat.dimension).unwrap_or(usize::MAX),
     )?;
     shape(
-        "float32 vectors",
+        ".vec vectors",
         nodes,
         usize::try_from(flat.count).unwrap_or(usize::MAX),
     )?;
+    let fp16 = match (flat.encoding, flat.component_bytes) {
+        (VectorEncoding::Float32, 2) => true,
+        (VectorEncoding::Float32, 4) => false,
+        _ => return Err(Error::NoFloatVectors),
+    };
+    if flat.vector_bytes() != Some(flat.data_length) {
+        return Err(Error::VectorDataLength {
+            length: flat.data_length,
+            count: flat.count,
+            dimension: flat.dimension,
+            component_bytes: flat.component_bytes,
+        });
+    }
+    let data = flat.vector_data(vec).ok_or(Error::VectorsPastEnd {
+        offset: flat.data_offset,
+    })?;
+    let header = IndexHeader {
+        offset: 0,
+        d,
+        ntotal: i64::try_from(nodes).unwrap_or(i64::MAX),
+        is_trained: true,
+        metric_type: index.header.metric_type,
+        kind: HeaderKind::Float {
+            reserved: [1 << 20; 2],
+            metric_arg: None,
+        },
+    };
+    if fp16 {
+        let storage = SqStorage {
+            header,
+            quantizer: ScalarQuantizer {
+                offset: 0,
+                qtype: QT_FP16,
+                rangestat: 0,
+                rangestat_arg: 0.0,
+                d: u64::from(flat.dimension),
+                code_size: 2 * u64::from(flat.dimension),
+                trained: &[],
+            },
+            format: CodeFormat::Fp16,
+            codes: data,
+        };
+        let values = storage.halves().iter().map(|h| f16_to_f32(h.get()));
+        check_values(similarity, dimension, values, FP16_UNIT_TOLERANCE)?;
+        return Ok(Storage::Sq(storage));
+    }
+    // Float32 components, four bytes each, which `data` holds in full.
     let raw = flat.float32_components(vec).ok_or(Error::NoFloatVectors)?;
-    if let Some(i) = raw.iter().position(|x| !x.get().is_finite()) {
+    check_values(
+        similarity,
+        dimension,
+        raw.iter().map(|x| x.get()),
+        UNIT_TOLERANCE,
+    )?;
+    Ok(Storage::Flat(FlatStorage {
+        fourcc,
+        header,
+        codes: raw,
+    }))
+}
+
+/// `Ok` when every one of the field's `values`, row after row of
+/// `dimension`, is finite, and for the cosine similarity every row's
+/// squared norm, summed in f64, is within `tolerance` of 1.
+fn check_values(
+    similarity: Similarity,
+    dimension: usize,
+    values: impl Iterator<Item = f32> + Clone,
+    tolerance: f64,
+) -> Result<()> {
+    if let Some(i) = values.clone().position(|x| !x.is_finite()) {
         return Err(Error::NotFinite {
             node: i.checked_div(dimension).unwrap_or(0),
             component: i.checked_rem(dimension).unwrap_or(0),
         });
     }
-    if similarity == Similarity::Cosine && dimension > 0 {
-        for (node, row) in raw.chunks_exact(dimension).enumerate() {
-            let squared_norm: f64 = row
-                .iter()
-                .map(|x| f64::from(x.get()) * f64::from(x.get()))
-                .sum();
+    if similarity != Similarity::Cosine || dimension == 0 {
+        return Ok(());
+    }
+    let mut squared_norm = 0.0_f64;
+    for (i, x) in values.enumerate() {
+        squared_norm += f64::from(x) * f64::from(x);
+        if i % dimension == dimension - 1 {
             let off = (squared_norm - 1.0).abs();
-            if off.is_nan() || off > UNIT_TOLERANCE {
-                return Err(Error::NotNormalized { node, squared_norm });
+            if off.is_nan() || off > tolerance {
+                return Err(Error::NotNormalized {
+                    node: i / dimension,
+                    squared_norm,
+                });
             }
+            squared_norm = 0.0;
         }
     }
-    Ok(FlatStorage {
-        fourcc,
-        header: IndexHeader {
-            offset: 0,
-            d,
-            ntotal: i64::try_from(nodes).unwrap_or(i64::MAX),
-            is_trained: true,
-            metric_type: index.header.metric_type,
-            kind: HeaderKind::Float {
-                reserved: [1 << 20; 2],
-                metric_arg: None,
-            },
-        },
-        codes: raw,
-    })
+    Ok(())
 }
 
 /// `Ok` when the graph's and the field's counts of `what` agree.
@@ -210,8 +295,9 @@ pub struct Plan {
     pub beam: usize,
 }
 
-/// An `on_disk` field: its graph, its quantized vectors, and its float32
-/// vectors, which serve as the file's storage for ground truth.
+/// An `on_disk` field: its graph, its quantized vectors, and its vectors in
+/// the `.vec`, float32 or fp16, which serve as the file's storage for
+/// ground truth.
 #[derive(Debug)]
 pub struct OnDiskField<'a> {
     index: &'a IdMapIndex<'a>,
@@ -220,15 +306,15 @@ pub struct OnDiskField<'a> {
     centroid_dot_product: f32,
     similarity: Similarity,
     encoding: ScalarEncoding,
-    raw: FlatStorage<'a>,
+    raw: Storage<'a>,
     labels: Labels,
 }
 
 impl<'a> OnDiskField<'a> {
     /// The field of a graph without its vectors, `index`: `field` its record
     /// in the `.vemq`, `records` its records in the `.veq`, and `flat` its
-    /// record in the `.vemf`, which places its float32 vectors in `vec`, the
-    /// `.vec`, in the same order.
+    /// record in the `.vemf`, which places its vectors in `vec`, the `.vec`,
+    /// in the same order, float32 or fp16 (see [`field_vectors`]).
     ///
     /// # Errors
     ///
@@ -278,11 +364,12 @@ impl<'a> OnDiskField<'a> {
         })
     }
 
-    /// The float32 vectors as storage of the graph's metric, row `i` node
-    /// `i`'s: for ground truth, sampling, and scoring, as a file's own.
+    /// The vectors in the `.vec` as storage of the graph's metric, row `i`
+    /// node `i`'s, float32 or fp16 (see [`field_vectors`]): for ground
+    /// truth, sampling, and scoring, as a file's own.
     #[must_use]
     pub fn storage(&self) -> Storage<'a> {
-        Storage::Flat(self.raw)
+        self.raw
     }
 
     /// The field's similarity function.
@@ -342,7 +429,7 @@ impl<'a> OnDiskField<'a> {
     /// query has a norm of 0, or the search reaches a node without a
     /// record.
     pub fn search(&self, query: &[f32], plan: &Plan) -> Result<Vec<ScoredDoc>> {
-        let d = self.raw.header.d;
+        let d = self.raw.header().d;
         if usize::try_from(d).ok() != Some(query.len()) {
             return Err(Error::DimensionMismatch {
                 file: usize::try_from(d).unwrap_or(0),
@@ -432,8 +519,8 @@ impl<'a> OnDiskField<'a> {
     }
 
     /// `ExactSearcher.exactNearestNeighborSearch` over the first pass's
-    /// docs: scored again in doc order against their float32 vectors, the
-    /// `k` best kept.
+    /// docs: scored again in doc order against their vectors in the `.vec`,
+    /// the `k` best kept.
     fn rescore(&self, mut docs: Vec<ScoredDoc>, q: &[f32], k: usize) -> Result<Vec<ScoredDoc>> {
         docs.sort_by_key(|h| h.doc);
         // getNumberOfMatchedDocs: the docs to score, whatever they score.
@@ -444,10 +531,9 @@ impl<'a> OnDiskField<'a> {
             let Some(node) = self.labels.node(i64::from(doc)) else {
                 continue;
             };
-            let row = self.raw.vector(node).ok_or(Error::Unscored { node })?;
             scored.push(ScoredDoc {
                 doc,
-                score: exact_score(self.similarity, q, row),
+                score: self.exact(q, node).ok_or(Error::Unscored { node })?,
             });
         }
         // BulkVectorScorer yields a doc only when it scores at least its
@@ -462,6 +548,24 @@ impl<'a> OnDiskField<'a> {
         }
         Ok(collect_top_k(&scored, k))
     }
+
+    /// Node `node`'s score against `q` as k-NN rescores the field's vector,
+    /// or `None` when it is not stored in full.
+    fn exact(&self, q: &[f32], node: usize) -> Option<f32> {
+        match self.raw {
+            Storage::Flat(s) => Some(exact_score(self.similarity, q, s.vector(node)?)),
+            Storage::Sq(s) => Some(fp16_exact_score(self.similarity, q, fp16_row(&s, node)?)),
+            Storage::Binary(_) => None,
+        }
+    }
+}
+
+/// Row `i` of fp16 storage, as its components' bits, or `None` when it is
+/// not stored in full.
+fn fp16_row<'a>(storage: &SqStorage<'a>, i: usize) -> Option<&'a [U16]> {
+    let d = usize::try_from(storage.header.d).ok()?;
+    let start = i.checked_mul(d)?;
+    storage.halves().get(start..start.checked_add(d)?)
 }
 
 /// `RescoreContext.getFirstPassK`: `ceil(k x f)` in float32, from 100 to
@@ -595,6 +699,47 @@ pub fn exact_score(similarity: Similarity, q: &[f32], v: &[F32]) -> f32 {
     }
 }
 
+/// The score k-NN rescores a `half_float` field's stored fp16 vector `v`
+/// with against the query `q`, whose cosine query it has normalized (see
+/// [`l2normalize`]), on the fixtures' host (see the module docs): for the
+/// similarities k-NN's native library has a kernel for, its
+/// (`DefaultFaissSimilarityFunction`), Faiss's scalar quantizer distance
+/// computer for `QT_fp16` over `v`'s decoded components, the squared L2
+/// distance or the inner product, converted to Lucene's score
+/// (`FaissScoreToLuceneScoreTransform`): `1 / (1 + d^2)` for Euclidean,
+/// the inner product scaled as `scaleMaxInnerProductScore` for the maximum
+/// inner product, and `(1 + ip) / 2`, clamped to 0 to 1, for cosine, the
+/// inner product standing for the cosine of k-NN's unit vectors. For the
+/// dot product, which has none, Lucene's function over the decoded vector,
+/// `max((1 + dot) / 2, 0)`, its dot product `VectorUtil.dotProduct`'s; k-NN
+/// records the dot product for no space type of a Faiss field.
+/// Components past the shorter of the two are not read.
+#[must_use]
+pub fn fp16_exact_score(similarity: Similarity, q: &[f32], v: &[U16]) -> f32 {
+    let decoded = || v.iter().map(|h| f16_to_f32(h.get()));
+    let inner_product = || faiss_sum(q, decoded(), |acc, a, b| a.mul_add(b, acc));
+    match similarity {
+        Similarity::Euclidean => {
+            let d = faiss_sum(q, decoded(), |acc, a, b| {
+                let diff = a - b;
+                diff.mul_add(diff, acc)
+            });
+            1.0 / (1.0 + d)
+        }
+        Similarity::MaximumInnerProduct => {
+            let ip = inner_product();
+            if ip < 0.0 { 1.0 / (1.0 - ip) } else { 1.0 + ip }
+        }
+        // k-NN's `(1 + ip) * 0.5`, the same float32 as a halving, clamped
+        // as its kernel clamps it: a NaN passes through.
+        Similarity::Cosine => half_of_one_plus(inner_product()).clamp(0.0, 1.0),
+        Similarity::DotProduct => {
+            let v: Vec<f32> = decoded().collect();
+            java_max_f32(half_of_one_plus(dot_product(q, &v)), 0.0)
+        }
+    }
+}
+
 /// `(1 + x) / 2` in float32, as Lucene computes it: `1 + x` overflows
 /// for a huge `x`, where `f32::midpoint` would not.
 #[expect(
@@ -689,6 +834,112 @@ mod tests {
             collect_top_k(&[hit(1, f32::NAN), hit(2, 0.1)], 2),
             [hit(2, 0.1)]
         );
+    }
+
+    #[test]
+    fn fp16_scores_are_k_nns() {
+        // Values fp16 holds exactly: zeros and normal ones.
+        let v = |x: &[f32]| {
+            x.iter()
+                .map(|&c| {
+                    let b = c.to_bits();
+                    let sign = (b >> 16) & 0x8000;
+                    let bits = if c == 0.0 {
+                        sign
+                    } else {
+                        sign | ((((b >> 23) & 0xff) - 112) << 10) | ((b >> 13) & 0x3ff)
+                    };
+                    let h = U16::new(u16::try_from(bits).unwrap());
+                    assert_eq!(f16_to_f32(h.get()), c);
+                    h
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            fp16_exact_score(Similarity::Euclidean, &[1.0, 0.0], &v(&[0.0, 1.0])),
+            1.0 / 3.0
+        );
+        assert_eq!(
+            fp16_exact_score(
+                Similarity::MaximumInnerProduct,
+                &[1.0, 2.0],
+                &v(&[3.0, 4.0])
+            ),
+            12.0
+        );
+        assert_eq!(
+            fp16_exact_score(
+                Similarity::MaximumInnerProduct,
+                &[1.0, 0.0],
+                &v(&[-3.0, 4.0])
+            ),
+            0.25
+        );
+        // The kernel's inner product: (1 + 0.5) / 2, where Lucene's cosine
+        // of the two, which normalizes, is 1.
+        assert_eq!(
+            fp16_exact_score(Similarity::Cosine, &[1.0, 0.0], &v(&[0.5, 0.0])),
+            0.75
+        );
+        assert_eq!(
+            exact_score(
+                Similarity::Cosine,
+                &[1.0, 0.0],
+                &[F32::new(0.5), F32::new(0.0)]
+            ),
+            1.0
+        );
+        // Clamped to 0 to 1, where Lucene's cosine clamps only below.
+        assert_eq!(
+            fp16_exact_score(Similarity::Cosine, &[1.0, 0.0], &v(&[-2.0, 0.0])),
+            0.0
+        );
+        assert_eq!(
+            fp16_exact_score(Similarity::Cosine, &[1.0, 0.0], &v(&[2.0, 0.0])),
+            1.0
+        );
+        assert_eq!(
+            fp16_exact_score(Similarity::DotProduct, &[0.5, 0.5], &v(&[0.5, 0.5])),
+            0.75
+        );
+        assert_eq!(
+            fp16_exact_score(Similarity::DotProduct, &[1.0, 0.0], &v(&[-2.0, 0.0])),
+            0.0
+        );
+    }
+
+    #[test]
+    fn unit_length_is_held_to_its_tolerance() {
+        // One component, its square the squared norm: within each
+        // tolerance of 1, and just past it.
+        let row = |squared_norm: f64| {
+            #[expect(clippy::cast_possible_truncation, reason = "a test value")]
+            let x = squared_norm.sqrt() as f32;
+            [x]
+        };
+        let check = |squared_norm: f64, tolerance: f64| {
+            check_values(
+                Similarity::Cosine,
+                1,
+                row(squared_norm).into_iter(),
+                tolerance,
+            )
+        };
+        for (tolerance, inside, outside) in [
+            (UNIT_TOLERANCE, 1.0 + 1.9e-4, 1.0 + 2.1e-4),
+            (FP16_UNIT_TOLERANCE, 1.0 - 2.1e-3, 1.0 + 2.3e-3),
+        ] {
+            assert!(check(inside, tolerance).is_ok(), "{tolerance}");
+            assert!(
+                matches!(
+                    check(outside, tolerance),
+                    Err(Error::NotNormalized { node: 0, .. })
+                ),
+                "{tolerance}"
+            );
+        }
+        // Under another similarity, any length.
+        assert!(check_values(Similarity::Euclidean, 1, [3.0].into_iter(), UNIT_TOLERANCE).is_ok());
     }
 
     #[test]

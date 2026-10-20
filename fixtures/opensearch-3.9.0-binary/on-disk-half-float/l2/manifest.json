@@ -2,7 +2,7 @@
   "opensearch_version": "3.9.0",
   "knn_plugin_version": "3.9.0.0",
   "index": "knn-l2-on-disk-half-float",
-  "index_uuid": "Lj6tNSIjSQu3-tZBx2_8TA",
+  "index_uuid": "CoR9CVHnTWi0wLw0aiuaRg",
   "segment": "_2",
   "compound_files": false,
   "encoding": "on-disk-half-float",
@@ -637,5 +637,32 @@
       "size": 361
     }
   ],
-  "compression_level": "32x"
+  "compression_level": "32x",
+  "live_queries": {
+    "queries_file": "queries.f32",
+    "queries_seed": 20261020,
+    "warm_up_queries": 300,
+    "warm_up_oversample_factor": 50.0,
+    "results_files": {
+      "results.jsonl": {
+        "k": 10,
+        "query": {}
+      },
+      "results-no-rescore.jsonl": {
+        "k": 10,
+        "query": {
+          "rescore": false
+        }
+      },
+      "results-oversample-30.jsonl": {
+        "k": 10,
+        "query": {
+          "rescore": {
+            "oversample_factor": 30.0
+          }
+        }
+      }
+    },
+    "simd_library": "opensearchknn_simd_avx2"
+  }
 }

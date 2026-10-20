@@ -18,7 +18,9 @@ use knn_recall::quantizer::Similarity;
 use knn_recall::{Labels, Queries, Recall};
 use serde::Serialize;
 
-use crate::scan::quantized::{Graph, Quantized, field_files, similarity_name};
+use crate::scan::quantized::{
+    FieldFiles, Graph, Quantized, RawFiles, field_files, similarity_name,
+};
 use crate::scan::shown;
 
 /// Arguments of `recall`.
@@ -112,7 +114,7 @@ struct OwnSearch {
     #[serde(skip_serializing_if = "Option::is_none")]
     beam: Option<usize>,
     /// For a graph without its vectors: whether the first pass was
-    /// rescored against the field's float32 vectors.
+    /// rescored against the field's vectors in the `.vec`.
     #[serde(skip_serializing_if = "Option::is_none")]
     rescore: Option<bool>,
     /// For a graph without its vectors, when rescored: the first pass's
@@ -178,38 +180,43 @@ pub fn run(args: &RecallArgs) -> anyhow::Result<ExitCode> {
 }
 
 /// `recall` on a graph without its vectors: the field the segment's `.fnm`
-/// ties it to, searched as k-NN searches it, against the field's float32
-/// vectors in the `.vec`. Result lists from elsewhere are scored against
-/// the `.vec` alone, without the quantized files.
+/// ties it to, searched as k-NN searches it, against the field's vectors
+/// in the `.vec`, float32, or fp16 for a `half_float` field. Result lists
+/// from elsewhere are scored against the `.vec` alone, without the
+/// quantized files.
 fn run_on_disk(args: &RecallArgs, index: &IdMapIndex<'_>) -> anyhow::Result<ExitCode> {
     let path = &args.file;
     let at = |why: String| anyhow::anyhow!("{}: {why}", path.display());
     let files = field_files(path).map_err(at)?;
     let ext = |ext: &str| shown(&files.vemq.with_extension(ext));
-    let flat = FlatVectorsMeta::parse(files.raw_meta.bytes())
-        .with_context(|| format!("reading {}", ext("vemf")))?;
-    let flat_field = flat
-        .fields
-        .iter()
-        .find(|f| u32::try_from(f.field_number).ok() == Some(files.number))
-        .with_context(|| format!("{}: no field {}", ext("vemf"), files.number))?;
-    let vec = files.raw.bytes();
-    // The .fnm's similarity, as the .vemf records it for the field.
-    if let Some(recorded) = flat_field.similarity
-        && recorded != files.similarity
-    {
-        bail!(
-            "{}: {} records the {} similarity for field {}, the .fnm the {}",
-            path.display(),
-            ext("vemf"),
-            similarity_name(recorded).unwrap_or("?"),
-            files.number,
-            similarity_name(files.similarity).unwrap_or("?")
+    if let Some(p) = &args.results {
+        let raw = files.raw().map_err(at)?;
+        let flat_field = flat_field(&files, &raw)?;
+        // The .fnm's similarity, as the .vemf records it for the field;
+        // scan's check holds both to the .vemq's instead.
+        if let Some(recorded) = flat_field.similarity
+            && recorded != files.similarity
+        {
+            bail!(
+                "{}: {} records the {} similarity for field {}, the .fnm the {}",
+                path.display(),
+                ext("vemf"),
+                similarity_name(recorded).unwrap_or("?"),
+                files.number,
+                similarity_name(files.similarity).unwrap_or("?")
+            );
+        }
+        return score_on_disk(
+            args,
+            index,
+            files.similarity,
+            &flat_field,
+            raw.vec.bytes(),
+            p,
         );
     }
-    if let Some(p) = &args.results {
-        return score_on_disk(args, index, files.similarity, flat_field, vec, p);
-    }
+    // The field passes scan's check before any of its files is opened
+    // here, so that the fault named first is the one scan names.
     let Quantized {
         meta,
         data: data_file,
@@ -218,6 +225,9 @@ fn run_on_disk(args: &RecallArgs, index: &IdMapIndex<'_>) -> anyhow::Result<Exit
     if let Some(warning) = warning {
         eprintln!("warning: {}: {warning}", path.display());
     }
+    let raw = files.raw().map_err(at)?;
+    let flat_field = flat_field(&files, &raw)?;
+    let vec = raw.vec.bytes();
     let field = meta
         .fields
         .iter()
@@ -227,7 +237,7 @@ fn run_on_disk(args: &RecallArgs, index: &IdMapIndex<'_>) -> anyhow::Result<Exit
         DataFile::parse(data_file.bytes()).with_context(|| format!("reading {}", ext("veq")))?;
     let records = QuantizedVectors::open(data_file.bytes(), &data, field)
         .with_context(|| format!("reading {}", ext("veq")))?;
-    let on_disk = OnDiskField::new(index, field, records, flat_field, vec)
+    let on_disk = OnDiskField::new(index, field, records, &flat_field, vec)
         .with_context(|| format!("{}: the field's files", path.display()))?;
     let storage = on_disk.storage();
     let dimension = knn_recall::query_dimension(&storage)
@@ -270,9 +280,21 @@ fn run_on_disk(args: &RecallArgs, index: &IdMapIndex<'_>) -> anyhow::Result<Exit
     )
 }
 
+/// The field's record in its `.vemf`, `raw.meta`.
+fn flat_field(files: &FieldFiles, raw: &RawFiles) -> anyhow::Result<FlatField> {
+    let vemf = || shown(&files.vemq.with_extension("vemf"));
+    let flat =
+        FlatVectorsMeta::parse(raw.meta.bytes()).with_context(|| format!("reading {}", vemf()))?;
+    flat.fields
+        .iter()
+        .find(|f| u32::try_from(f.field_number).ok() == Some(files.number))
+        .copied()
+        .with_context(|| format!("{}: no field {}", vemf(), files.number))
+}
+
 /// `recall --results` on a graph without its vectors: the lists scored
-/// against the field's float32 vectors in `vec`, which `flat` places, the
-/// `.fnm` recording `similarity` for the field.
+/// against the field's vectors in `vec`, which `flat` places, the `.fnm`
+/// recording `similarity` for the field.
 fn score_on_disk(
     args: &RecallArgs,
     index: &IdMapIndex<'_>,
@@ -285,10 +307,8 @@ fn score_on_disk(
     let similarity = Similarity::from_ordinal(similarity).ok_or(knn_recall::Error::Similarity {
         ordinal: similarity,
     })?;
-    let storage = Storage::Flat(
-        field_vectors(index, similarity, flat, vec)
-            .with_context(|| format!("{}: the field's float32 vectors", path.display()))?,
-    );
+    let storage = field_vectors(index, similarity, flat, vec)
+        .with_context(|| format!("{}: the field's vectors in the .vec", path.display()))?;
     let dimension = knn_recall::query_dimension(&storage)
         .with_context(|| format!("{}: no query can match it", path.display()))?;
     let (queries, sample) = load_queries(args, &storage, dimension)?;

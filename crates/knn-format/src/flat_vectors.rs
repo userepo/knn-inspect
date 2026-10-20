@@ -33,6 +33,14 @@ pub const LUCENE99_CODEC: &str = "Lucene99FlatVectorsFormatMeta";
 /// The codec name k-NN's `KNN1040HalfFloatFlatVectorsFormat` writes.
 pub const KNN1040_HALF_FLOAT_CODEC: &str = "KNN1040HalfFloatFlatVectorsFormatMeta";
 
+/// The codec name of the `.vec` Lucene's `Lucene99FlatVectorsFormat`
+/// writes.
+pub const LUCENE99_DATA_CODEC: &str = "Lucene99FlatVectorsFormatData";
+
+/// The codec name of the `.vec` k-NN's `KNN1040HalfFloatFlatVectorsFormat`
+/// writes.
+pub const KNN1040_HALF_FLOAT_DATA_CODEC: &str = "KNN1040HalfFloatFlatVectorsFormatData";
+
 /// The only codec version either format has written.
 pub const VERSION: i32 = 0;
 
@@ -62,12 +70,31 @@ pub enum MetaFormat {
 }
 
 impl MetaFormat {
+    /// The format whose `.vemf` codec name is `codec`, if either is.
+    #[must_use]
+    pub fn of_codec(codec: &str) -> Option<Self> {
+        match codec {
+            LUCENE99_CODEC => Some(Self::Lucene99),
+            KNN1040_HALF_FLOAT_CODEC => Some(Self::Knn1040HalfFloat),
+            _ => None,
+        }
+    }
+
     /// The codec name the format writes.
     #[must_use]
     pub fn codec(self) -> &'static str {
         match self {
             Self::Lucene99 => LUCENE99_CODEC,
             Self::Knn1040HalfFloat => KNN1040_HALF_FLOAT_CODEC,
+        }
+    }
+
+    /// The codec name of the `.vec` the format writes.
+    #[must_use]
+    pub fn data_codec(self) -> &'static str {
+        match self {
+            Self::Lucene99 => LUCENE99_DATA_CODEC,
+            Self::Knn1040HalfFloat => KNN1040_HALF_FLOAT_DATA_CODEC,
         }
     }
 }
@@ -118,6 +145,16 @@ impl FlatField {
             .checked_mul(u64::from(self.component_bytes))
     }
 
+    /// The bytes of the field's vectors in `vec`, the `.vec` this record
+    /// describes, row after row, however their components are encoded:
+    /// `None` unless all of them are inside the file.
+    #[must_use]
+    pub fn vector_data<'a>(&self, vec: &'a [u8]) -> Option<&'a [u8]> {
+        let start = usize::try_from(self.data_offset).ok()?;
+        let length = usize::try_from(self.vector_bytes()?).ok()?;
+        vec.get(start..start.checked_add(length)?)
+    }
+
     /// The field's vectors in `vec`, the `.vec` this record describes, as
     /// one slice of float32 components, row after row: `None` unless the
     /// field holds float32 components, four bytes each, all of them inside
@@ -128,9 +165,7 @@ impl FlatField {
         if self.encoding != VectorEncoding::Float32 || self.component_bytes != 4 {
             return None;
         }
-        let start = usize::try_from(self.data_offset).ok()?;
-        let length = usize::try_from(self.vector_bytes()?).ok()?;
-        <[crate::F32]>::ref_from_bytes(vec.get(start..start.checked_add(length)?)?).ok()
+        <[crate::F32]>::ref_from_bytes(self.vector_data(vec)?).ok()
     }
 
     /// The field's vectors in `vec`, the `.vec` this record describes, as
@@ -142,10 +177,8 @@ impl FlatField {
         if self.encoding != VectorEncoding::Float32 || !matches!(self.component_bytes, 2 | 4) {
             return None;
         }
-        let start = usize::try_from(self.data_offset).ok()?;
-        let length = usize::try_from(self.vector_bytes()?).ok()?;
         Some(VectorRows {
-            data: vec.get(start..start.checked_add(length)?)?,
+            data: self.vector_data(vec)?,
             component_bytes: usize::try_from(self.component_bytes).ok()?,
             dimension: usize::try_from(self.dimension).ok()?,
         })
@@ -159,11 +192,8 @@ impl FlatField {
         if self.encoding != VectorEncoding::Float32 || self.component_bytes != 4 {
             return None;
         }
-        let start = usize::try_from(self.data_offset).ok()?;
-        let length = usize::try_from(self.vector_bytes()?).ok()?;
-        let data = vec.get(start..start.checked_add(length)?)?;
         Some(Float32Rows {
-            words: data.as_chunks::<4>().0,
+            words: self.vector_data(vec)?.as_chunks::<4>().0,
             dimension: usize::try_from(self.dimension).ok()?,
         })
     }

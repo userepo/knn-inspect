@@ -1,6 +1,7 @@
 //! The cross-check of a graph without its vectors against the
 //! scalar-quantized vectors Lucene keeps for it: the `.vemq` and `.veq` of
-//! the segment, and the float32 vectors in the `.vec` beside them.
+//! the segment, and the vectors in the `.vec` beside them, float32, or
+//! fp16 for a `half_float` field.
 //!
 //! The segment's field infos (`.fnm`) tie the native file to its field:
 //! k-NN names the file for the field, and the field's per-field format
@@ -14,10 +15,13 @@ use knn_format::NativeFile;
 use knn_format::envelope::{Envelope, Header, SEGMENT_ID_LEN};
 use knn_format::faiss::{IdMapIndex, Metric};
 use knn_format::field_infos::{FieldInfo, FieldInfos};
-use knn_format::flat_vectors::{FlatField, FlatVectorsMeta, VectorEncoding, VectorRows};
+use knn_format::flat_vectors::{
+    FlatField, FlatVectorsMeta, MetaFormat, VectorEncoding, VectorRows,
+};
 use knn_format::quantized_vectors::{
     DataFile, QuantizedField, QuantizedVectors, QuantizedVectorsMeta, ScalarEncoding,
 };
+use knn_recall::on_disk::{FP16_UNIT_TOLERANCE, UNIT_TOLERANCE};
 use serde::Serialize;
 
 use super::{CrossCheck, has_codec_header, lucene_footer, segment_files, segment_of, shown};
@@ -214,10 +218,10 @@ pub(super) fn lucene_quantized(path: &Path, graph: Graph, space: Option<Space>) 
 }
 
 /// The files of the field the segment's `.fnm` ties a graph without its
-/// vectors to: what `recall` searches. The `.vemf` and `.vec` are held to
-/// a sound footer, the `.fnm`'s segment, and the segment suffix their
-/// name gives; the field as a whole, before it is searched, to all `scan`
-/// holds it to ([`Self::quantized`]).
+/// vectors to: what `recall` searches. They are opened as they are
+/// needed: the `.vemf` and `.vec` by [`Self::raw`], held to what `scan`
+/// holds them to; the `.vemq` and `.veq` by [`Self::quantized`], once the
+/// field as a whole passes `scan`'s check.
 pub(crate) struct FieldFiles {
     /// The `.vemq`; the `.veq`, `.vemf`, and `.vec` share its name.
     pub(crate) vemq: PathBuf,
@@ -225,12 +229,16 @@ pub(crate) struct FieldFiles {
     pub(crate) number: u32,
     /// Lucene's similarity ordinal, as the `.fnm` records it.
     pub(crate) similarity: i32,
-    /// The `.vemf`.
-    pub(crate) raw_meta: NativeFile,
-    /// The `.vec`.
-    pub(crate) raw: NativeFile,
     /// The field as the `.fnm` ties the native file to it.
     tied: Tied,
+}
+
+/// The `.vemf` and `.vec` of a field, opened.
+pub(crate) struct RawFiles {
+    /// The `.vemf`.
+    pub(crate) meta: NativeFile,
+    /// The `.vec`.
+    pub(crate) vec: NativeFile,
 }
 
 /// The `.vemq` and `.veq` of a field `scan`'s check passes, and what it
@@ -246,12 +254,29 @@ pub(crate) struct Quantized {
 }
 
 impl FieldFiles {
+    /// The `.vemf` and `.vec`, opened and held to what `scan` holds them
+    /// to: sound, of the `.fnm`'s segment and the suffix their name gives,
+    /// and in the flat format the field's format keeps its raw vectors in.
+    ///
+    /// # Errors
+    ///
+    /// Returns why not, as text that names the file.
+    pub(crate) fn raw(&self) -> Result<RawFiles, String> {
+        let suffix = name_suffix(&self.vemq).unwrap_or_default();
+        let (meta, vec) = raw_files(&self.vemq, &self.tied.segment_id, suffix)
+            .and_then(|(meta, vec)| {
+                raw_codecs(&self.vemq, suffix, &meta, &vec).map(|()| (meta, vec))
+            })
+            .map_err(|(_, why)| why)?;
+        Ok(RawFiles { meta, vec })
+    }
+
     /// The `.vemq`, read, and the `.veq` beside it, once the field passes
     /// the check `scan` makes of it against `graph` (`lucene_quantized`):
     /// the `.fnm` and the `.vemq` agree, the field fits the graph, its
     /// records are as Lucene writes them, and the `.vemf` and `.vec`
-    /// describe its float32 vectors, all of them finite. What the check
-    /// only warns of is given with them.
+    /// describe its vectors, float32 or fp16, all of them finite. What the
+    /// check only warns of is given with them.
     ///
     /// # Errors
     ///
@@ -309,16 +334,13 @@ impl FieldFiles {
 }
 
 /// Finds the files of the field the native file at `path` is a graph of,
-/// through the segment's `.fnm`, as [`lucene_quantized`] does, and opens
-/// its `.vemf` and `.vec`, held to what `scan` holds them to.
+/// through the segment's `.fnm`, as [`lucene_quantized`] does; they are
+/// opened by [`FieldFiles::raw`] and [`FieldFiles::quantized`].
 ///
 /// # Errors
 ///
 /// Returns why not, as text: the `.fnm` is missing, unread, not the
-/// segment's, or records the field otherwise than k-NN does; the field is
-/// a `half_float` one, whose fp16 vectors k-NN rescores with native
-/// kernels this tool does not port; or its `.vemf` or `.vec` is missing,
-/// damaged, or not of the `.fnm`'s segment and suffix.
+/// segment's, or records the field otherwise than k-NN does.
 pub(crate) fn field_files(path: &Path) -> Result<FieldFiles, String> {
     let t = match tie(path, None) {
         Tie::Field(t) => t,
@@ -329,20 +351,10 @@ pub(crate) fn field_files(path: &Path) -> Result<FieldFiles, String> {
             ));
         }
     };
-    if t.format == HALF_FLOAT_QUANTIZED_FORMAT {
-        return Err(format!(
-            "field {:?} is a half_float field, in {}: recall does not read its fp16 vectors, which k-NN rescores with native kernels this tool does not port",
-            t.info.name, t.format
-        ));
-    }
-    let suffix = name_suffix(&t.vemq).unwrap_or_default().to_owned();
-    let (raw_meta, raw) = raw_files(&t.vemq, &t.segment_id, &suffix).map_err(|(_, why)| why)?;
     Ok(FieldFiles {
         vemq: t.vemq.clone(),
         number: t.info.number,
         similarity: t.info.vector_similarity,
-        raw_meta,
-        raw,
         tied: t,
     })
 }
@@ -361,10 +373,8 @@ enum Tie {
 /// The field the `.fnm` ties the native file to.
 struct Tied {
     info: FieldInfo,
-    /// The quantized format the `.fnm` records it in, one of
-    /// [`QUANTIZED_FORMATS`].
-    format: String,
-    /// The `.vemq` the field's per-field format and suffix name.
+    /// The `.vemq` the field's per-field format, one of
+    /// [`QUANTIZED_FORMATS`], and suffix name.
     vemq: PathBuf,
     /// The segment id the `.fnm`'s header names.
     segment_id: [u8; SEGMENT_ID_LEN],
@@ -477,7 +487,6 @@ fn tie(path: &Path, space: Option<Space>) -> Tie {
     match quantized_field(&infos, field, space) {
         Ok((info, format, suffix)) => Tie::Field(Tied {
             info: info.clone(),
-            format: format.to_owned(),
             vemq: dir.join(format!("{segment}_{format}_{suffix}.vemq")),
             segment_id,
         }),
@@ -499,7 +508,8 @@ fn si_id(native: &Path) -> Option<[u8; SEGMENT_ID_LEN]> {
 
 /// The `.fnm`'s record of `field` and its per-field format and that
 /// format's suffix, when it is a k-NN Faiss field of the `--space` given in
-/// a quantized format; otherwise why not, as the outcome to report.
+/// a quantized format, recorded with the similarity k-NN records for its
+/// space type; otherwise why not, as the outcome to report.
 fn quantized_field<'a>(
     infos: &'a FieldInfos,
     field: &str,
@@ -560,6 +570,27 @@ fn quantized_field<'a>(
         return mismatch(format!(
             "the .fnm records the vectors format suffix {suffix:?} for field {field:?}, which is not a number"
         ));
+    }
+    // k-NN records its space type's similarity for the field, of one of
+    // the float spaces in these formats; where the two differ, its exact
+    // search, which rescores, scores with the space type's through
+    // Lucene's float32 scorer, whatever the vectors
+    // (`VectorScorers.createSimilarityOverrideScorer`).
+    if let Some(recorded) = info.knn_space_type() {
+        let Some(own) = [Space::L2, Space::InnerProduct, Space::Cosine]
+            .into_iter()
+            .find(|s| s.name() == recorded)
+        else {
+            return mismatch(format!(
+                "the .fnm records the {recorded} space type for field {field:?}, which k-NN gives no field in {format}"
+            ));
+        };
+        if !similarity_is(info.vector_similarity, own) {
+            return mismatch(format!(
+                "the .fnm records the {} similarity for field {field:?}, not the one k-NN records for its {recorded} space type",
+                similarity_name(info.vector_similarity).unwrap_or("unknown")
+            ));
+        }
     }
     Ok((info, format, suffix))
 }
@@ -1109,9 +1140,9 @@ fn not_compared(why: &str) -> Early {
     )
 }
 
-/// Compares each record's additional correction with the one the float32
-/// vector of the same ordinal gives, in the field of the same number in
-/// the `.vec` beside the `.vemq`.
+/// Compares each record's additional correction with the one the vector
+/// of the same ordinal gives, float32 or fp16, in the field of the same
+/// number in the `.vec` beside the `.vemq`.
 fn against_vec(
     vemq: &Path,
     field: &QuantizedField,
@@ -1119,7 +1150,9 @@ fn against_vec(
 ) -> (CrossCheck, String) {
     let vec = vemq.with_extension("vec");
     let header = records.header;
-    let (meta_file, vec_file) = match raw_files(vemq, &header.segment_id, &header.suffix) {
+    let (meta_file, vec_file) = match raw_files(vemq, &header.segment_id, &header.suffix)
+        .and_then(|files| raw_codecs(vemq, &header.suffix, &files.0, &files.1).map(|()| files))
+    {
         Ok(files) => files,
         Err(early) => return early,
     };
@@ -1163,8 +1196,16 @@ fn against_vec(
             ),
         );
     }
-    match corrections_doubt(field, records, &rows) {
-        None => (
+    // Both doubts, each the cosine field's vectors' or the records' own.
+    let doubts: Vec<String> = [
+        unit_length_doubt(field, &rows),
+        corrections_doubt(field, records, &rows),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if doubts.is_empty() {
+        (
             CrossCheck::Match,
             format!(
                 "corrections agree with the {} {}vectors of {}",
@@ -1176,11 +1217,12 @@ fn against_vec(
                 },
                 shown(&vec)
             ),
-        ),
-        Some(why) => (
+        )
+    } else {
+        (
             CrossCheck::Warning,
-            format!("against {}: {why}", shown(&vec)),
-        ),
+            format!("against {}: {}", shown(&vec), doubts.join("; ")),
+        )
     }
 }
 
@@ -1189,7 +1231,8 @@ fn against_vec(
 /// the `.fnm`'s segment's and the `.vemq`'s name's. The `.vec` check is
 /// skipped for a graph without its vectors, so a damaged or missing one is
 /// reported here: Lucene opens them with the quantized files, which a
-/// compound segment would keep inside the `.cfs` too.
+/// compound segment would keep inside the `.cfs` too. Their formats are
+/// [`raw_codecs`]'s to check.
 fn raw_files(
     vemq: &Path,
     segment_id: &[u8; SEGMENT_ID_LEN],
@@ -1243,6 +1286,65 @@ fn raw_files(
         }
     }
     Ok((meta_file, vec_file))
+}
+
+/// `Ok` when the `.vemf` and `.vec` beside the `.vemq`, `meta_file` and
+/// `vec_file`, are in the flat format the quantized format of the
+/// per-field suffix `suffix` keeps its raw vectors in (see
+/// [`raw_format`]), whose reader reads no other: a `.vemf` in either flat
+/// format this tool reads must be that one, and the `.vec` then of the
+/// same format. A `.vemf` in another codec is left to its parse.
+fn raw_codecs(
+    vemq: &Path,
+    suffix: &str,
+    meta_file: &NativeFile,
+    vec_file: &NativeFile,
+) -> Result<(), Early> {
+    let (flat_meta, vec) = (vemq.with_extension("vemf"), vemq.with_extension("vec"));
+    let codec = |file: &NativeFile| {
+        Envelope::parse(file.bytes())
+            .ok()
+            .and_then(|e| e.header)
+            .map(|h| h.codec)
+            .unwrap_or_default()
+    };
+    let (meta_codec, vec_codec) = (codec(meta_file), codec(vec_file));
+    if let Some(found) = MetaFormat::of_codec(&meta_codec) {
+        let expected = raw_format(suffix);
+        let format = suffix.rsplit_once('_').map_or(suffix, |(format, _)| format);
+        if found != expected {
+            return Err((
+                CrossCheck::Mismatch,
+                format!(
+                    "{} is a {meta_codec} file, where the field's format, {format}, keeps its raw vectors in {}",
+                    shown(&flat_meta),
+                    expected.codec()
+                ),
+            ));
+        }
+        if vec_codec != expected.data_codec() {
+            return Err((
+                CrossCheck::Mismatch,
+                format!(
+                    "{} is a {vec_codec} file, where its .vemf's format writes {}",
+                    shown(&vec),
+                    expected.data_codec()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The flat format the quantized format of the per-field suffix `suffix`,
+/// `<format>_<n>`, keeps its raw vectors in: k-NN's half-float one for its
+/// half-float format (`KNN1040HalfFloatScalarQuantizedVectorsFormat`),
+/// Lucene's for the others.
+fn raw_format(suffix: &str) -> MetaFormat {
+    match suffix.strip_prefix(HALF_FLOAT_QUANTIZED_FORMAT) {
+        Some(rest) if rest.starts_with('_') => MetaFormat::Knn1040HalfFloat,
+        _ => MetaFormat::Lucene99,
+    }
 }
 
 /// The `.vemf`'s record of the quantized field's raw vectors: the field
@@ -1371,28 +1473,78 @@ fn dot_product_doubt(field: &QuantizedField) -> Option<String> {
     })
 }
 
+/// For a cosine field, the vectors of the `.vec` that are not of unit
+/// length, as `recall` holds them (`knn_recall::on_disk`): k-NN normalizes
+/// a cosine field's vectors, and a `half_float` field's fp16 roundings of
+/// them are of unit length to fp16's rounding. Lucene would have
+/// normalized any other before quantizing it, so its correction alone
+/// cannot show it.
+fn unit_length_doubt(field: &QuantizedField, rows: &VectorRows<'_>) -> Option<String> {
+    // Lucene's similarity ordinal: COSINE 2.
+    if field.similarity != 2 {
+        return None;
+    }
+    let tolerance = if rows.component_bytes() == 2 {
+        FP16_UNIT_TOLERANCE
+    } else {
+        UNIT_TOLERANCE
+    };
+    let mut off = 0_usize;
+    let mut first = None;
+    for i in 0..rows.len() {
+        let Some(row) = rows.row(i) else {
+            break;
+        };
+        let squared_norm: f64 = row.map(|x| f64::from(x) * f64::from(x)).sum();
+        let away = (squared_norm - 1.0).abs();
+        if away.is_nan() || away > tolerance {
+            off = off.saturating_add(1);
+            first.get_or_insert((i, squared_norm));
+        }
+    }
+    first.map(|(i, squared_norm)| {
+        format!(
+            "{off} of {} vectors of the cosine field are not of unit length, as k-NN keeps them; first: vector {i}, of squared norm {squared_norm}",
+            rows.len()
+        )
+    })
+}
+
 /// Each record's additional correction against the one Lucene's quantizer
 /// computes from the `.vec`'s vector and the stored centroid, in float32
 /// and Lucene's order: the squared norm of their difference for the
-/// Euclidean similarity, their dot product otherwise. It recomputes
-/// exactly where Lucene quantized the vectors the `.vec` holds, which for
-/// a cosine field are k-NN's normalized ones; a relative difference above
-/// [`TOLERANCE`], far beyond float rounding, warns.
+/// Euclidean similarity, their dot product otherwise. For the cosine
+/// similarity the vector is normalized first, as Lucene's writer
+/// normalizes a cosine field's vectors before it quantizes them
+/// (`VectorUtil.l2normalize`): that leaves k-NN's normalized float32
+/// vectors as they are, a squared norm within 1e-4 of 1, but not
+/// necessarily their fp16 roundings in a `half_float` field's `.vec`. It
+/// recomputes exactly where Lucene quantized the vectors the `.vec` holds;
+/// a relative difference above [`TOLERANCE`], far beyond float rounding,
+/// warns.
 fn corrections_doubt(
     field: &QuantizedField,
     records: &QuantizedVectors<'_>,
     rows: &VectorRows<'_>,
 ) -> Option<String> {
+    // Lucene's similarity ordinals: EUCLIDEAN 0, COSINE 2.
     let euclidean = field.similarity == 0;
+    let cosine = field.similarity == 2;
     let mut off = 0_usize;
     let mut first = None;
     for i in 0..records.len().min(rows.len()) {
         let (Some(record), Some(row)) = (records.record(i), rows.row(i)) else {
             break;
         };
+        let mut row: Vec<f32> = row.collect();
+        if cosine {
+            // A vector of norm 0, which Lucene cannot normalize, is left:
+            // k-NN refuses one for a cosine field.
+            let _ = knn_recall::quantizer::l2normalize(&mut row);
+        }
         let mut sum = 0.0_f32;
         let mut size = 0.0_f64;
-        for (x, &c) in row.zip(&field.centroid) {
+        for (&x, &c) in row.iter().zip(&field.centroid) {
             let term = if euclidean {
                 let d = x - c;
                 d * d

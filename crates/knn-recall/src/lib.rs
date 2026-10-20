@@ -20,7 +20,7 @@
 //! [`quantized_scorer`] the scorer of a query against them,
 //! [`lucene_search`] the search k-NN runs with Lucene's searcher over the
 //! graph, and [`on_disk`] the whole query k-NN runs against such a field,
-//! rescored against its float32 vectors.
+//! rescored against its vectors in the `.vec`, float32 or fp16.
 //!
 //! Distances are float32 sums in element order. That is how Faiss's
 //! portable scalar-quantizer code computes scalar-quantized distances; its
@@ -189,9 +189,35 @@ pub enum Error {
         /// As recorded.
         ordinal: i32,
     },
-    /// The field's `.vemf` record puts no float32 vectors in its `.vec`.
-    #[error("the field's .vemf record puts no float32 vectors in its .vec")]
+    /// The field's `.vemf` record puts no float32 or fp16 vectors in its
+    /// `.vec`.
+    #[error("the field's .vemf record puts no float32 or fp16 vectors in its .vec")]
     NoFloatVectors,
+    /// The field's `.vemf` record gives its vectors another length than
+    /// they take, which Lucene's reader refuses.
+    #[error(
+        "the field's .vemf record gives its {count} vectors of dimension {dimension}, {component_bytes} bytes a component, {length} bytes, not the {} they take",
+        u128::from(*count) * u128::from(*dimension) * u128::from(*component_bytes)
+    )]
+    VectorDataLength {
+        /// As recorded.
+        length: u64,
+        /// The vectors recorded.
+        count: u32,
+        /// Their dimension.
+        dimension: u32,
+        /// Bytes per component.
+        component_bytes: u32,
+    },
+    /// The field's `.vemf` record places its vectors past the end of its
+    /// `.vec`.
+    #[error(
+        "the field's .vemf record places its vectors from offset {offset} of its .vec, which ends before they do"
+    )]
+    VectorsPastEnd {
+        /// Where it places them.
+        offset: u64,
+    },
     /// A `k` above the 10,000 k-NN accepts.
     #[error("k-NN refuses a k above 10000, and {k} is")]
     KnnK {
@@ -208,8 +234,9 @@ pub enum Error {
     /// norm float32 cannot hold, which normalizing turns into one of norm 0.
     #[error("a cosine query of norm 0, or one too large for float32, cannot be normalized")]
     ZeroNormQuery,
-    /// A cosine field's float32 vector that is not of unit length, which
-    /// k-NN's normalized vectors are.
+    /// A cosine field's vector that is not of unit length, which k-NN's
+    /// normalized vectors are, to fp16's rounding in a `half_float`
+    /// field's `.vec`.
     #[error(
         "the field's vector {node} has a squared norm of {squared_norm}, where k-NN keeps a cosine field's vectors of unit length"
     )]
@@ -219,8 +246,8 @@ pub enum Error {
         /// Its squared norm, summed in f64.
         squared_norm: f64,
     },
-    /// A float32 vector of the field holds a value that is not finite,
-    /// which k-NN refuses to index.
+    /// A vector of the field holds a value that is not finite, which k-NN
+    /// refuses to index.
     #[error("the field's vector {node} holds a value that is not finite at component {component}")]
     NotFinite {
         /// The vector's node.

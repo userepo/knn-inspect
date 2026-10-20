@@ -28,7 +28,7 @@ The macOS binary is not notarized; after unpacking, run
 `xattr -d com.apple.quarantine knn-inspect`. Or build from source:
 
 ```
-cargo install --git https://github.com/userepo/knn-inspect --tag v0.10.1 knn-inspect
+cargo install --git https://github.com/userepo/knn-inspect --tag v0.11.0 knn-inspect
 ```
 
 ## Usage
@@ -145,33 +145,37 @@ searches it, since 0.10.0: the segment's `.fnm` names the field and its
 against the field's quantized vectors in the `.veq`, with Lucene's
 scorer (k-NN's native kernel for a 1-bit field), as k-NN's
 memory-optimized search does; the first pass is then rescored against
-the field's float32 vectors in the `.vec`, which also serve as the
-file's vectors for the brute force and for `--sample`. As k-NN does by
-default, the first pass keeps `min(10000, max(100, ceil(k x f)))`
-results, `f` 2 for a 1-bit (32x) field and 1 for 2 and 4 bits (16x, 8x),
-and the graph is searched with a beam of that or `max(k, ef_search)`,
-whichever is larger, where `ef_search` is the index setting
-`index.knn.algo_param.ef_search` or a query's
-`method_parameters.ef_search` (100 unless set), not the efSearch the
-file records: `--ef-search` gives it. For its own search of such a file,
-`--k` is at most 10,000, as k-NN's query requires. `--oversample F`
-rescores with an `oversample_factor` of F, from 1 to 100, as a query
-that gives one does, and `--no-rescore` keeps the first pass's top k, as
-`"rescore": false` does. This is the search of a one-segment index
-without a filter or deleted documents, under k-NN's default settings
-(shard-level rescoring on), with the arithmetic k-NN runs on an x86-64
-host with AVX2: on the fixtures, every result list the live index
-returned, with and without rescoring, is reproduced bit for bit, doc ids
-and scores. On another host, k-NN's own float32 sums can differ in a
-last bit (see [docs/format-notes.md](docs/format-notes.md)). Before the
-search, the field must pass the check `scan` makes of it
+the field's vectors in the `.vec`, float32, or fp16 for a `half_float`
+field (since 0.11.0), which also serve as the file's vectors for the
+brute force and for `--sample`. As k-NN does by default, the first pass
+keeps `min(10000, max(100, ceil(k x f)))` results, `f` 2 for a 1-bit
+(32x) field and 1 for 2 and 4 bits (16x, 8x), and the graph is searched
+with a beam of that or `max(k, ef_search)`, whichever is larger, where
+`ef_search` is the index setting `index.knn.algo_param.ef_search` or a
+query's `method_parameters.ef_search` (100 unless set), not the efSearch
+the file records: `--ef-search` gives it. For its own search of such a
+file, `--k` is at most 10,000, as k-NN's query requires.
+`--oversample F` rescores with an `oversample_factor` of F, from 1 to
+100, as a query that gives one does, and `--no-rescore` keeps the first
+pass's top k, as `"rescore": false` does. This is the search of a
+one-segment index without a filter or deleted documents, under k-NN's
+default settings (shard-level rescoring on), with the arithmetic k-NN
+runs on an x86-64 host with AVX2: on the fixtures, every result list the
+live index returned, with and without rescoring, is reproduced bit for
+bit, doc ids and scores. A `half_float` field's fp16 vectors are
+rescored as k-NN's native library scores them there, with Faiss's fp16
+distance computer and k-NN's conversion to Lucene's scores. On another
+host, k-NN's own sums, Lucene's float32 ones and its library's, can
+differ in a last bit (see [docs/format-notes.md](docs/format-notes.md)).
+Before the search, the field must pass the check `scan` makes of it
 (`lucene_quantized`), and what that check only warns of is printed on
 stderr; a cosine field's `.vec` vectors must also be of unit length, as
-k-NN keeps them. Result lists from elsewhere (`--results`) are scored
-against the `.vemf` and `.vec` alone, which must be sound, of the
-field's segment, of the similarity the `.fnm` records, and finite. A
-`half_float` field in `on_disk` mode, whose fp16 vectors k-NN rescores
-with native kernels, is not searched.
+k-NN keeps them (to fp16's rounding for a `half_float` field). Result
+lists from elsewhere (`--results`) are scored against the `.vemf` and
+`.vec` alone, which must be sound, of the field's segment and format, of
+the similarity the `.fnm` records where the `.vemf` records one (k-NN's
+half-float format records none), of the length their vectors take, and
+finite.
 
 `scan` finds every `.faiss` and `.faissc` file under a directory,
 subdirectories included, and runs `verify` on each, printing one summary
@@ -205,7 +209,8 @@ offset Lucene could have used. A graph without its vectors has none to
 find there; `scan` checks the scalar-quantized vectors Lucene keeps for
 it instead. The segment's `.fnm` ties the graph to the field k-NN named
 the file for, which it must record as a k-NN field of the `--space`
-given, and names the `.vemq` that holds the field's quantized vectors.
+given, with the similarity k-NN records for its space type (since
+0.11.0), and names the `.vemq` that holds the field's quantized vectors.
 That `.vemq` must record the field with the graph's dimension and vector
 count, as the `.fnm` describes it, quantized to 1, 2, or 4 bits into
 records of the graph's code size, with a similarity that fits the
@@ -222,27 +227,34 @@ to its own name the same way. Without a `.fnm` this tool can read (a
 missing one is not counted as damage), the field is matched by its shape
 instead, and every field of the graph's shape that fits is held to this.
 Each record's additional correction, recomputed from its vector in the
-`.vec` and the stored centroid, and the centroid's dot product,
+`.vec` (normalized first for a cosine field, as Lucene's writer
+normalizes it) and the stored centroid, and the centroid's dot product,
 recomputed from its components, must agree with the stored ones within a
 small relative tolerance (on the fixtures the corrections agree bit for
-bit), or `scan` warns; a sound `.vemf` in a format this tool does not
-read, or components other than float32, leave the comparison with the
-`.vec` out. A compound segment keeps these files inside the `.cfs` too,
-so this check is skipped there. The `.si` file gives the segment's
-document count, and every label in the ID map, which k-NN sets to a doc
-id, must be one of the segment's doc ids. A `.vec`, `.vemf`, `.fnm`,
-`.vemq`, `.veq`, or `.si` that is there but cannot be read, or fails its
-own checksum, fails the native file too: the segment cannot be trusted
-as it stands. A sound `.si` in a format this tool does not read, as a
-newer Lucene may write, is skipped instead, as is a sound `.vemq` in
-such a format; a sound `.fnm` in one leaves the field matched by shape.
-`--space` applies to every file found; leave it out when the directory
-mixes space types. A sound file in a layout or scalar quantizer type
-this tool does not read is reported as `unsupported` rather than failed:
-`verify` alone fails it, but a scan of a whole index must not read it as
-corruption. Exit code 0 when every file is clean, 1 if any failed (or
-would not open, a subdirectory could not be read, or none was found), 2
-if the worst verdict was a warning or an unsupported file.
+bit), or `scan` warns. Since 0.11.0 a cosine field's vectors are
+normalized first, and `scan` also warns of one that is not of unit
+length, as k-NN keeps them (within 2e-4 of a squared norm of 1, or
+2.2e-3 for fp16), as `recall` refuses it. A sound `.vemf` in a format
+this tool does not read, or components neither float32 nor fp16, leave
+the comparison with the `.vec` out; a `.vemf` or `.vec` in a flat format
+other than the one the field's format keeps its raw vectors in is a
+mismatch (since 0.11.0). A compound segment keeps these files inside the
+`.cfs` too, so this check is skipped there. The `.si` file gives the
+segment's document count, and every label in the ID map, which k-NN sets
+to a doc id, must be one of the segment's doc ids. A `.vec`, `.vemf`,
+`.fnm`, `.vemq`, `.veq`, or `.si` that is there but cannot be read, or
+fails its own checksum, fails the native file too: the segment cannot be
+trusted as it stands. A sound `.si` in a format this tool does not read,
+as a newer Lucene may write, is skipped instead, as is a sound `.vemq`
+in such a format; a sound `.fnm` in one leaves the field matched by
+shape. `--space` applies to every file found; leave it out when the
+directory mixes space types. A sound file in a layout or scalar
+quantizer type this tool does not read is reported as `unsupported`
+rather than failed: `verify` alone fails it, but a scan of a whole index
+must not read it as corruption. Exit code 0 when every file is clean, 1
+if any failed (or would not open, a subdirectory could not be read, or
+none was found), 2 if the worst verdict was a warning or an unsupported
+file.
 
 ## Benchmarks
 
@@ -318,9 +330,8 @@ an `on_disk` field or an `sq` encoder of 1, 2, or 4 bits, keeping the
 quantized vectors in Lucene's files; with or without the Lucene footer.
 Every command reads all of them, except that `recall` on a graph without
 its vectors needs the segment's `.fnm` and the field's `.vemq`, `.veq`,
-`.vemf`, and `.vec` loose, not in a compound file, and is refused for a
-`half_float` field in `on_disk` mode. Fixtures and format notes target
-OpenSearch 3.9.0.
+`.vemf`, and `.vec` loose, not in a compound file. Fixtures and format
+notes target OpenSearch 3.9.0.
 
 Not yet: other scalar-quantized storage, product quantization, IVF, and
 the float graph without its vectors (a CAGRA graph, `IHc2` or the older
@@ -380,8 +391,11 @@ whose results come from Lucene 10.5.1 itself.
   (`results-k-150.jsonl`); and the 10 nearest without rescoring at an
   `ef_search` of 10 (`results-no-rescore-ef-search-10.jsonl`), which
   `recall`'s search must reproduce bit for bit; and of a `half_float`
-  field in `on_disk` mode, in k-NN's own quantized format, its `.vec` in
-  fp16 (`on-disk-half-float/l2/`), with graph statistics
+  field in `on_disk` mode for every space, in k-NN's own quantized
+  format, its `.vec` in fp16 (`on-disk-half-float/`), with graph
+  statistics and the live index's results in three of those modes
+  (`results.jsonl`, `results-no-rescore.jsonl`,
+  `results-oversample-30.jsonl`)
 - `*.stats.json` beside each synthetic fixture and `stats.json` beside
   each real one - the graph statistics Faiss Python computes from the
   same file (for a graph without its vectors, from a copy Faiss can
@@ -412,7 +426,12 @@ whose results come from Lucene 10.5.1 itself.
   dimensions 1 to 384 (`rescore.cases`), with each query as Lucene
   normalizes it and every score as k-NN's rescoring computes it, with
   the JDK's vector module, compiled (`rescore.expected`), which
-  `knn_recall::on_disk` must match bit for bit
+  `knn_recall::on_disk` must match bit for bit; and fp16 vectors and
+  float32 queries over every similarity and dimensions 1 to 384
+  (`fp16-rescore.cases`), with every score as k-NN's rescoring of a
+  `half_float` field computes it, with its native library for AVX2
+  (`fp16-rescore.expected`), which `knn_recall::on_disk` must match bit
+  for bit
 
 Each real fixture directory also holds `vectors.f32`, the indexed vectors
 in doc-id order (row i is Faiss label i), or for a binary field
@@ -439,14 +458,17 @@ The quantizer, scorer, search, and rescore cases need Docker and the
 OpenSearch 3.9.0 image, whose JDK runs Lucene's quantizer, scorer, and
 float32 sums and k-NN's searcher from its jars
 (`tools/QuantizerOracle.java`, `tools/ScorerOracle.java`,
-`tools/SearchOracle.java`, `tools/RescoreOracle.java`); no cluster is
-started:
+`tools/SearchOracle.java`, `tools/RescoreOracle.java`), and k-NN's
+rescoring of fp16 vectors from its plugin's jars and native library
+(`tools/Fp16RescoreOracle.java`, on an x86-64 host with AVX2); no
+cluster is started:
 
 ```
 .venv\Scripts\python tools\quantizer_oracle.py --out fixtures\synthetic-quantizer
 .venv\Scripts\python tools\scorer_oracle.py --fixtures fixtures --out fixtures\synthetic-quantizer
 .venv\Scripts\python tools\search_oracle.py --fixtures fixtures --out fixtures\synthetic-quantizer
 .venv\Scripts\python tools\rescore_oracle.py --out fixtures\synthetic-quantizer
+.venv\Scripts\python tools\fp16_rescore_oracle.py --out fixtures\synthetic-quantizer
 ```
 
 Real fixtures need Docker:
@@ -465,7 +487,7 @@ docker compose -f tools\docker-compose.yml up -d
 .venv\Scripts\python tools\extract_opensearch.py --out fixtures\opensearch-3.9.0-binary\on-disk --encoding on-disk --spaces innerproduct cosinesimil --queries 100
 .venv\Scripts\python tools\extract_opensearch.py --out fixtures\opensearch-3.9.0-binary\on-disk-16x --encoding on-disk --compression 16x --spaces l2 --queries 100
 .venv\Scripts\python tools\extract_opensearch.py --out fixtures\opensearch-3.9.0-binary\on-disk-8x --encoding on-disk --compression 8x --spaces l2 --queries 100
-.venv\Scripts\python tools\extract_opensearch.py --out fixtures\opensearch-3.9.0-binary\on-disk-half-float --encoding on-disk-half-float --spaces l2
+.venv\Scripts\python tools\extract_opensearch.py --out fixtures\opensearch-3.9.0-binary\on-disk-half-float --encoding on-disk-half-float --queries 100 --modes results.jsonl results-no-rescore.jsonl results-oversample-30.jsonl
 docker compose -f tools\docker-compose.yml down -v
 ```
 

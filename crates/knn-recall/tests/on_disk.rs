@@ -1,5 +1,6 @@
 //! The query k-NN runs against an `on_disk` field, over the fixtures: the
-//! plan of a query, the search against its parts, and what is refused.
+//! plan of a query, the search against its parts, and what is refused,
+//! for float32 fields and `half_float` ones alike.
 
 #![allow(
     clippy::unwrap_used,
@@ -14,11 +15,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use knn_format::I64;
+use knn_format::faiss::{CodeFormat, Storage};
 use knn_format::flat_vectors::{FlatField, FlatVectorsMeta, VectorEncoding};
 use knn_format::quantized_vectors::{DataFile, QuantizedVectors, QuantizedVectorsMeta};
 use knn_recall::lucene_search;
 use knn_recall::on_disk::{
-    DEFAULT_EF_SEARCH, OnDiskField, Plan, Rescore, exact_score, field_vectors,
+    DEFAULT_EF_SEARCH, OnDiskField, Plan, Rescore, exact_score, field_vectors, fp16_exact_score,
 };
 use knn_recall::quantized_scorer::QuantizedScorer;
 use knn_recall::quantizer::Similarity;
@@ -28,7 +30,22 @@ fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/opensearch-3.9.0-binary")
 }
 
-const STEM: &str = "_2_Faiss1040ScalarQuantizedKnnVectorsFormat_0";
+/// The stem of the fixture's field files: its per-field format and suffix,
+/// k-NN's half-float one for a `half_float` field.
+fn stem(fixture: &str) -> &'static str {
+    if fixture.starts_with("on-disk-half-float/") {
+        "_2_Faiss1040HalfFloatScalarQuantizedKnnVectorsFormat_0"
+    } else {
+        "_2_Faiss1040ScalarQuantizedKnnVectorsFormat_0"
+    }
+}
+
+/// The `half_float` fixtures, whose `.vec` holds fp16 vectors.
+const HALF_FLOAT: [&str; 3] = [
+    "on-disk-half-float/l2",
+    "on-disk-half-float/innerproduct",
+    "on-disk-half-float/cosinesimil",
+];
 
 /// A fixture's files, read.
 struct Files {
@@ -42,7 +59,8 @@ struct Files {
 impl Files {
     fn of(fixture: &str) -> Self {
         let dir = fixtures().join(fixture);
-        let read = |ext: &str| fs::read(dir.join(format!("{STEM}.{ext}"))).unwrap();
+        let stem = stem(fixture);
+        let read = |ext: &str| fs::read(dir.join(format!("{stem}.{ext}"))).unwrap();
         Self {
             native: fs::read(dir.join("_2_165_vec.faiss")).unwrap(),
             vemq: read("vemq"),
@@ -173,7 +191,10 @@ fn rescored_results_are_the_exact_best_of_the_first_pass() {
         "on-disk/innerproduct",
         "on-disk/cosinesimil",
         "on-disk-8x/l2",
-    ] {
+    ]
+    .into_iter()
+    .chain(HALF_FLOAT)
+    {
         with_field(fixture, |f| {
             let rescored = f.plan(10, DEFAULT_EF_SEARCH, Rescore::Default).unwrap();
             let first = f.plan(100, DEFAULT_EF_SEARCH, Rescore::Off).unwrap();
@@ -229,7 +250,7 @@ fn search_all_lists_labels_per_query() {
 }
 
 #[test]
-fn what_k_nn_refuses_is_refused() {
+fn queries_k_nn_refuses_are_refused() {
     // A cosine query of norm 0, and a query of another dimension.
     with_field("on-disk/cosinesimil", |f| {
         let plan = f.plan(10, DEFAULT_EF_SEARCH, Rescore::Default).unwrap();
@@ -254,7 +275,10 @@ fn what_k_nn_refuses_is_refused() {
             Err(Error::KnnK { k: 10_001 })
         ));
     });
+}
 
+#[test]
+fn parts_k_nn_would_not_write_are_refused() {
     let files = Files::of("on-disk/l2");
     let parsed = knn_format::parse(&files.native).unwrap();
     let meta = QuantizedVectorsMeta::parse(&files.vemq).unwrap();
@@ -274,7 +298,7 @@ fn what_k_nn_refuses_is_refused() {
     assert!(matches!(
         new(&halves),
         Err(Error::OnDiskShape {
-            what: "float32 dimension",
+            what: ".vec dimension",
             graph: 16,
             field: 8
         })
@@ -286,17 +310,36 @@ fn what_k_nn_refuses_is_refused() {
     assert!(matches!(
         new(&fewer),
         Err(Error::OnDiskShape {
-            what: "float32 vectors",
+            what: ".vec vectors",
             graph: 500,
             field: 499
         })
     ));
-    // Vectors the .vec cannot hold, and byte ones.
+    // Vectors the .vec cannot hold, another length than they take, and
+    // byte ones.
     let past = FlatField {
         data_offset: u64::try_from(files.vec.len()).unwrap(),
         ..flat.fields[0]
     };
-    assert!(matches!(new(&past), Err(Error::NoFloatVectors)));
+    assert!(matches!(new(&past), Err(Error::VectorsPastEnd { .. })));
+    let short = FlatField {
+        data_length: 31_936,
+        ..flat.fields[0]
+    };
+    let err = new(&short).unwrap_err();
+    assert!(matches!(
+        err,
+        Error::VectorDataLength {
+            length: 31_936,
+            count: 500,
+            dimension: 16,
+            component_bytes: 4
+        }
+    ));
+    assert_eq!(
+        err.to_string(),
+        "the field's .vemf record gives its 500 vectors of dimension 16, 4 bytes a component, 31936 bytes, not the 32000 they take"
+    );
     let bytes = FlatField {
         encoding: VectorEncoding::Byte,
         component_bytes: 1,
@@ -427,19 +470,33 @@ const MODES: [&str; 6] = [
     "results-no-rescore-ef-search-10.jsonl",
 ];
 
+/// The live modes the `half_float` fixtures record (`--modes`): the
+/// search's plans are the float32 fields', and the rescoring is what
+/// differs.
+const HALF_FLOAT_MODES: [&str; 3] = [
+    "results.jsonl",
+    "results-no-rescore.jsonl",
+    "results-oversample-30.jsonl",
+];
+
 #[test]
 fn searches_return_what_the_live_index_returned() {
     // tools/extract_opensearch.py --queries queried each index the fixture
     // was copied from, in each mode its manifest records.
     let mut compared = 0;
     let mut failures = Vec::new();
-    for fixture in [
+    let float32 = [
         "on-disk/l2",
         "on-disk/innerproduct",
         "on-disk/cosinesimil",
         "on-disk-16x/l2",
         "on-disk-8x/l2",
-    ] {
+    ];
+    let every = float32
+        .iter()
+        .map(|&f| (f, &MODES[..]))
+        .chain(HALF_FLOAT.iter().map(|&f| (f, &HALF_FLOAT_MODES[..])));
+    for (fixture, recorded) in every {
         let dir = fixtures().join(fixture);
         let manifest: serde_json::Value =
             serde_json::from_slice(&fs::read(dir.join("manifest.json")).unwrap()).unwrap();
@@ -448,9 +505,16 @@ fn searches_return_what_the_live_index_returned() {
             .unwrap();
         let mut names: Vec<&str> = modes.keys().map(String::as_str).collect();
         names.sort_unstable();
-        let mut expected = MODES;
+        let mut expected = recorded.to_vec();
         expected.sort_unstable();
         assert_eq!(names, expected, "{fixture}");
+        if HALF_FLOAT.contains(&fixture) {
+            // Rescored by the native library whose sums the port follows.
+            assert_eq!(
+                manifest["live_queries"]["simd_library"], "opensearchknn_simd_avx2",
+                "{fixture}"
+            );
+        }
         let queries = Queries::from_bytes(&fs::read(dir.join("queries.f32")).unwrap(), 16).unwrap();
         with_field(fixture, |f| {
             for (file, mode) in modes {
@@ -496,14 +560,26 @@ fn searches_return_what_the_live_index_returned() {
         // The beam is what the query's ef_search makes it: at 10, the live
         // index returned other results than at 100.
         let read = |file: &str| fs::read(dir.join(file)).unwrap();
+        if recorded.contains(&"results-no-rescore-ef-search-10.jsonl") {
+            assert_ne!(
+                read("results-no-rescore.jsonl"),
+                read("results-no-rescore-ef-search-10.jsonl"),
+                "{fixture}"
+            );
+        }
+        // Rescoring changed what the live index returned.
         assert_ne!(
+            read("results.jsonl"),
             read("results-no-rescore.jsonl"),
-            read("results-no-rescore-ef-search-10.jsonl"),
             "{fixture}"
         );
     }
     assert!(failures.is_empty(), "{failures:#?}");
-    assert_eq!(compared, 5 * MODES.len() * 100, "every live baseline");
+    assert_eq!(
+        compared,
+        (5 * MODES.len() + 3 * HALF_FLOAT_MODES.len()) * 100,
+        "every live baseline"
+    );
 }
 
 #[test]
@@ -532,6 +608,110 @@ fn a_cosine_fields_vectors_must_be_of_unit_length() {
     }
     // Under another similarity, any length is a vector's own.
     assert!(field_vectors(&parsed.index, Similarity::MaximumInnerProduct, field, &vec).is_ok());
+}
+
+#[test]
+fn a_half_float_fields_vectors_are_its_fp16_ones() {
+    // The .vec's fp16 vectors, as storage, decoded for ground truth, and
+    // what the search rescores, with the normalized query for cosine: the
+    // scores themselves are held to k-NN's by the live lists and
+    // tests/rescore.rs.
+    for fixture in HALF_FLOAT {
+        with_field(fixture, |f| {
+            let Storage::Sq(storage) = f.storage() else {
+                panic!("{fixture}: fp16 storage");
+            };
+            assert_eq!(storage.format, CodeFormat::Fp16, "{fixture}");
+            assert_eq!(storage.row_count(), 500, "{fixture}");
+            let plan = f.plan(10, DEFAULT_EF_SEARCH, Rescore::Default).unwrap();
+            for q in queries(f, 3).rows() {
+                let knn_recall::Query::Floats(q) = q else {
+                    panic!("float queries");
+                };
+                let mut normalized = q.to_vec();
+                if f.similarity() == Similarity::Cosine {
+                    knn_recall::quantizer::l2normalize(&mut normalized).unwrap();
+                }
+                for hit in f.search(q, &plan).unwrap() {
+                    let node = usize::try_from(hit.doc).unwrap();
+                    let row = &storage.halves()[node * 16..(node + 1) * 16];
+                    assert_eq!(
+                        hit.score.to_bits(),
+                        fp16_exact_score(f.similarity(), &normalized, row).to_bits(),
+                        "{fixture}"
+                    );
+                }
+            }
+        });
+    }
+
+    // A cosine field's fp16 vectors are of unit length within fp16's
+    // rounding, and of finite values.
+    let files = Files::of("on-disk-half-float/cosinesimil");
+    let parsed = knn_format::parse(&files.native).unwrap();
+    let flat = FlatVectorsMeta::parse(&files.vemf).unwrap();
+    let field = &flat.fields[0];
+    assert_eq!(field.component_bytes, 2);
+    assert!(field_vectors(&parsed.index, Similarity::Cosine, field, &files.vec).is_ok());
+    let at = |node: usize, component: usize| {
+        usize::try_from(field.data_offset).unwrap() + 2 * (16 * node + component)
+    };
+    // Vector 3 doubled, its exponents one up: a squared norm of 4.
+    let mut doubled = files.vec.clone();
+    for i in 0..16 {
+        let a = at(3, i);
+        let h = u16::from_le_bytes([doubled[a], doubled[a + 1]]);
+        if h & 0x7FFF != 0 {
+            doubled[a..a + 2].copy_from_slice(&(h + 0x0400).to_le_bytes());
+        }
+    }
+    match field_vectors(&parsed.index, Similarity::Cosine, field, &doubled) {
+        Err(Error::NotNormalized { node, squared_norm }) => {
+            assert_eq!(node, 3);
+            assert!((squared_norm - 4.0).abs() < 1e-2, "{squared_norm}");
+        }
+        other => panic!("{other:?}"),
+    }
+    // A NaN or an infinity in vector 7, component 5, under any similarity.
+    for value in [0x7E00_u16, 0xFC00] {
+        let mut spoiled = files.vec.clone();
+        let a = at(7, 5);
+        spoiled[a..a + 2].copy_from_slice(&value.to_le_bytes());
+        for similarity in [Similarity::Cosine, Similarity::Euclidean] {
+            assert!(
+                matches!(
+                    field_vectors(&parsed.index, similarity, field, &spoiled),
+                    Err(Error::NotFinite {
+                        node: 7,
+                        component: 5
+                    })
+                ),
+                "{value:#06x}"
+            );
+        }
+    }
+    // Past the end of the .vec, or of another length than 500 fp16
+    // vectors of 16 take.
+    let past = FlatField {
+        data_offset: u64::try_from(files.vec.len()).unwrap(),
+        ..*field
+    };
+    assert!(matches!(
+        field_vectors(&parsed.index, Similarity::Cosine, &past, &files.vec),
+        Err(Error::VectorsPastEnd { .. })
+    ));
+    let short = FlatField {
+        data_length: 15_968,
+        ..*field
+    };
+    assert!(matches!(
+        field_vectors(&parsed.index, Similarity::Cosine, &short, &files.vec),
+        Err(Error::VectorDataLength {
+            length: 15_968,
+            component_bytes: 2,
+            ..
+        })
+    ));
 }
 
 #[test]

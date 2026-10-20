@@ -1,6 +1,6 @@
 //! `recall` on graphs without their vectors: the field found through the
 //! segment's `.fnm`, searched as k-NN searches it, against the field's
-//! float32 vectors.
+//! vectors in the `.vec`, float32 or, for a `half_float` field, fp16.
 
 #![allow(
     clippy::unwrap_used,
@@ -52,9 +52,16 @@ fn every_on_disk_fixture_is_searched_as_k_nn_searches_it() {
         ("on-disk/cosinesimil", "inner_product"),
         ("on-disk-16x/l2", "l2"),
         ("on-disk-8x/l2", "l2"),
+        ("on-disk-half-float/l2", "l2"),
+        ("on-disk-half-float/innerproduct", "inner_product"),
+        ("on-disk-half-float/cosinesimil", "inner_product"),
     ] {
         let path = native(fixture);
-        let v = json(&["recall", &path, "--sample", "50", "--json"]);
+        let o = run(&["recall", &path, "--sample", "50", "--json"]);
+        assert_eq!(o.status.code(), Some(0), "{fixture}");
+        // The field passes scan's check without a warning.
+        assert_eq!(String::from_utf8_lossy(&o.stderr), "", "{fixture}");
+        let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
         assert_eq!(v["metric"], metric, "{fixture}");
         assert_eq!(v["vectors"], 500, "{fixture}");
         assert_eq!(v["dimension"], 16, "{fixture}");
@@ -128,12 +135,16 @@ fn the_rescoring_options_set_the_plan() {
 fn the_live_index_results_score_as_the_tools_own_search() {
     // The live index's lists, read as `--results` lines, and the tool's
     // search in the same rescoring mode find the same documents.
-    for fixture in [
-        "on-disk/l2",
-        "on-disk/innerproduct",
-        "on-disk/cosinesimil",
-        "on-disk-16x/l2",
-        "on-disk-8x/l2",
+    // The half_float fixtures record three modes of the six.
+    for (fixture, recorded) in [
+        ("on-disk/l2", 6),
+        ("on-disk/innerproduct", 6),
+        ("on-disk/cosinesimil", 6),
+        ("on-disk-16x/l2", 6),
+        ("on-disk-8x/l2", 6),
+        ("on-disk-half-float/l2", 3),
+        ("on-disk-half-float/innerproduct", 3),
+        ("on-disk-half-float/cosinesimil", 3),
     ] {
         let path = native(fixture);
         let dir = fixtures().join(fixture);
@@ -144,7 +155,7 @@ fn the_live_index_results_score_as_the_tools_own_search() {
         let modes = manifest["live_queries"]["results_files"]
             .as_object()
             .unwrap();
-        assert_eq!(modes.len(), 6, "{fixture}");
+        assert_eq!(modes.len(), recorded, "{fixture}");
         for (file, mode) in modes {
             // The mode's k and query parameters, as the CLI's options.
             let k = mode["k"].to_string();
@@ -254,12 +265,54 @@ fn what_cannot_be_searched_is_said_so() {
         String::from_utf8_lossy(&o.stderr)
     );
 
-    // A half_float field, whose fp16 vectors k-NN rescores natively.
-    let o = run(&["recall", &native("on-disk-half-float/l2"), "--sample", "5"]);
+    // A half_float field's fp16 vector holding a NaN (0x7E00): damage the
+    // check before the search finds, and the results from elsewhere,
+    // scored against the .vec alone, are refused for it too.
+    let s = Scratch::of("half-float-nan", "on-disk-half-float/l2");
+    s.edit(
+        "_2_Faiss1040HalfFloatScalarQuantizedKnnVectorsFormat_0.vec",
+        true,
+        |b| {
+            let at = 128 + 3 * 32;
+            b[at..at + 2].copy_from_slice(&0x7E00_u16.to_le_bytes());
+        },
+    );
+    let o = run(&["recall", &s.native(), "--sample", "5"]);
     assert_eq!(o.status.code(), Some(1));
     let err = String::from_utf8_lossy(&o.stderr);
     assert!(
-        err.contains("field \"vec\" is a half_float field, in Faiss1040HalfFloatScalarQuantizedKnnVectorsFormat"),
+        err.contains("holds a value that is not finite: vector 3, component 0"),
+        "{err}"
+    );
+    let (queries, results) = (s.0.join("queries.f32"), s.0.join("results.jsonl"));
+    let o = run(&[
+        "recall",
+        &s.native(),
+        "--queries",
+        queries.to_str().unwrap(),
+        "--results",
+        results.to_str().unwrap(),
+    ]);
+    assert_eq!(o.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        err.contains("the field's vector 3 holds a value that is not finite at component 0"),
+        "{err}"
+    );
+
+    // A damaged .veq and .vec both: named in scan's order, the .veq first.
+    let s = Scratch::of("veq-and-vec", "on-disk/l2");
+    for name in [
+        "_2_Faiss1040ScalarQuantizedKnnVectorsFormat_0.veq",
+        "_2_Faiss1040ScalarQuantizedKnnVectorsFormat_0.vec",
+    ] {
+        s.edit(name, false, |b| b[200] ^= 0xFF);
+    }
+    let o = run(&["recall", &s.native(), "--sample", "5"]);
+    assert_eq!(o.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        err.contains("come out damaged as scan checks them: the .veq fails its footer checksum"),
         "{err}"
     );
 

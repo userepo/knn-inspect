@@ -84,8 +84,8 @@ Each entry of `layers`:
 | `sample` | object, optional | For `--sample`: `count` and `seed` |
 | `results_file` | string, optional | The `--results` file |
 | `ids_file` | string, optional | The `--ids` file |
-| `search` | object, optional | For the tool's own search: `ef_search` used and `search_ms`; for a graph without its vectors (since 0.10.0), the index's `ef_search` and also `beam` (the graph search's), `rescore` (whether the first pass was rescored against the field's float32 vectors), and, when it was, `first_pass_k` (the first pass's results rescored) |
-| `dimension`, `vectors` | integer | Of the file; for binary storage, `dimension` is the bits of the code size, which the queries must have (since 0.7.0); for a graph without its vectors, of the field's float32 vectors in the `.vec` (since 0.10.0) |
+| `search` | object, optional | For the tool's own search: `ef_search` used and `search_ms`; for a graph without its vectors (since 0.10.0), the index's `ef_search` and also `beam` (the graph search's), `rescore` (whether the first pass was rescored against the field's vectors in the `.vec`), and, when it was, `first_pass_k` (the first pass's results rescored) |
+| `dimension`, `vectors` | integer | Of the file; for binary storage, `dimension` is the bits of the code size, which the queries must have (since 0.7.0); for a graph without its vectors, of the field's vectors in the `.vec`, float32, or fp16 for a `half_float` field (since 0.10.0; fp16 since 0.11.0) |
 | `metric` | string | As for `info` |
 | `ground_truth_ms` | integer | Time of the brute-force pass |
 | `k` | integer | The `--k` given |
@@ -199,13 +199,15 @@ than a relative 1e-4, far beyond float rounding.
   records. Since 0.10.0 the segment's `.fnm` ties the native file to its
   field: the field k-NN named the file for (`vec` in `_2_165_vec.faiss`)
   must be a k-NN field of the Faiss engine and of the space the
-  `--space` given names, in `Faiss1040ScalarQuantizedKnnVectorsFormat`
-  or, for a `half_float` field,
-  `Faiss1040HalfFloatScalarQuantizedKnnVectorsFormat`, whose name and
-  suffix name the one `.vemq` read. The `.fnm` must name the segment the
-  `.si` does, when a sound `.si` lies beside it, and no segment suffix;
-  that `.vemq` must name the `.fnm`'s segment and the suffix Lucene
-  opens the field's files under
+  `--space` given names, recorded with the similarity k-NN records for
+  its space type (since 0.11.0; k-NN's exact search scores with the
+  space type's where the two differ), in
+  `Faiss1040ScalarQuantizedKnnVectorsFormat` or, for a `half_float`
+  field, `Faiss1040HalfFloatScalarQuantizedKnnVectorsFormat`, whose name
+  and suffix name the one `.vemq` read. The `.fnm` must name the segment
+  the `.si` does, when a sound `.si` lies beside it, and no segment
+  suffix; that `.vemq` must name the `.fnm`'s segment and the suffix
+  Lucene opens the field's files under
   (`Faiss1040ScalarQuantizedKnnVectorsFormat_0` for suffix `0` of the
   float format), and record a field of the `.fnm`'s field number with
   the graph's dimension and vector count, and agree with the `.fnm` on
@@ -239,34 +241,42 @@ than a relative 1e-4, far beyond float rounding.
   tells `cosinesimil` from `innerproduct`), or it is a `mismatch`, as is
   a `.vemf` that records no field of the same number, or one with
   another dimension, count, similarity, vector encoding, or
-  docs-with-field kind. The `.veq` must lie beside the `.vemq`, be
-  sound, name the same segment, and hold the field's records where the
-  `.vemq` puts them, each with a component sum equal to its components'
-  and finite interval ends, and the `.vemq` a finite centroid whose dot
-  product is neither NaN nor negative, or the check is `damaged`. Each
-  record's additional correction is then compared with the one Lucene's
-  quantizer computes from the vector of the same ordinal in the `.vec`
-  and the stored centroid (the squared norm of their difference for
-  `euclidean`, their dot product otherwise), which recomputes exactly
-  where Lucene quantized the vectors the `.vec` holds, as it did the
-  fixtures', and the centroid's stored dot product with the one its
+  docs-with-field kind, and, since 0.11.0, a `.vemf` in a flat format
+  other than the one the field's format keeps its raw vectors in
+  (Lucene's, or for a `half_float` field k-NN's half-float one), or a
+  `.vec` in a format other than its `.vemf`'s. The `.veq` must lie
+  beside the `.vemq`, be sound, name the same segment, and hold the
+  field's records where the `.vemq` puts them, each with a component sum
+  equal to its components' and finite interval ends, and the `.vemq` a
+  finite centroid whose dot product is neither NaN nor negative, or the
+  check is `damaged`. Each record's additional correction is then
+  compared with the one Lucene's quantizer computes from the vector of
+  the same ordinal in the `.vec` and the stored centroid (the squared
+  norm of their difference for `euclidean`, their dot product otherwise;
+  for `cosine` the vector normalized first, as Lucene's writer
+  normalizes a cosine field's vectors, since 0.11.0), which recomputes
+  exactly where Lucene quantized the vectors the `.vec` holds, as it did
+  the fixtures', and the centroid's stored dot product with the one its
   components give; a relative difference above 1e-4, far beyond float
-  rounding, is a `warning`. The centroid itself is not compared with the
-  `.vec`'s vectors: a merge recomputes it from every source segment's
-  vectors, deleted documents' included, which the merged `.vec` no
-  longer holds. A `.vec` or `.vemf` that is missing beside the `.vemq`,
-  is not sound, or names another segment, a `.vemf` whose field length
-  or offset Lucene's reader would refuse, or a `.vec` that holds a value
-  that is not finite, is `damaged`, since Lucene opens them with the
-  quantized files. A `half_float` field's `.vec` holds fp16 components,
-  which are decoded and compared as float32 ones are (since 0.10.1).
-  When the `.vemf` is sound but in a format this tool does not read, or
-  the field's components are neither float32 nor fp16, the comparison
-  with the `.vec` is left out and `detail` says why. Tied by the `.fnm`,
-  the check is skipped when the field's `.vemq` is sound, of the segment
-  and suffix its name and the `.fnm` give, but in a format this tool
-  does not read. Matched by shape, it is skipped when the segment's
-  files cannot be listed; when no `.vemq` of the segment lies beside the
+  rounding, is a `warning`. So, since 0.11.0, is a cosine field's `.vec`
+  vector that is not of unit length as k-NN keeps it: within 2e-4 of a
+  squared norm of 1, or 2.2e-3 for fp16, the field's vectors rounded.
+  The centroid itself is not compared with the `.vec`'s vectors: a merge
+  recomputes it from every source segment's vectors, deleted documents'
+  included, which the merged `.vec` no longer holds. A `.vec` or `.vemf`
+  that is missing beside the `.vemq`, is not sound, or names another
+  segment, a `.vemf` whose field length or offset Lucene's reader would
+  refuse, or a `.vec` that holds a value that is not finite, is
+  `damaged`, since Lucene opens them with the quantized files. A
+  `half_float` field's `.vec` holds fp16 components, which are decoded
+  and compared as float32 ones are (since 0.10.1). When the `.vemf` is
+  sound but in a format this tool does not read, or the field's
+  components are neither float32 nor fp16, the comparison with the
+  `.vec` is left out and `detail` says why. Tied by the `.fnm`, the
+  check is skipped when the field's `.vemq` is sound, of the segment and
+  suffix its name and the `.fnm` give, but in a format this tool does
+  not read. Matched by shape, it is skipped when the segment's files
+  cannot be listed; when no `.vemq` of the segment lies beside the
   native file, as in a compound segment, whose `.fnm` is inside the
   `.cfs` too; when no sound `.vemq` holds a field the graph can have
   been built over and one is in a format this tool does not read; and

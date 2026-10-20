@@ -669,12 +669,16 @@ size is 2. The labels follow the `null` directly: their count, 500, at
 begins. The quantized vectors are in the Lucene files described under
 Scalar-quantized vectors below.
 
-`--encoding on-disk-half-float` indexes the `l2` draw into a
-`half_float` field in `on_disk` mode (`on-disk-half-float/l2/`). Its
-native file is the same layout, 75,846 bytes with code size 18; its
-Lucene files carry the name of k-NN's own quantized format for such a
-field (see Scalar-quantized vectors below), and its `.vec` holds the
-vectors as fp16 from offset 128.
+`--encoding on-disk-half-float` indexes each space's draw into a
+`half_float` field in `on_disk` mode (`on-disk-half-float/l2/`,
+`on-disk-half-float/innerproduct/`, `on-disk-half-float/cosinesimil/`),
+and `--queries 100` with `--modes` records the live index's results in
+three modes: the 10 nearest with k-NN's default rescoring, without
+rescoring, and with an `oversample_factor` of 30. Each native file is
+the same layout, 75,846 bytes with code size 18; its Lucene files carry
+the name of k-NN's own quantized format for such a field (see
+Scalar-quantized vectors below), and its `.vec` holds the vectors as
+fp16 from offset 128.
 
 ## Real files from OpenSearch 3.9.0
 
@@ -809,7 +813,12 @@ segment id and the segment suffix of the field's format and suffix
 `Faiss1040HalfFloatScalarQuantizedKnnVectorsFormat_0` for a `half_float`
 field, k-NN's subclass of the format under its own name), as Lucene's
 `checkIndexHeader` requires, and matches a field by the graph's shape
-only without a `.fnm` it can read.
+only without a `.fnm` it can read. Since 0.11.0 it also holds the
+field's similarity to the one k-NN records for its `spaceType`, one of
+`l2`, `innerproduct`, and `cosinesimil`: where the two differ, k-NN's
+exact search rescores with the space type's, through Lucene's float32
+scorer whatever the vectors
+(`VectorScorers.createSimilarityOverrideScorer`).
 
 ### Flat-vectors metadata (`.vemf`)
 
@@ -873,14 +882,22 @@ A `half_float` field in `on_disk` mode is written in k-NN's
 name, so its files carry that name, and its `.vemq` and `.veq` are the
 same Lucene files; its raw vectors are in k-NN's half-float flat format
 (`KNN1040HalfFloatFlatVectorsFormatMeta`), two bytes a component. The
-fixture of one (`on-disk-half-float/l2`) shows the records quantized
-from the fp16 values: every record's additional correction recomputes
-bit for bit from the `.vec`'s fp16 components, decoded, and the centroid
-is their mean. `scan` checks such a field as any other (since 0.10.0
-through the `.fnm`, by shape before), its corrections against the
-`.vec`'s fp16 values, decoded (`knn_format::flat_vectors::VectorRows`,
-since 0.10.1); `recall` does not search it, since k-NN rescores its fp16
-vectors with native kernels (`KNN1040HalfFloatVectorScorer`).
+fixtures of one (`on-disk-half-float/`) show the records quantized from
+the fp16 values: every record's additional correction recomputes bit for
+bit from the `.vec`'s fp16 components, decoded, and for `cosinesimil`
+normalized, as Lucene's writer normalizes a cosine field's vectors
+before it quantizes them (`VectorUtil.l2normalize`): k-NN's normalized
+float32 vectors are within its 1e-4 of unit length and stay as they are,
+but their fp16 roundings need not. The centroid is the fp16 values'
+mean, for `cosinesimil` the mean of the values as stored, normalized:
+the merge takes it from the vectors as the source segments' `.vec` holds
+them, without normalizing them first. `scan` checks such a field as any
+other (since 0.10.0 through the `.fnm`, by shape before), its
+corrections against the `.vec`'s fp16 values, decoded
+(`knn_format::flat_vectors::VectorRows`, since 0.10.1); `recall`
+searches it as k-NN does since 0.11.0, its fp16 vectors rescored as
+k-NN's native library scores them (see the rescoring of a `half_float`
+field below).
 
 After the big-endian index header (109 bytes in the fixtures: the codec
 name and the segment suffix `Faiss1040ScalarQuantizedKnnVectorsFormat_0`
@@ -1051,12 +1068,13 @@ query's `method_parameters.ef_search` or the index setting
 file records (256 in the fixtures) is not read. The first pass is cut to
 the results scoring at least the `firstPassK`-th
 (`ResultUtil.reduceToTopK`), and those are scored again in doc order
-against their float32 vectors in the `.vec` (`ExactSearcher`), with the
-field's `VectorSimilarityFunction` through Lucene's bulk scorer
-(`Lucene99MemorySegmentFloatVectorScorer.bulkScore`); the `k` best are
-kept, a tie going to the lower doc id, and a score below 0, or NaN, is
-dropped (`BulkVectorScorer` yields only scores from its least
-competitive one, 0 to begin with). k-NN accepts a `k` up to 10,000
+against their vectors in the `.vec` (`ExactSearcher`), a float32 field's
+with the field's `VectorSimilarityFunction` through Lucene's bulk scorer
+(`Lucene99MemorySegmentFloatVectorScorer.bulkScore`), a `half_float`
+field's as described below; the `k` best are kept, a tie going to the
+lower doc id, and a score below 0, or NaN, is dropped
+(`BulkVectorScorer` yields only scores from its least competitive one, 0
+to begin with). k-NN accepts a `k` up to 10,000
 (`KNNQueryBuilder.K_MAX`). With `"rescore": false`, the beam is `max(k,
 ef_search)` and the first `k` results are kept. With the defaults and
 `k` 10, every fixture's beam and first pass are 100. Several segments,
@@ -1084,10 +1102,10 @@ through a fixture. `knn_recall::vector_util` follows the compiled order;
 `tools/rescore_oracle.py` runs Lucene's sums
 (`tools/RescoreOracle.java`) with the vector module, after a warm-up,
 over every similarity and 29 dimensions from 1 to 384: the port matches
-every normalized query and score bit for bit. On the fixtures, every
-result list the live index returned for 100 queries in each of six modes
-is reproduced bit for bit, doc ids and scores, 3,000 lists in all: the
-10 nearest with k-NN's default rescoring, without rescoring, with an
+every normalized query and score bit for bit. On the float32 fixtures,
+every result list the live index returned for 100 queries in each of six
+modes is reproduced bit for bit, doc ids and scores, 3,000 lists in all:
+the 10 nearest with k-NN's default rescoring, without rescoring, with an
 `oversample_factor` of 30 (a first pass and beam of 300), and with an
 `ef_search` of 300 (a beam of 300, cut to the 100 best); the 150 nearest
 (a first pass of 150, all of it scored, for 2 and 4 bits); and the 10
@@ -1096,6 +1114,56 @@ returns other results than one of 100 does. Another host (16 lanes with
 AVX-512, 4 on Arm, products rounded on their own where Lucene finds
 fused multiply-adds slow, a JVM without the vector module) can differ in
 a last bit, which matters only to a tie.
+
+A `half_float` field's first pass is a float32 field's: its records are
+quantized from the fp16 values, and searched alike. Its rescoring is
+k-NN's own. The `.vec`'s values are k-NN's
+(`KNN1040HalfFloatFlatVectorsValues`), whose scorer hands the similarity
+to k-NN's native library over the mapped file
+(`KNN1040HalfFloatVectorScorer.NativeHalfFloatRandomVectorScorer`) for
+Euclidean, the maximum inner product, and cosine
+(`NativeEngines990KnnVectorsScorer.getNativeFunctionType`), and scores
+the dot product, for which the library has no kernel, with Lucene's
+function over the decoded vector (`VectorUtil.dotProduct`), though k-NN
+records the dot product for no space type of a Faiss field. k-NN loads
+the widest library its CPU runs and its node settings allow
+(`KNNLibraryLoader`; `knn.faiss.avx2.disabled` and the AVX-512 ones),
+`libopensearchknn_simd_avx2.so` on the fixtures' host, which the node
+logs as `opensearchknn_simd_avx2` and `tools/extract_opensearch.py`
+records in each manifest as `live_queries.simd_library`; with AVX2
+disabled there, it would load its generic library, built without F16C
+and fused multiply-adds, whose sums differ. Built for AVX2 and F16C,
+that library scores an fp16 vector with Faiss's own scalar quantizer
+distance computer for `QT_fp16` (`DefaultFaissSimilarityFunction`; Faiss
+5616caa, whose `ScalarQuantizer.cpp` k-NN's patches leave alone), on the
+float32 query and the fp16 components converted exactly (`vcvtph2ps`).
+For a dimension that is a multiple of 8 it sums in 8 lanes, one fused
+multiply-add per component, of the difference with itself for L2 and of
+the product for the inner product, and adds the lanes as `((l0 + l4) +
+(l2 + l6)) + ((l1 + l5) + (l3 + l7))` (`result_8`), the JVM's tree; for
+any other dimension it sums in order, one fused multiply-add each, which
+GCC made of `accu += tmp * tmp` and `accu += *yi++ * x` (the shipped
+library's code shows `vfmadd231ss`). k-NN then converts the sum to
+Lucene's score (`FaissScoreToLuceneScoreTransform`): `1 / (1 + d^2)` for
+L2, `1 / (1 - ip)` below 0 and `1 + ip` otherwise for the maximum inner
+product, and `(1 + ip) / 2` clamped to 0 to 1 for cosine, the inner
+product of k-NN's unit vectors standing for their cosine, where Lucene's
+cosine normalizes and clamps only below. A cosine field's fp16 vectors
+are of unit length only to fp16's rounding, each component at most 2^-11
+of itself from its float32 value, which k-NN leaves within 1e-4 of unit
+squared norm: a squared norm within about 1.1e-3 of 1. `scan` and
+`recall` hold such a field's vectors to twice that, as they hold a
+float32 cosine field's to 2e-4 (`scan` warns, `recall` refuses).
+`tools/fp16_rescore_oracle.py` runs k-NN's own rescorer
+(`tools/Fp16RescoreOracle.java`: k-NN's fp16 values over a memory-mapped
+file, with the library k-NN picks, which the script refuses unless it is
+the AVX2 one) over every similarity and 27 dimensions from 1 to 384: the
+port (`knn_recall::on_disk::fp16_exact_score`) matches every score bit
+for bit. On the fixtures, every result list the live index returned for
+100 queries in each of three modes is reproduced bit for bit, doc ids
+and scores, 900 lists in all. The AVX-512 and Arm libraries have fp16
+kernels of their own (an SPR build computes cosine's inner product in
+fp16 arithmetic), whose scores can differ.
 
 ### Bytes
 

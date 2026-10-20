@@ -259,6 +259,210 @@ fn a_half_float_on_disk_field_is_tied_by_its_own_format() {
 }
 
 #[test]
+fn every_half_float_space_recomputes_from_its_fp16_vec() {
+    // Lucene's writer normalizes a cosine field's vectors before it
+    // quantizes them, which leaves k-NN's float32 ones as they are but not
+    // their fp16 roundings: the corrections recompute from the decoded
+    // vectors normalized.
+    for space in ["innerproduct", "cosinesimil"] {
+        let dir = fixtures().join("on-disk-half-float").join(space);
+        let (code, f) = scan(&dir, &[]);
+        assert_eq!(code, Some(0), "{space}: {f}");
+        let q = &f["lucene_quantized"];
+        assert_eq!(q["status"], "match", "{space}: {q}");
+        assert!(
+            detail(q).contains("corrections agree with the 500 fp16 vectors of"),
+            "{space}: {q}"
+        );
+    }
+}
+
+/// `bytes`, a file with a codec header, with its codec name replaced by
+/// `codec`.
+fn recodec(bytes: &mut Vec<u8>, codec: &str) {
+    let len = usize::from(bytes[4]);
+    bytes.splice(5..5 + len, codec.bytes());
+    bytes[4] = u8::try_from(codec.len()).unwrap();
+}
+
+#[test]
+fn the_raw_files_are_the_flat_format_the_fields_format_keeps() {
+    // A float field's .vemf in k-NN's half-float codec, which the field's
+    // format does not read.
+    let s = Scratch::of("vemf-half-float-codec", "on-disk/l2");
+    s.edit(VEMF, |b| {
+        recodec(b, "KNN1040HalfFloatFlatVectorsFormatMeta");
+    });
+    let (code, f) = scan(&s.0, &[]);
+    let q = &f["lucene_quantized"];
+    assert_eq!(code, Some(1), "{q}");
+    assert_eq!(q["status"], "mismatch", "{q}");
+    assert!(
+        detail(q).ends_with(
+            ".vemf is a KNN1040HalfFloatFlatVectorsFormatMeta file, where the field's format, Faiss1040ScalarQuantizedKnnVectorsFormat, keeps its raw vectors in Lucene99FlatVectorsFormatMeta"
+        ),
+        "{q}"
+    );
+    // So does recall, its own search and results from elsewhere alike.
+    let native = s.0.join("_2_165_vec.faiss");
+    let o = run(&["recall", native.to_str().unwrap(), "--sample", "5"]);
+    assert_eq!(o.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        err.contains("is a KNN1040HalfFloatFlatVectorsFormatMeta file"),
+        "{err}"
+    );
+    let (queries, results) = (s.0.join("queries.f32"), s.0.join("results.jsonl"));
+    let o = run(&[
+        "recall",
+        native.to_str().unwrap(),
+        "--queries",
+        queries.to_str().unwrap(),
+        "--results",
+        results.to_str().unwrap(),
+    ]);
+    assert_eq!(o.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        err.contains("is a KNN1040HalfFloatFlatVectorsFormatMeta file"),
+        "{err}"
+    );
+
+    // A half_float field's in Lucene's.
+    let stem = "_2_Faiss1040HalfFloatScalarQuantizedKnnVectorsFormat_0";
+    let s = Scratch::of("vemf-lucene-codec", "on-disk-half-float/l2");
+    s.edit(&format!("{stem}.vemf"), |b| {
+        recodec(b, "Lucene99FlatVectorsFormatMeta");
+    });
+    let (code, f) = scan(&s.0, &[]);
+    let q = &f["lucene_quantized"];
+    assert_eq!(code, Some(1), "{q}");
+    assert!(
+        detail(q).ends_with("keeps its raw vectors in KNN1040HalfFloatFlatVectorsFormatMeta"),
+        "{q}"
+    );
+
+    // A .vec of the other format than its .vemf.
+    let s = Scratch::of("vec-codec", "on-disk/l2");
+    s.edit(VEC, |b| recodec(b, "KNN1040HalfFloatFlatVectorsFormatData"));
+    let (code, f) = scan(&s.0, &[]);
+    let q = &f["lucene_quantized"];
+    assert_eq!(code, Some(1), "{q}");
+    assert!(
+        detail(q).ends_with(
+            ".vec is a KNN1040HalfFloatFlatVectorsFormatData file, where its .vemf's format writes Lucene99FlatVectorsFormatData"
+        ),
+        "{q}"
+    );
+    // And a half_float field's .vec in Lucene's.
+    let s = Scratch::of("half-float-vec-codec", "on-disk-half-float/l2");
+    s.edit(&format!("{stem}.vec"), |b| {
+        recodec(b, "Lucene99FlatVectorsFormatData");
+    });
+    let (code, f) = scan(&s.0, &[]);
+    let q = &f["lucene_quantized"];
+    assert_eq!(code, Some(1), "{q}");
+    assert!(
+        detail(q).ends_with(
+            ".vec is a Lucene99FlatVectorsFormatData file, where its .vemf's format writes KNN1040HalfFloatFlatVectorsFormatData"
+        ),
+        "{q}"
+    );
+}
+
+#[test]
+fn a_cosine_fields_vectors_are_held_to_unit_length() {
+    // Vector 1 doubled: Lucene would have normalized it back to the
+    // vector its record was quantized from, so only its length shows it,
+    // as recall holds it.
+    let s = Scratch::of("cosine-doubled", "on-disk/cosinesimil");
+    s.edit(VEC, |b| {
+        let at = 128 + 64;
+        for c in b[at..at + 64].as_chunks_mut::<4>().0 {
+            *c = (2.0 * f32::from_le_bytes(*c)).to_le_bytes();
+        }
+    });
+    let (code, f) = scan(&s.0, &[]);
+    let q = &f["lucene_quantized"];
+    assert_eq!(code, Some(2), "{q}");
+    assert_eq!(q["status"], "warning", "{q}");
+    assert!(
+        detail(q).contains(
+            "1 of 500 vectors of the cosine field are not of unit length, as k-NN keeps them; first: vector 1, of squared norm 4.0000"
+        ),
+        "{q}"
+    );
+
+    // With a correction spoiled too, both are named.
+    spoil_a_correction(&s);
+    let (code, f) = scan(&s.0, &[]);
+    let q = &f["lucene_quantized"];
+    assert_eq!(code, Some(2), "{q}");
+    assert!(
+        detail(q).contains("first: vector 1, of squared norm 4.0000")
+            && detail(q).contains("1 of 500 records' additional corrections differ"),
+        "{q}"
+    );
+
+    // Vector 1 scaled to a squared norm of 1 + 5e-4, past the 2e-4 a
+    // float32 field's vectors stay within, warns; to 1 + 1.5e-4, within
+    // it, does not, though Lucene normalized it before quantizing.
+    for (squared_norm, warns) in [(1.0005_f32, true), (1.00015, false)] {
+        let s = Scratch::of("cosine-scaled", "on-disk/cosinesimil");
+        s.edit(VEC, |b| {
+            let at = 128 + 64;
+            let row: Vec<f32> = b[at..at + 64]
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
+                .collect();
+            let norm: f32 = row.iter().map(|x| x * x).sum();
+            let scale = (squared_norm / norm).sqrt();
+            for (c, x) in b[at..at + 64].as_chunks_mut::<4>().0.iter_mut().zip(row) {
+                *c = (scale * x).to_le_bytes();
+            }
+        });
+        let (code, f) = scan(&s.0, &[]);
+        let q = &f["lucene_quantized"];
+        if warns {
+            assert_eq!(code, Some(2), "{q}");
+            assert!(
+                detail(q).contains("first: vector 1, of squared norm 1.000"),
+                "{q}"
+            );
+        } else {
+            assert_eq!(code, Some(0), "{q}");
+            assert_eq!(q["status"], "match", "{q}");
+        }
+    }
+
+    // The same in a half_float field's fp16 vectors, their exponents one
+    // up.
+    let vec = "_2_Faiss1040HalfFloatScalarQuantizedKnnVectorsFormat_0.vec";
+    let s = Scratch::of(
+        "half-float-cosine-doubled",
+        "on-disk-half-float/cosinesimil",
+    );
+    s.edit(vec, |b| {
+        let at = 128 + 32;
+        for c in b[at..at + 32].as_chunks_mut::<2>().0 {
+            let h = u16::from_le_bytes(*c);
+            if h & 0x7FFF != 0 {
+                *c = (h + 0x0400).to_le_bytes();
+            }
+        }
+    });
+    let (code, f) = scan(&s.0, &[]);
+    let q = &f["lucene_quantized"];
+    assert_eq!(code, Some(2), "{q}");
+    assert!(
+        detail(q).contains("first: vector 1, of squared norm 4.0000"),
+        "{q}"
+    );
+}
+
+#[test]
 fn a_half_float_fields_fp16_vec_is_compared() {
     // The fp16 .vec holds its vectors from offset 128, two bytes a
     // component: doubling vector 3's first component, which its record's
@@ -1514,6 +1718,9 @@ fn the_field_infos_must_record_a_quantized_k_nn_field() {
                     "PerFieldKnnVectorsFormat.format",
                     "NativeEngines990KnnVectorsFormat",
                 );
+                // A space type no quantized field takes: the format
+                // decides first.
+                set_attribute(b, "spaceType", "hamming");
             },
             "mismatch",
             "the .fnm records field \"vec\" in NativeEngines990KnnVectorsFormat, which keeps the vectors in the native file, not beside a graph without them",
@@ -1578,6 +1785,44 @@ fn the_field_infos_must_record_a_quantized_k_nn_field() {
 }
 
 #[test]
+fn the_field_infos_similarity_is_its_space_types() {
+    // The cosine field relabeled innerproduct: the .fnm, .vemq, and graph
+    // all agree on the cosine similarity, but k-NN's exact search would
+    // rescore with the space type's maximum inner product instead.
+    let s = Scratch::of("fnm-space-similarity", "on-disk/cosinesimil");
+    s.edit(FNM, |b| set_attribute(b, "spaceType", "innerproduct"));
+    let (code, f) = scan(&s.0, &[]);
+    assert_eq!(code, Some(1), "{f}");
+    let q = &f["lucene_quantized"];
+    assert_eq!(q["status"], "mismatch", "{q}");
+    assert_eq!(
+        detail(q),
+        "the .fnm records the cosine similarity for field \"vec\", not the one k-NN records for its innerproduct space type"
+    );
+    // A space type k-NN gives no float field in this format.
+    let hamming = Scratch::of("fnm-space-hamming", "on-disk/l2");
+    hamming.edit(FNM, |b| set_attribute(b, "spaceType", "hamming"));
+    let (code, f) = scan(&hamming.0, &[]);
+    assert_eq!(code, Some(1), "{f}");
+    assert_eq!(
+        detail(&f["lucene_quantized"]),
+        "the .fnm records the hamming space type for field \"vec\", which k-NN gives no field in Faiss1040ScalarQuantizedKnnVectorsFormat"
+    );
+    let o = run(&[
+        "recall",
+        s.0.join("_2_165_vec.faiss").to_str().unwrap(),
+        "--sample",
+        "5",
+    ]);
+    assert_eq!(o.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        err.contains("not the one k-NN records for its innerproduct space type"),
+        "{err}"
+    );
+}
+
+#[test]
 fn the_field_infos_must_agree_with_the_vemq() {
     // The vec field's record ends the .fnm: its dimension, encoding, and
     // similarity are the three bytes before the footer.
@@ -1607,6 +1852,8 @@ fn the_field_infos_must_agree_with_the_vemq() {
                 let at = b.len() - 17;
                 assert_eq!(b[at], 0, "the similarity, EUCLIDEAN");
                 b[at] = 3;
+                // The space type of that similarity, as k-NN records it.
+                set_attribute(b, "spaceType", "innerproduct");
             },
             "the .fnm records the maximum_inner_product similarity for field \"vec\", the .vemq the euclidean",
         ),

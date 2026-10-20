@@ -88,13 +88,31 @@ const CASES: &[Case] = &[
     // Lucene files under a longer suffix.
     Case {
         dir: "on-disk-half-float/l2",
-        stem: "_2_Faiss1040HalfFloatScalarQuantizedKnnVectorsFormat_0",
+        stem: HALF_FLOAT_STEM,
         data_offset: 120,
         similarity: 0,
         encoding: ScalarEncoding::SingleBitQueryNibble,
         record_size: 18,
     },
+    Case {
+        dir: "on-disk-half-float/innerproduct",
+        stem: HALF_FLOAT_STEM,
+        data_offset: 120,
+        similarity: 3,
+        encoding: ScalarEncoding::SingleBitQueryNibble,
+        record_size: 18,
+    },
+    Case {
+        dir: "on-disk-half-float/cosinesimil",
+        stem: HALF_FLOAT_STEM,
+        data_offset: 120,
+        similarity: 2,
+        encoding: ScalarEncoding::SingleBitQueryNibble,
+        record_size: 18,
+    },
 ];
+
+const HALF_FLOAT_STEM: &str = "_2_Faiss1040HalfFloatScalarQuantizedKnnVectorsFormat_0";
 
 /// The fixture's vectors as indexed, row i document i.
 fn vectors(dir: &Path) -> Vec<[f32; 16]> {
@@ -138,16 +156,21 @@ fn real_fixtures_record_one_quantized_field_of_500_vectors() {
 
         // The centroid is the vectors' mean (normalized for cosine), the
         // fixtures having no deleted documents, whose vectors a merge would
-        // count too; and the stored dot product is its own.
-        // A half_float field's centroid is the mean of its fp16 values.
-        let rows = if case.stem == STEM {
+        // count too; and the stored dot product is its own. A half_float
+        // field's centroid is the mean of its fp16 values as the .vec
+        // holds them, for cosine k-NN's normalized vectors rounded, which
+        // the merge does not normalize again before it takes their mean;
+        // a float field's here the mean of the vectors indexed, which k-NN
+        // normalizes for cosine.
+        let indexed = case.stem == STEM;
+        let rows = if indexed {
             vectors(&dir)
         } else {
             vec_rows(&dir, case.stem)
         };
         let mut mean = [0.0_f64; 16];
         for row in &rows {
-            let norm = if case.similarity == 2 {
+            let norm = if case.similarity == 2 && indexed {
                 row.iter()
                     .map(|&x| f64::from(x) * f64::from(x))
                     .sum::<f64>()
@@ -247,9 +270,12 @@ fn additional_corrections_are_the_quantizers_own() {
     // for the Euclidean similarity, the dot product otherwise. Every
     // fixture's corrections recompute exactly from the `.vec`, the cosine
     // one's too: its vectors are k-NN's normalized ones, which Lucene's
-    // merge leaves as they are; and the half_float one's from its fp16
-    // values, decoded.
-    for case in CASES {
+    // merge leaves as they are; and the half_float ones' from their fp16
+    // values, decoded. The half_float cosine field is left out: its fp16
+    // values are k-NN's normalized vectors rounded, which Lucene's merge
+    // normalizes again before it quantizes them, by a sum this crate does
+    // not port; knn-recall's quantizer tests recompute it bit for bit.
+    for case in CASES.iter().filter(|c| c.stem == STEM || c.similarity != 2) {
         let dir = fixtures().join(case.dir);
         let meta = QuantizedVectorsMeta::parse(
             &fs::read(dir.join(format!("{}.vemq", case.stem))).unwrap(),

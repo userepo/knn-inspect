@@ -1,7 +1,7 @@
 //! The port of Lucene's `OptimizedScalarQuantizer` against every record of
 //! the `on_disk` fixtures, which Lucene's merge quantized from the vectors
-//! their `.vec` holds; and against vectors built by hand for what the
-//! fixtures lack.
+//! their `.vec` holds, float32 or fp16; and against vectors built by hand
+//! for what the fixtures lack.
 
 #![allow(
     clippy::unwrap_used,
@@ -27,7 +27,15 @@ fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/opensearch-3.9.0-binary")
 }
 
-const STEM: &str = "_2_Faiss1040ScalarQuantizedKnnVectorsFormat_0";
+/// The stem of the fixture's field files: its per-field format and suffix,
+/// k-NN's half-float one for a `half_float` field.
+fn stem(fixture: &str) -> &'static str {
+    if fixture.starts_with("on-disk-half-float/") {
+        "_2_Faiss1040HalfFloatScalarQuantizedKnnVectorsFormat_0"
+    } else {
+        "_2_Faiss1040ScalarQuantizedKnnVectorsFormat_0"
+    }
+}
 
 /// The fixtures, each with the encoding and similarity its `.vemq` records.
 const CASES: &[(&str, ScalarEncoding, Similarity)] = &[
@@ -56,15 +64,30 @@ const CASES: &[(&str, ScalarEncoding, Similarity)] = &[
         ScalarEncoding::PackedNibble,
         Similarity::Euclidean,
     ),
+    (
+        "on-disk-half-float/l2",
+        ScalarEncoding::SingleBitQueryNibble,
+        Similarity::Euclidean,
+    ),
+    (
+        "on-disk-half-float/innerproduct",
+        ScalarEncoding::SingleBitQueryNibble,
+        Similarity::MaximumInnerProduct,
+    ),
+    (
+        "on-disk-half-float/cosinesimil",
+        ScalarEncoding::SingleBitQueryNibble,
+        Similarity::Cosine,
+    ),
 ];
 
-/// The float32 vectors the segment's `.vec` holds, where its `.vemf` puts
-/// them.
-fn vec_rows(dir: &Path) -> Vec<Vec<f32>> {
+/// The vectors the segment's `.vec` holds, where its `.vemf` puts them, as
+/// float32: a `half_float` field's fp16 ones decoded.
+fn vec_rows(dir: &Path, stem: &str) -> Vec<Vec<f32>> {
     let meta =
-        FlatVectorsMeta::parse(&fs::read(dir.join(format!("{STEM}.vemf"))).unwrap()).unwrap();
-    let vec = fs::read(dir.join(format!("{STEM}.vec"))).unwrap();
-    let rows = meta.fields[0].float32_rows(&vec).unwrap();
+        FlatVectorsMeta::parse(&fs::read(dir.join(format!("{stem}.vemf"))).unwrap()).unwrap();
+    let vec = fs::read(dir.join(format!("{stem}.vec"))).unwrap();
+    let rows = meta.fields[0].vector_rows(&vec).unwrap();
     (0..rows.len())
         .map(|i| rows.row(i).unwrap().collect())
         .collect()
@@ -73,10 +96,12 @@ fn vec_rows(dir: &Path) -> Vec<Vec<f32>> {
 #[test]
 fn every_fixture_record_recomputes_bit_for_bit() {
     let mut records_seen = 0;
+    let mut normalized = 0;
     for &(fixture, encoding, similarity) in CASES {
         let dir = fixtures().join(fixture);
+        let stem = stem(fixture);
         let meta =
-            QuantizedVectorsMeta::parse(&fs::read(dir.join(format!("{STEM}.vemq"))).unwrap())
+            QuantizedVectorsMeta::parse(&fs::read(dir.join(format!("{stem}.vemq"))).unwrap())
                 .unwrap();
         let field = &meta.fields[0];
         assert_eq!(field.scalar_encoding, Some(encoding), "{fixture}");
@@ -85,22 +110,24 @@ fn every_fixture_record_recomputes_bit_for_bit() {
             Some(similarity),
             "{fixture}"
         );
-        let bytes = fs::read(dir.join(format!("{STEM}.veq"))).unwrap();
+        let bytes = fs::read(dir.join(format!("{stem}.veq"))).unwrap();
         let data = DataFile::parse(&bytes).unwrap();
         let records = QuantizedVectors::open(&bytes, &data, field).unwrap();
         let quantizer = OptimizedScalarQuantizer::new(similarity);
-        let rows = vec_rows(&dir);
+        let rows = vec_rows(&dir, stem);
         assert_eq!(rows.len(), records.len(), "{fixture}");
         for (i, row) in rows.into_iter().enumerate() {
             // Lucene's merge normalizes a cosine field's vectors, which
-            // k-NN's already are.
+            // k-NN's float32 ones already are, but not always their fp16
+            // roundings.
             let mut v = row;
             if similarity == Similarity::Cosine {
-                assert_eq!(
-                    l2normalize(&mut v),
-                    Some(false),
+                let divided = l2normalize(&mut v).unwrap();
+                assert!(
+                    !divided || fixture.starts_with("on-disk-half-float/"),
                     "{fixture}: vector {i} is a unit vector"
                 );
+                normalized += usize::from(divided);
             }
             let (packed, result) = quantize_record(&quantizer, encoding, &v, &field.centroid)
                 .unwrap_or_else(|| panic!("{fixture}: vector {i} quantizes"));
@@ -124,7 +151,10 @@ fn every_fixture_record_recomputes_bit_for_bit() {
             records_seen += 1;
         }
     }
-    assert_eq!(records_seen, 2500, "five fixtures of 500 vectors");
+    assert_eq!(records_seen, 4000, "eight fixtures of 500 vectors");
+    // Some of the half_float cosine field's, which the comparison then
+    // holds to Lucene's division.
+    assert!(normalized > 0);
 }
 
 /// One case of `tools/quantizer_oracle.py`: the similarity, bits, vector,
