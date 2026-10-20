@@ -11,13 +11,15 @@ use anyhow::{Context, bail};
 use clap::Args;
 use knn_format::NativeFile;
 use knn_format::faiss::{IdMapIndex, Storage};
-use knn_format::flat_vectors::FlatVectorsMeta;
-use knn_format::quantized_vectors::{DataFile, QuantizedVectors, QuantizedVectorsMeta};
-use knn_recall::on_disk::{DEFAULT_EF_SEARCH, OnDiskField, Plan, Rescore};
+use knn_format::flat_vectors::{FlatField, FlatVectorsMeta};
+use knn_format::quantized_vectors::{DataFile, QuantizedVectors};
+use knn_recall::on_disk::{DEFAULT_EF_SEARCH, OnDiskField, Plan, Rescore, field_vectors};
+use knn_recall::quantizer::Similarity;
 use knn_recall::{Labels, Queries, Recall};
 use serde::Serialize;
 
-use crate::scan::quantized::field_files;
+use crate::scan::quantized::{Graph, Quantized, field_files, similarity_name};
+use crate::scan::shown;
 
 /// Arguments of `recall`.
 #[derive(Debug, Args)]
@@ -50,8 +52,9 @@ pub struct RecallArgs {
     pub k: usize,
     /// Candidate queue size for the tool's own search; the file's efSearch
     /// when absent. At least 1: with 0 the search stops after one step. For
-    /// a graph without its vectors, the index's `ef_search` setting, which
-    /// k-NN reads instead of the file's: 100 when absent.
+    /// a graph without its vectors, the index's `ef_search` setting or a
+    /// query's `method_parameters.ef_search`, which k-NN reads instead of
+    /// the file's: 100 when absent.
     #[arg(long, conflicts_with = "results", value_parser = clap::value_parser!(u64).range(1..))]
     pub ef_search: Option<u64>,
     /// For a graph without its vectors: rescore the first pass with this
@@ -176,44 +179,61 @@ pub fn run(args: &RecallArgs) -> anyhow::Result<ExitCode> {
 
 /// `recall` on a graph without its vectors: the field the segment's `.fnm`
 /// ties it to, searched as k-NN searches it, against the field's float32
-/// vectors in the `.vec`.
+/// vectors in the `.vec`. Result lists from elsewhere are scored against
+/// the `.vec` alone, without the quantized files.
 fn run_on_disk(args: &RecallArgs, index: &IdMapIndex<'_>) -> anyhow::Result<ExitCode> {
     let path = &args.file;
-    let files = field_files(path).map_err(|why| anyhow::anyhow!("{}: {why}", path.display()))?;
-    let open = |ext: &str| {
-        let p = files.vemq.with_extension(ext);
-        NativeFile::open(&p).with_context(|| format!("opening {}", p.display()))
-    };
-    let (meta_file, data_file) = (open("vemq")?, open("veq")?);
-    let (raw_meta_file, raw_file) = (open("vemf")?, open("vec")?);
-    let shown = |ext: &str| files.vemq.with_extension(ext).display().to_string();
-    let meta = QuantizedVectorsMeta::parse(meta_file.bytes())
-        .with_context(|| format!("reading {}", shown("vemq")))?;
-    let field = meta
-        .fields
-        .iter()
-        .find(|f| u32::try_from(f.field_number).ok() == Some(files.number))
-        .with_context(|| format!("{}: no field {}", shown("vemq"), files.number))?;
-    let data =
-        DataFile::parse(data_file.bytes()).with_context(|| format!("reading {}", shown("veq")))?;
-    let records = QuantizedVectors::open(data_file.bytes(), &data, field)
-        .with_context(|| format!("reading {}", shown("veq")))?;
-    let flat = FlatVectorsMeta::parse(raw_meta_file.bytes())
-        .with_context(|| format!("reading {}", shown("vemf")))?;
+    let at = |why: String| anyhow::anyhow!("{}: {why}", path.display());
+    let files = field_files(path).map_err(at)?;
+    let ext = |ext: &str| shown(&files.vemq.with_extension(ext));
+    let flat = FlatVectorsMeta::parse(files.raw_meta.bytes())
+        .with_context(|| format!("reading {}", ext("vemf")))?;
     let flat_field = flat
         .fields
         .iter()
         .find(|f| u32::try_from(f.field_number).ok() == Some(files.number))
-        .with_context(|| format!("{}: no field {}", shown("vemf"), files.number))?;
-    let on_disk = OnDiskField::new(index, field, records, flat_field, raw_file.bytes())
+        .with_context(|| format!("{}: no field {}", ext("vemf"), files.number))?;
+    let vec = files.raw.bytes();
+    // The .fnm's similarity, as the .vemf records it for the field.
+    if let Some(recorded) = flat_field.similarity
+        && recorded != files.similarity
+    {
+        bail!(
+            "{}: {} records the {} similarity for field {}, the .fnm the {}",
+            path.display(),
+            ext("vemf"),
+            similarity_name(recorded).unwrap_or("?"),
+            files.number,
+            similarity_name(files.similarity).unwrap_or("?")
+        );
+    }
+    if let Some(p) = &args.results {
+        return score_on_disk(args, index, files.similarity, flat_field, vec, p);
+    }
+    let Quantized {
+        meta,
+        data: data_file,
+        warning,
+    } = files.quantized(Graph::of(index)).map_err(at)?;
+    if let Some(warning) = warning {
+        eprintln!("warning: {}: {warning}", path.display());
+    }
+    let field = meta
+        .fields
+        .iter()
+        .find(|f| u32::try_from(f.field_number).ok() == Some(files.number))
+        .with_context(|| format!("{}: no field {}", ext("vemq"), files.number))?;
+    let data =
+        DataFile::parse(data_file.bytes()).with_context(|| format!("reading {}", ext("veq")))?;
+    let records = QuantizedVectors::open(data_file.bytes(), &data, field)
+        .with_context(|| format!("reading {}", ext("veq")))?;
+    let on_disk = OnDiskField::new(index, field, records, flat_field, vec)
         .with_context(|| format!("{}: the field's files", path.display()))?;
     let storage = on_disk.storage();
     let dimension = knn_recall::query_dimension(&storage)
         .with_context(|| format!("{}: no query can match it", path.display()))?;
     let (queries, sample) = load_queries(args, &storage, dimension)?;
-    let (results, search) = if let Some(p) = &args.results {
-        (read_results(p)?, None)
-    } else {
+    let (results, search) = {
         let rescore = match (args.no_rescore, args.oversample) {
             (true, _) => Rescore::Off,
             (false, Some(f)) => Rescore::Oversample(f),
@@ -246,6 +266,43 @@ fn run_on_disk(args: &RecallArgs, index: &IdMapIndex<'_>) -> anyhow::Result<Exit
             sample,
             results,
             search,
+        },
+    )
+}
+
+/// `recall --results` on a graph without its vectors: the lists scored
+/// against the field's float32 vectors in `vec`, which `flat` places, the
+/// `.fnm` recording `similarity` for the field.
+fn score_on_disk(
+    args: &RecallArgs,
+    index: &IdMapIndex<'_>,
+    similarity: i32,
+    flat: &FlatField,
+    vec: &[u8],
+    results: &Path,
+) -> anyhow::Result<ExitCode> {
+    let path = &args.file;
+    let similarity = Similarity::from_ordinal(similarity).ok_or(knn_recall::Error::Similarity {
+        ordinal: similarity,
+    })?;
+    let storage = Storage::Flat(
+        field_vectors(index, similarity, flat, vec)
+            .with_context(|| format!("{}: the field's float32 vectors", path.display()))?,
+    );
+    let dimension = knn_recall::query_dimension(&storage)
+        .with_context(|| format!("{}: no query can match it", path.display()))?;
+    let (queries, sample) = load_queries(args, &storage, dimension)?;
+    let results = read_results(results)?;
+    report(
+        args,
+        index,
+        &storage,
+        dimension,
+        Searched {
+            queries,
+            sample,
+            results,
+            search: None,
         },
     )
 }

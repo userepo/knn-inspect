@@ -17,8 +17,10 @@ default), `sq-fp16` (the `sq` encoder with `type: fp16`, `bits: 16`),
 `sq-bf16` (the same with `type: bf16`), `half-float` (the `half_float`
 data type), `byte` (the `byte` data type), `binary` (the `binary` data
 type), `binary-encoder` (a float field with the `binary` encoder,
-`bits: 1`), or `on-disk` (a float field in `on_disk` mode, at its
-default 32x compression, or the `--compression` given: 32x, 16x, or 8x).
+`bits: 1`), `on-disk` (a float field in `on_disk` mode, at its default
+32x compression, or the `--compression` given: 32x, 16x, or 8x), or
+`on-disk-half-float` (a `half_float` field in `on_disk` mode, which k-NN
+writes in its own quantized format, its `.vec` in fp16).
 The vectors indexed are the same for every encoding, except that `byte`
 scales them by 32, rounds them, and clips them to [-128, 127], the only
 values a byte field takes, and `binary` keeps one bit per component of
@@ -62,6 +64,7 @@ Usage:
     python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-binary/on-disk --encoding on-disk --spaces innerproduct cosinesimil --queries 100
     python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-binary/on-disk-16x --encoding on-disk --compression 16x --spaces l2 --queries 100
     python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-binary/on-disk-8x --encoding on-disk --compression 8x --spaces l2 --queries 100
+    python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-binary/on-disk-half-float --encoding on-disk-half-float --spaces l2
 """
 
 from __future__ import annotations
@@ -86,7 +89,7 @@ BYTE_SPACES = ["l2", "innerproduct"]
 # k-NN accepts only hamming for binary fields, and hamming for nothing
 # else.
 BINARY_SPACES = ["hamming"]
-ENCODINGS = ["float", "sq-fp16", "sq-bf16", "half-float", "byte", "binary", "binary-encoder", "on-disk"]
+ENCODINGS = ["float", "sq-fp16", "sq-bf16", "half-float", "byte", "binary", "binary-encoder", "on-disk", "on-disk-half-float"]
 # The compression levels at which an on_disk Faiss field quantizes to 1,
 # 2, or 4 bits a component; 32x is its default.
 COMPRESSIONS = ["32x", "16x", "8x"]
@@ -155,8 +158,10 @@ def create_index(host: str, index: str, space: str, dim: int, compound: bool, en
         field["data_type"] = "byte"
     elif encoding == "binary":
         field["data_type"] = "binary"
-    elif encoding == "on-disk":
+    elif encoding in ("on-disk", "on-disk-half-float"):
         field["mode"] = "on_disk"
+        if encoding == "on-disk-half-float":
+            field["data_type"] = "half_float"
         if compression is not None:
             field["compression_level"] = compression
     field["space_type"] = space
@@ -306,7 +311,7 @@ def main() -> None:
     parser.add_argument("--spaces", nargs="+", choices=SPACES + BINARY_SPACES, help="default: every space the encoding allows")
     parser.add_argument("--batches", type=int, default=2, help="bulk batches before the force merge")
     parser.add_argument("--encoding", default="float", choices=ENCODINGS, help="how the field stores its vectors")
-    parser.add_argument("--compression", choices=COMPRESSIONS, help="on-disk only: the field's compression level, 32x when absent")
+    parser.add_argument("--compression", choices=COMPRESSIONS, help="the on-disk encodings only: the field's compression level, 32x when absent")
     parser.add_argument("--queries", type=int, default=0, help="on-disk only: query the live index this many times and record the results")
     args = parser.parse_args()
     if args.count > MAX_RESULT_WINDOW:
@@ -315,8 +320,8 @@ def main() -> None:
     spaces = args.spaces or allowed
     if refused := [s for s in spaces if s not in allowed]:
         parser.error(f"k-NN's Faiss engine refuses {', '.join(refused)} for {args.encoding} fields")
-    if args.compression is not None and args.encoding != "on-disk":
-        parser.error("--compression applies to --encoding on-disk only")
+    if args.compression is not None and not args.encoding.startswith("on-disk"):
+        parser.error("--compression applies to the on-disk encodings only")
     if args.queries and args.encoding != "on-disk":
         parser.error("--queries applies to --encoding on-disk only")
     if args.encoding == "binary" and args.dim % 8:
@@ -397,7 +402,7 @@ def main() -> None:
             "request": body,
             "files": files,
         }
-        if args.encoding == "on-disk":
+        if args.encoding.startswith("on-disk"):
             manifest["compression_level"] = args.compression or "32x"
         if args.queries:
             manifest["live_queries"] = record_queries(args.host, index, dest, args.dim, args.queries, pos_of_doc)

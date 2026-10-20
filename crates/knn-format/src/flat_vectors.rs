@@ -207,7 +207,8 @@ impl FlatVectorsMeta {
     ///
     /// Returns an error when the file has no codec header, names another
     /// codec or version, a record runs out or holds an impossible value,
-    /// or bytes follow the last record, where Lucene expects the footer.
+    /// bytes follow the last record, where Lucene expects the footer, or
+    /// the file does not end with one.
     pub fn parse(bytes: &[u8]) -> Result<Self> {
         let envelope = Envelope::parse(bytes)?;
         let Some(header) = envelope.header else {
@@ -245,6 +246,11 @@ impl FlatVectorsMeta {
                 offset: cur.offset(),
                 what: "after the last flat-vectors record",
                 count: trailing,
+            });
+        }
+        if envelope.footer.is_none() {
+            return Err(Error::MissingFooter {
+                offset: bytes.len(),
             });
         }
         Ok(Self { format, fields })

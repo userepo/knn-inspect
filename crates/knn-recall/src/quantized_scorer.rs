@@ -119,9 +119,11 @@ impl QuantizedScorer {
     /// `fma(lx ly, cc, fma(ax ly, sy, fma(ax ay, d, ay lx sx)))`, each
     /// product but the second fused with the sum before it, and the
     /// Euclidean distance clamped as `std::max(0, distance)`, a NaN to 0.
+    /// k-NN scores the other encodings with Lucene's scorer, so for them
+    /// this changes nothing.
     #[must_use]
     pub fn knn_native_kernel(mut self) -> Self {
-        self.native_kernel = true;
+        self.native_kernel = self.encoding == ScalarEncoding::SingleBitQueryNibble;
         self
     }
 
@@ -197,13 +199,30 @@ impl QuantizedScorer {
 /// The dot product of the query's codes with a stored vector's, unpacked
 /// from `packed` as [`crate::quantizer::pack`] packs them. Lucene sums it
 /// by bit planes for the 1- and 2-bit encodings; the integer is the same.
+///
+/// The query's codes are read as Lucene reads them, which matters only
+/// for a code past its bits, which the quantizer gives when an interval
+/// is a few subnormals wide (see [`crate::quantizer`]): for the 1- and
+/// 2-bit encodings `transposeHalfByte` keeps a code's low 4 bits; for the
+/// nibble and 7-bit ones, a byte is signed; for unsigned bytes, it is not.
 fn code_dot_product(encoding: ScalarEncoding, query: &[u8], packed: &[u8]) -> i64 {
+    let query_code = |q: u8| -> i64 {
+        match encoding {
+            ScalarEncoding::UnsignedByte => i64::from(q),
+            ScalarEncoding::SevenBit | ScalarEncoding::PackedNibble => {
+                i64::from(i8::from_le_bytes([q]))
+            }
+            ScalarEncoding::SingleBitQueryNibble | ScalarEncoding::DibitQueryNibble => {
+                i64::from(q & 0x0F)
+            }
+        }
+    };
     let code = |j: usize| -> i64 {
         match encoding {
             ScalarEncoding::UnsignedByte => packed.get(j).map_or(0, |&b| i64::from(b)),
-            // Lucene's dotProduct(byte[], byte[]) reads both as signed: the
-            // query's 7-bit codes are the same either way, and a stored
-            // byte of 128 or more, which no 7-bit record holds, is negative.
+            // Lucene's dotProduct(byte[], byte[]) reads the stored byte as
+            // signed too: one of 128 or more, which a 7-bit record holds
+            // only from a degenerate interval, is negative.
             ScalarEncoding::SevenBit => packed
                 .get(j)
                 .map_or(0, |&b| i64::from(i8::from_le_bytes([b]))),
@@ -225,7 +244,7 @@ fn code_dot_product(encoding: ScalarEncoding, query: &[u8], packed: &[u8]) -> i6
     query
         .iter()
         .enumerate()
-        .map(|(j, &q)| i64::from(q) * code(j))
+        .map(|(j, &q)| query_code(q) * code(j))
         .sum()
 }
 

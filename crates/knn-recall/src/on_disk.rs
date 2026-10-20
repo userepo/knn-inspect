@@ -72,6 +72,119 @@ const MAX_FIRST_PASS: i32 = 10_000;
 /// `KNNQueryBuilder.K_MAX`: the largest `k` k-NN accepts.
 pub const MAX_K: usize = 10_000;
 
+/// How far a cosine field's vector's squared norm may be from 1: k-NN
+/// leaves a vector whose squared norm is within 1e-4 of 1 as it is
+/// (`VectorUtil.l2normalize`) and normalizes any other to within float32
+/// rounding of 1; the norm is summed here in f64, so twice that bound.
+const UNIT_TOLERANCE: f64 = 2e-4;
+
+/// The float32 vectors of the field of a graph without its vectors,
+/// `index`, as storage of the graph's metric, row `i` node `i`'s: `flat`
+/// is the field's record in the `.vemf`, which places them in `vec`, the
+/// `.vec`. They serve as the file's own vectors for ground truth and
+/// sampling, and are what k-NN rescores against.
+///
+/// # Errors
+///
+/// Returns an error when the file holds its own vectors, its metric is
+/// neither L2 nor inner product, its ID map holds another number of
+/// labels than the graph has nodes or a label that is not a doc id, the
+/// `.vemf` places no float32 vectors in the `.vec`, they disagree with the
+/// graph on the dimension or the vector count, one holds a value that is
+/// not finite, which k-NN refuses, or, for a field of the cosine
+/// similarity, one is not of unit length: the ground truth of the graph's
+/// inner product is the cosine's only over k-NN's normalized vectors.
+pub fn field_vectors<'a>(
+    index: &IdMapIndex<'_>,
+    similarity: Similarity,
+    flat: &FlatField,
+    vec: &'a [u8],
+) -> Result<FlatStorage<'a>> {
+    if index.index.storage.is_some() {
+        return Err(Error::HasVectors);
+    }
+    let fourcc = match index.metric() {
+        Metric::L2 => FourCc::FLAT_L2,
+        Metric::InnerProduct => FourCc::FLAT_IP,
+        Metric::Hamming | Metric::Other(_) => {
+            return Err(Error::Metric {
+                metric_type: index.header.metric_type,
+            });
+        }
+    };
+    let d = index.index.header.d;
+    let dimension = usize::try_from(d).map_err(|_| Error::Dimension { d })?;
+    let nodes = index.index.graph.node_count();
+    if index.id_map.len() != nodes {
+        return Err(Error::LabelCount {
+            nodes,
+            labels: index.id_map.len(),
+        });
+    }
+    // k-NN's labels are Lucene doc ids, which are ints.
+    if let Some(label) = index
+        .id_map
+        .iter()
+        .map(|l| l.get())
+        .find(|&l| i32::try_from(l).map_or(true, |doc| doc < 0))
+    {
+        return Err(Error::DocId { label });
+    }
+    shape(
+        "float32 dimension",
+        dimension,
+        usize::try_from(flat.dimension).unwrap_or(usize::MAX),
+    )?;
+    shape(
+        "float32 vectors",
+        nodes,
+        usize::try_from(flat.count).unwrap_or(usize::MAX),
+    )?;
+    let raw = flat.float32_components(vec).ok_or(Error::NoFloatVectors)?;
+    if let Some(i) = raw.iter().position(|x| !x.get().is_finite()) {
+        return Err(Error::NotFinite {
+            node: i.checked_div(dimension).unwrap_or(0),
+            component: i.checked_rem(dimension).unwrap_or(0),
+        });
+    }
+    if similarity == Similarity::Cosine && dimension > 0 {
+        for (node, row) in raw.chunks_exact(dimension).enumerate() {
+            let squared_norm: f64 = row
+                .iter()
+                .map(|x| f64::from(x.get()) * f64::from(x.get()))
+                .sum();
+            let off = (squared_norm - 1.0).abs();
+            if off.is_nan() || off > UNIT_TOLERANCE {
+                return Err(Error::NotNormalized { node, squared_norm });
+            }
+        }
+    }
+    Ok(FlatStorage {
+        fourcc,
+        header: IndexHeader {
+            offset: 0,
+            d,
+            ntotal: i64::try_from(nodes).unwrap_or(i64::MAX),
+            is_trained: true,
+            metric_type: index.header.metric_type,
+            kind: HeaderKind::Float {
+                reserved: [1 << 20; 2],
+                metric_arg: None,
+            },
+        },
+        codes: raw,
+    })
+}
+
+/// `Ok` when the graph's and the field's counts of `what` agree.
+fn shape(what: &'static str, graph: usize, field: usize) -> Result<()> {
+    if graph == field {
+        Ok(())
+    } else {
+        Err(Error::OnDiskShape { what, graph, field })
+    }
+}
+
 /// How the first pass's results are rescored.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Rescore {
@@ -119,12 +232,10 @@ impl<'a> OnDiskField<'a> {
     ///
     /// # Errors
     ///
-    /// Returns an error when the file holds its own vectors, its metric is
-    /// neither L2 nor inner product, its labels repeat or are not doc ids,
-    /// the field holds no vectors or not in an encoding k-NN writes, its
-    /// similarity is not Lucene's, the `.vemf` places no float32 vectors in
-    /// the `.vec`, or the parts disagree on the dimension or the vector
-    /// count.
+    /// Returns an error when the field holds no vectors or not in an
+    /// encoding k-NN writes, its similarity is not Lucene's, its labels
+    /// repeat or are not doc ids, the parts disagree on the dimension or the
+    /// vector count, or as [`field_vectors`] does.
     pub fn new(
         index: &'a IdMapIndex<'a>,
         field: &'a QuantizedField,
@@ -135,16 +246,6 @@ impl<'a> OnDiskField<'a> {
         if index.index.storage.is_some() {
             return Err(Error::HasVectors);
         }
-        let metric = index.metric();
-        let fourcc = match metric {
-            Metric::L2 => FourCc::FLAT_L2,
-            Metric::InnerProduct => FourCc::FLAT_IP,
-            Metric::Hamming | Metric::Other(_) => {
-                return Err(Error::Metric {
-                    metric_type: index.header.metric_type,
-                });
-            }
-        };
         let encoding = field.scalar_encoding.ok_or(Error::NoQuantizedVectors)?;
         if !encoding.is_knn() {
             return Err(Error::Encoding {
@@ -156,13 +257,6 @@ impl<'a> OnDiskField<'a> {
         })?;
         let d = index.index.header.d;
         let nodes = index.index.graph.node_count();
-        let shape = |what, graph: usize, field: usize| {
-            if graph == field {
-                Ok(())
-            } else {
-                Err(Error::OnDiskShape { what, graph, field })
-            }
-        };
         let dimension = usize::try_from(d).map_err(|_| Error::Dimension { d })?;
         shape(
             "dimension",
@@ -170,43 +264,8 @@ impl<'a> OnDiskField<'a> {
             usize::try_from(field.dimension).unwrap_or(usize::MAX),
         )?;
         shape("vectors", nodes, records.len())?;
-        shape("labels", nodes, index.id_map.len())?;
-        shape(
-            "float32 dimension",
-            dimension,
-            usize::try_from(flat.dimension).unwrap_or(usize::MAX),
-        )?;
-        shape(
-            "float32 vectors",
-            nodes,
-            usize::try_from(flat.count).unwrap_or(usize::MAX),
-        )?;
-        let raw = flat.float32_components(vec).ok_or(Error::NoFloatVectors)?;
-        // k-NN's labels are Lucene doc ids, which are ints.
-        if let Some(label) = index
-            .id_map
-            .iter()
-            .map(|l| l.get())
-            .find(|&l| i32::try_from(l).map_or(true, |doc| doc < 0))
-        {
-            return Err(Error::DocId { label });
-        }
+        let raw = field_vectors(index, similarity, flat, vec)?;
         let labels = Labels::from_id_map(index.id_map)?;
-        let raw = FlatStorage {
-            fourcc,
-            header: IndexHeader {
-                offset: 0,
-                d,
-                ntotal: i64::try_from(nodes).unwrap_or(i64::MAX),
-                is_trained: true,
-                metric_type: index.header.metric_type,
-                kind: HeaderKind::Float {
-                    reserved: [1 << 20; 2],
-                    metric_arg: None,
-                },
-            },
-            codes: raw,
-        };
         Ok(Self {
             index,
             records,
@@ -333,15 +392,22 @@ impl<'a> OnDiskField<'a> {
     ///
     /// # Errors
     ///
-    /// As [`Self::search`], and when the queries are bits.
+    /// When the queries are bits, and otherwise as [`Self::search`], for
+    /// the first query that failed, by its row ([`Error::AtQuery`]),
+    /// however the queries ran in parallel.
     pub fn search_all(&self, queries: &Queries, plan: &Plan) -> Result<Vec<Vec<i64>>> {
-        queries
+        let lists: Vec<Result<Vec<i64>>> = queries
             .rows()
+            .enumerate()
             .collect::<Vec<_>>()
             .into_par_iter()
-            .map(|q| match q {
+            .map(|(row, q)| match q {
                 Query::Floats(q) => Ok(self
-                    .search(q, plan)?
+                    .search(q, plan)
+                    .map_err(|e| Error::AtQuery {
+                        row,
+                        cause: Box::new(e),
+                    })?
                     .into_iter()
                     .map(|h| i64::from(h.doc))
                     .collect()),
@@ -350,7 +416,9 @@ impl<'a> OnDiskField<'a> {
                     queries: crate::BINARY,
                 }),
             })
-            .collect()
+            .collect();
+        // In row order, so the error is the first row's.
+        lists.into_iter().collect()
     }
 
     /// The doc id of node `ord`: its label, which [`Self::new`] checked is

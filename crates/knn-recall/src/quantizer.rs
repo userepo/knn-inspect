@@ -18,7 +18,10 @@
 //! minimum-squared-error grid for the bit count, and refined by up to five
 //! steps of coordinate descent on a loss that weighs the error parallel to
 //! the vector; each component is clamped to the interval and rounded to one
-//! of its `2^bits` points. The corrective terms are the interval's ends,
+//! of its `2^bits` points, but where the interval is a few subnormals wide:
+//! there the float32 step rounds so coarsely that a code can land past
+//! them, which Java's `(byte)` keeps, and so does the port. The corrective
+//! terms are the interval's ends,
 //! the sum of the codes, and the additional correction: the squared norm of
 //! the centered vector for the Euclidean similarity, the vector's dot
 //! product with the centroid otherwise.

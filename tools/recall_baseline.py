@@ -53,6 +53,7 @@ import numpy as np  # noqa: E402
 # directory off the path, so it is put back.
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from strip_envelope import parse_footer, parse_header  # noqa: E402
+from walk_faiss import Walker  # noqa: E402
 
 QUERIES = 100
 K = 10
@@ -66,9 +67,11 @@ REAL_SETS = (
     "opensearch-3.9.0-binary",
 )
 
-# Real sets whose native file holds a graph without its vectors (a `null`
-# storage): there is nothing to search or score.
-NO_VECTORS = ("on-disk", "on-disk-16x", "on-disk-8x")
+def holds_vectors(path: pathlib.Path) -> bool:
+    """Whether the native file holds its vectors: a graph without them (a
+    `null` storage, as k-NN writes one for an `on_disk` field) has nothing
+    to search or score."""
+    return Walker(payload(path).tobytes()).walk()["storage"] is not None
 
 
 def payload(path: pathlib.Path) -> np.ndarray:
@@ -216,12 +219,10 @@ def main() -> None:
         for real in REAL_SETS
         for m in (args.fixtures / real).glob("*/*/manifest.json")
     ):
-        # A graph without its vectors has nothing to search.
-        if manifest.parent.parent.name in NO_VECTORS:
-            continue
         files = json.loads(manifest.read_text(encoding="utf-8"))["files"]
         native = next(f["name"] for f in files if f["name"].endswith((".faiss", ".faissc")))
-        baseline(manifest.parent / native, manifest.parent, "")
+        if holds_vectors(manifest.parent / native):
+            baseline(manifest.parent / native, manifest.parent, "")
 
 
 if __name__ == "__main__":

@@ -669,6 +669,13 @@ size is 2. The labels follow the `null` directly: their count, 500, at
 begins. The quantized vectors are in the Lucene files described under
 Scalar-quantized vectors below.
 
+`--encoding on-disk-half-float` indexes the `l2` draw into a
+`half_float` field in `on_disk` mode (`on-disk-half-float/l2/`). Its
+native file is the same layout, 75,846 bytes with code size 18; its
+Lucene files carry the name of k-NN's own quantized format for such a
+field (see Scalar-quantized vectors below), and its `.vec` holds the
+vectors as fp16 from offset 128.
+
 ## Real files from OpenSearch 3.9.0
 
 `tools/extract_opensearch.py` indexed 500 random 16-dimensional vectors
@@ -766,7 +773,7 @@ Lucene's per-field format adds the last two:
 | `parameters` | the resolved method as JSON: `index_description`, `name`, `spaceType`, `data_type`, and `parameters` with `ef_search`, `ef_construction`, `m`, and the encoder |
 | `sq_config` | `bits=1`, `bits=2`, or `bits=4` on the `on_disk` fields; absent elsewhere |
 | `qframe_config` | `type=binary,bits=1,random_rotation=false,enable_adc=false` on the field with the `binary` encoder; absent elsewhere |
-| `PerFieldKnnVectorsFormat.format` | `Faiss1040ScalarQuantizedKnnVectorsFormat` for the `on_disk` fields, `NativeEngines990HalfFloatKnnVectorsFormat` for `half_float`, `NativeEngines990KnnVectorsFormat` otherwise |
+| `PerFieldKnnVectorsFormat.format` | `Faiss1040ScalarQuantizedKnnVectorsFormat` for the `on_disk` float fields, `Faiss1040HalfFloatScalarQuantizedKnnVectorsFormat` for the `on_disk` `half_float` one, `NativeEngines990HalfFloatKnnVectorsFormat` for the other `half_float` ones, `NativeEngines990KnnVectorsFormat` otherwise |
 | `PerFieldKnnVectorsFormat.suffix` | `0` |
 
 k-NN names a native file after its segment, its build version, and its
@@ -779,20 +786,28 @@ build version does not, so the field's name is the file name less the
 `_2_165_` prefix and the extension. So the `.fnm` ties the file to a
 field number, and through the format name and suffix to the `.vemq` that
 holds the field's quantized vectors. The reader
-(`knn_format::field_infos`) checks each value's range as Lucene's reader
-does, refuses a field that is both the soft-deletes and the parent
-field, as `FieldInfo.checkConsistency` does, and a name or number two
-fields share and the soft-deletes or parent field flag on two fields, as
-Lucene's `FieldInfos` does, in Lucene's order, so the first fault it
-names is Lucene's; like Lucene, it decodes bytes that are not UTF-8 to
-U+FFFD and reads a negative attribute count as none. It reads versions 0
-to 2, and does not check the header's segment id and suffix, which are
-the caller's to compare. For a graph without its vectors, `scan` (since
-0.10.0) holds the `.fnm` to the `.si`'s segment id and the empty suffix,
-reads only the `.vemq` the `.fnm` names for the native file's field,
-which must carry the `.fnm`'s segment id and the segment suffix of the
-field's format and suffix
-(`Faiss1040ScalarQuantizedKnnVectorsFormat_0`), as Lucene's
+(`knn_format::field_infos`) checks, in Lucene's order, so the first
+fault it names is Lucene's, each value's range, as the reader reads it;
+once a record is read, a negative point count or vector dimension and a
+field that is both the soft-deletes and the parent field
+(`FieldInfo.checkConsistency`); then bytes after the last record and a
+missing footer (`checkFooter`); then a name two fields share, the
+soft-deletes or parent field flag on two fields, a field number of
+`i32::MAX`, for which `FieldInfos` cannot size its table, and a number
+two fields share; it does not check the rules that tie one of a field's
+values to another (payloads without positions, say). Like Lucene, it
+decodes bytes that are not UTF-8 to U+FFFD and reads a negative
+attribute count as none. A vint's fifth byte must hold only the int's
+top 4 bits, as Lucene's writer leaves it, where Lucene 10.5.1's reader
+would read on. It reads versions 0 to 2, and does not check the header's
+segment id and suffix, which are the caller's to compare. For a graph
+without its vectors, `scan` (since 0.10.0) holds the `.fnm` to the
+`.si`'s segment id and the empty suffix, reads only the `.vemq` the
+`.fnm` names for the native file's field, which must carry the `.fnm`'s
+segment id and the segment suffix of the field's format and suffix
+(`Faiss1040ScalarQuantizedKnnVectorsFormat_0`, or
+`Faiss1040HalfFloatScalarQuantizedKnnVectorsFormat_0` for a `half_float`
+field, k-NN's subclass of the format under its own name), as Lucene's
 `checkIndexHeader` requires, and matches a field by the graph's shape
 only without a `.fnm` it can read.
 
@@ -851,6 +866,21 @@ version 0 at Lucene 10.5.1 (`writeMeta` and `writeVectors` in
 the `.vec` and `.vemf` of the same name, as for any other field. `scan`
 reads both files since 0.9.0, and since 0.10.0 only the `.vemq` the
 segment's `.fnm` names for the graph's field (see Field infos above).
+
+A `half_float` field in `on_disk` mode is written in k-NN's
+`Faiss1040HalfFloatScalarQuantizedKnnVectorsFormat`
+(`FaissCodecFormatResolver`), a subclass of that format under its own
+name, so its files carry that name, and its `.vemq` and `.veq` are the
+same Lucene files; its raw vectors are in k-NN's half-float flat format
+(`KNN1040HalfFloatFlatVectorsFormatMeta`), two bytes a component. The
+fixture of one (`on-disk-half-float/l2`) shows the records quantized
+from the fp16 values: every record's additional correction recomputes
+bit for bit from the `.vec`'s fp16 components, decoded, and the centroid
+is their mean. `scan` checks such a field as any other (since 0.10.0
+through the `.fnm`, by shape before), but does not yet compare its
+corrections with the `.vec`; `recall` does not search it, since k-NN
+rescores its fp16 vectors with native kernels
+(`KNN1040HalfFloatVectorScorer`).
 
 After the big-endian index header (109 bytes in the fixtures: the codec
 name and the segment suffix `Faiss1040ScalarQuantizedKnnVectorsFormat_0`
@@ -924,17 +954,19 @@ vector by 0.9 and the whole error by 0.1 (not at all when the centered
 vector's squared norm is 0, or so small that 0.9 divided by it
 overflows), stopping when the loss would grow, the ends move less than
 1e-8, or the system for the ends is singular, and rounds each clamped
-component to one of the interval's `2^bits` points. The codes then pack
-as the encoding stores them: eight 1-bit codes to a byte, the first in
-the top bit; for 2 bits, the codes' low bits so packed in the first half
-of the bytes and their high bits in the second; for 4 bits, the first
-half of the codes in the high nibbles and the second half in the low
-ones. `knn_recall::quantizer` ports it operation for operation: float32
-where the Java computes in float, float64 where it widens (a product of
-two floats is rounded before it is widened), Java's `Math.round` (ties
-toward positive infinity), `Math.min` and `Math.max` (-0 below +0), and
-no fused multiply-add. It recomputes the codes and all four corrective
-terms of the fixtures' 2,500 records bit for bit.
+component to one of the interval's `2^bits` points, but where the
+interval is a few subnormals wide, whose float32 step rounds so coarsely
+that a code can land past them, which `(byte)` keeps. The codes then
+pack as the encoding stores them: eight 1-bit codes to a byte, the first
+in the top bit; for 2 bits, the codes' low bits so packed in the first
+half of the bytes and their high bits in the second; for 4 bits, the
+first half of the codes in the high nibbles and the second half in the
+low ones. `knn_recall::quantizer` ports it operation for operation:
+float32 where the Java computes in float, float64 where it widens (a
+product of two floats is rounded before it is widened), Java's
+`Math.round` (ties toward positive infinity), `Math.min` and `Math.max`
+(-0 below +0), and no fused multiply-add. It recomputes the codes and
+all four corrective terms of the fixtures' 2,500 records bit for bit.
 `tools/quantizer_oracle.py` runs Lucene's own quantizer, from the Lucene
 10.5.1 jar and the JDK in the OpenSearch 3.9.0 image
 (`tools/QuantizerOracle.java`), over 1,600 synthetic cases in
@@ -958,16 +990,19 @@ codes)`, in float32 and in that order. For `EUCLIDEAN` the score is `1 /
 estimate; for `MAXIMUM_INNER_PRODUCT` the estimate plus both dot
 products with the centroid less the centroid's own, scaled as
 `scaleMaxInnerProductScore` does (`1 + x` from 0 up, `1 / (1 - x)`
-below); for `COSINE`, the same sum clamped to [-1, 1] and mapped to `(1
-+ x) / 2`. For 1-bit fields k-NN scores with a native kernel instead
-(`DefaultSQSimilarityFunction` in its x86-64 build for AVX2, and SIMD
-builds for AVX-512 and Arm), which computes the same expression and
-transforms; the AVX2 build's compiler fuses its multiply-adds, as
-`fma(lx ly, codes . codes, fma(ax ly, sy, fma(ax ay, d, ay lx sx)))`,
-which can change the last bit, and its Euclidean clamp turns a NaN
-distance into 0. `QuantizedScorer::knn_native_kernel` scores that way,
-and the 1-bit fixtures' live first-pass scores recompute bit for bit
-with it; another build can fuse otherwise.
+below); for `COSINE` and `DOT_PRODUCT`, the same sum clamped to [-1, 1]
+and mapped to `(1 + x) / 2`. A query code past 4 bits, from such a
+degenerate interval, is read as Lucene reads it: its low 4 bits for the
+1- and 2-bit encodings, which `transposeHalfByte` keeps, and the signed
+byte for the nibble and 7-bit ones. For 1-bit fields k-NN scores with a
+native kernel instead (`DefaultSQSimilarityFunction` in its x86-64 build
+for AVX2, and SIMD builds for AVX-512 and Arm), which computes the same
+expression and transforms; the AVX2 build's compiler fuses its
+multiply-adds, as `fma(lx ly, codes . codes, fma(ax ly, sy, fma(ax ay,
+d, ay lx sx)))`, which can change the last bit, and its Euclidean clamp
+turns a NaN distance into 0. `QuantizedScorer::knn_native_kernel` scores
+that way, and the 1-bit fixtures' live first-pass scores recompute bit
+for bit with it; another build can fuse otherwise.
 `knn_recall::quantized_scorer` ports Lucene's scorer operation for
 operation. `tools/scorer_oracle.py` runs Lucene's own scorer
 (`tools/ScorerOracle.java`) over the five `on_disk` fixtures' vectors

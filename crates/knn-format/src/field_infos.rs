@@ -25,16 +25,21 @@
 //!
 //! Values are checked as Lucene's reader and `FieldInfos` check them, and
 //! in the same order, so the first fault is the one Lucene names: in each
-//! record, the ranges above, a field number or count that fits an `int`,
-//! flag bits the version does not define, and a field that is both the
-//! soft-deletes and the parent field; then bytes after the last record;
-//! then a name two fields share or the soft-deletes or parent field flag
-//! on two fields; then a number two fields share. As in Lucene, a
-//! string's bytes that are not UTF-8 decode to U+FFFD, and a negative
-//! attribute count reads as no attributes. The other rules
-//! `FieldInfo.checkConsistency` applies between a field's own values (a
+//! record, as it is read, a field count or number that fits an `int`,
+//! flag bits the version does not define, and the ranges above; once the
+//! record is read, as `FieldInfo.checkConsistency` does, point counts and
+//! a vector dimension that fit an `int`, and a field that is both the
+//! soft-deletes and the parent field; then bytes after the last record and
+//! a missing footer; then a name two fields share or the soft-deletes or
+//! parent field flag on two fields; then a field number of `i32::MAX`, for
+//! which `FieldInfos` cannot size its table; then a number two fields
+//! share. As in Lucene, a string's bytes that are not UTF-8 decode to
+//! U+FFFD, and a negative attribute count reads as no attributes. The
+//! other rules `checkConsistency` applies between a field's own values (a
 //! doc-values generation on a field without doc values, say) are not
-//! checked.
+//! checked. A vint's fifth byte must hold only the int's top 4 bits, as
+//! Lucene's writer leaves it, where Lucene 10.5.1's reader would read on
+//! (see `Cursor::vint`).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -72,6 +77,8 @@ const FLAG_DOC_VALUES_SKIPPER: u8 = 0x20;
 /// The soft-deletes field flag, which one field of a segment at most
 /// carries.
 const FLAG_SOFT_DELETES: u8 = 0x08;
+/// `Integer.MAX_VALUE`, the field number `FieldInfos` cannot index.
+const MAX_NUMBER: u32 = 0x7FFF_FFFF;
 
 /// The attribute k-NN's field mapper puts on every vector field it maps;
 /// k-NN reads only for the key.
@@ -211,8 +218,9 @@ impl FieldInfos {
     /// Returns an error when the file has no codec header, names another
     /// codec or version, a record runs out or holds a value Lucene's
     /// reader refuses, two fields share a name or a number or both carry
-    /// the soft-deletes or the parent field flag, or bytes follow the last
-    /// record, where Lucene expects the footer.
+    /// the soft-deletes or the parent field flag, a field number is
+    /// `i32::MAX`, bytes follow the last record, where Lucene expects the
+    /// footer, or the file does not end with one.
     pub fn parse(bytes: &[u8]) -> Result<Self> {
         let envelope = Envelope::parse(bytes)?;
         let Some(header) = envelope.header else {
@@ -250,6 +258,11 @@ impl FieldInfos {
                 count: trailing,
             });
         }
+        if envelope.footer.is_none() {
+            return Err(Error::MissingFooter {
+                offset: bytes.len(),
+            });
+        }
         check_fields(&records)?;
         Ok(Self {
             version,
@@ -277,8 +290,10 @@ impl FieldInfos {
 
 /// What Lucene's `FieldInfos` refuses across fields, in the order its
 /// constructor checks: field by field a repeated name and a second field
-/// with the soft-deletes or the parent field flag, then a repeated number.
-/// `records` holds each field with its record's offset and flag byte.
+/// with the soft-deletes or the parent field flag; then a field number of
+/// `i32::MAX`, one past which the table by number it allocates overflows;
+/// then a repeated number. `records` holds each field with its record's
+/// offset and flag byte.
 fn check_fields(records: &[(usize, FieldInfo, u8)]) -> Result<()> {
     let mut names = BTreeSet::new();
     let mut soft_deletes: Option<&str> = None;
@@ -308,6 +323,15 @@ fn check_fields(records: &[(usize, FieldInfo, u8)]) -> Result<()> {
             *first = Some(field.name.as_str());
         }
     }
+    // Lucene uses the fields as its table when their numbers are 0 to
+    // count - 1 in order, which a number of i32::MAX cannot be.
+    if let Some((offset, field, _)) = records.iter().find(|(_, f, _)| f.number == MAX_NUMBER) {
+        return Err(Error::InvalidValue {
+            offset: *offset,
+            what: "field number",
+            value: i64::from(field.number),
+        });
+    }
     let mut numbers = BTreeSet::new();
     for (offset, field, _) in records {
         if !numbers.insert(field.number) {
@@ -334,11 +358,8 @@ fn read_field(cur: &mut Cursor<'_>, version: i32) -> Result<(FieldInfo, u8)> {
     if version >= VERSION_DOC_VALUES_SKIPPER {
         defined |= FLAG_DOC_VALUES_SKIPPER;
     }
-    // Bits the version does not define, or a field that is both the
-    // soft-deletes and the parent field, which checkConsistency refuses
-    // once the record is read; no later byte decides either.
-    let both = FLAG_SOFT_DELETES | FLAG_PARENT_FIELD;
-    if flags & !defined != 0 || flags & both == both {
+    // Bits the version does not define, which the reader refuses at once.
+    if flags & !defined != 0 {
         return Err(Error::InvalidValue {
             offset: flags_offset,
             what: "field flags",
@@ -360,11 +381,19 @@ fn read_field(cur: &mut Cursor<'_>, version: i32) -> Result<(FieldInfo, u8)> {
         let value = cur.string("attribute value")?;
         attributes.insert(key, value);
     }
-    if cur.vint("point data dimension count")? != 0 {
-        cur.vint("point index dimension count")?;
-        cur.vint("point bytes per dimension")?;
-    }
-    let vector_dimension = int_vint(cur, "vector dimension")?;
+    // Read as they are; checkConsistency refuses a negative one once the
+    // whole record is read. Without point data, the index dimension count
+    // is the data one, 0, and so are the bytes.
+    let point_data = offset_vint(cur, "point data dimension count")?;
+    let (point_index, point_bytes) = if point_data.1 == 0 {
+        (point_data, (point_data.0, 0))
+    } else {
+        (
+            offset_vint(cur, "point index dimension count")?,
+            offset_vint(cur, "point bytes per dimension")?,
+        )
+    };
+    let dimension = offset_vint(cur, "vector dimension")?;
     let vector_encoding = match byte_in(cur, "vector encoding", 1)? {
         0 => VectorEncoding::Byte,
         _ => VectorEncoding::Float32,
@@ -374,6 +403,30 @@ fn read_field(cur: &mut Cursor<'_>, version: i32) -> Result<(FieldInfo, u8)> {
         "vector similarity function",
         u8::try_from(*SIMILARITY_FUNCTIONS.end()).unwrap_or(u8::MAX),
     )?);
+    // checkConsistency, in its order, for the values it checks alone.
+    for ((offset, value), what) in [
+        (point_data, "point data dimension count"),
+        (point_index, "point index dimension count"),
+        (point_bytes, "point bytes per dimension"),
+        (dimension, "vector dimension"),
+    ] {
+        if i32::try_from(value).is_err() {
+            return Err(Error::InvalidValue {
+                offset,
+                what,
+                value: i64::from(value),
+            });
+        }
+    }
+    let both = FLAG_SOFT_DELETES | FLAG_PARENT_FIELD;
+    if flags & both == both {
+        return Err(Error::InvalidValue {
+            offset: flags_offset,
+            what: "field flags",
+            value: i64::from(flags),
+        });
+    }
+    let vector_dimension = dimension.1;
     Ok((
         FieldInfo {
             name,
@@ -400,6 +453,12 @@ fn int_vint(cur: &mut Cursor<'_>, what: &'static str) -> Result<u32> {
         });
     }
     Ok(value)
+}
+
+/// A vint with its offset, for a check made after the record is read.
+fn offset_vint(cur: &mut Cursor<'_>, what: &'static str) -> Result<(usize, u32)> {
+    let offset = cur.offset();
+    Ok((offset, cur.vint(what)?))
 }
 
 /// A byte that Lucene's reader accepts only from 0 to `max`.

@@ -345,7 +345,7 @@ impl Unreadable {
 /// its start has no `/`, so a later `/` is no separator, and normalizes it
 /// otherwise, which turning the start's slashes would stop. It is shown as
 /// given.
-fn shown(path: &Path) -> String {
+pub(crate) fn shown(path: &Path) -> String {
     let text = path.display().to_string();
     let start: String = text
         .chars()
@@ -423,13 +423,7 @@ fn scan_file(path: &Path, options: &Options) -> FileReport {
         let quantized = if index.index.storage.is_some() {
             LuceneQuantized::skipped(HOLDS_ITS_VECTORS.to_owned())
         } else {
-            let graph = Graph {
-                dimension: index.header.d,
-                count: index.header.ntotal,
-                code_size: index.code_size(),
-                metric: index.metric(),
-            };
-            lucene_quantized(path, graph, options.space)
+            lucene_quantized(path, Graph::of(index), options.space)
         };
         (
             lucene_vectors(path, bytes, p),

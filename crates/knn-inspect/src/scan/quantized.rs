@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use knn_check::Space;
 use knn_format::NativeFile;
 use knn_format::envelope::{Envelope, Header, SEGMENT_ID_LEN};
-use knn_format::faiss::Metric;
+use knn_format::faiss::{IdMapIndex, Metric};
 use knn_format::field_infos::{FieldInfo, FieldInfos};
 use knn_format::flat_vectors::{FlatField, FlatVectorsMeta, Float32Rows, VectorEncoding};
 use knn_format::quantized_vectors::{
@@ -33,9 +33,18 @@ use super::{CrossCheck, has_codec_header, lucene_footer, segment_files, segment_
 /// documents' included, which the merged `.vec` no longer holds.
 const TOLERANCE: f64 = 1e-4;
 
-/// The per-field vectors format k-NN 3.9 writes a graph-only field in,
-/// whose `.vemq` and `.veq` hold the field's quantized vectors.
-const QUANTIZED_FORMAT: &str = "Faiss1040ScalarQuantizedKnnVectorsFormat";
+/// The per-field vectors formats k-NN 3.9 writes a graph-only field in,
+/// whose `.vemq` and `.veq` hold the field's quantized vectors
+/// (`FaissCodecFormatResolver`): the first for a `float` field, the second,
+/// a subclass of it under its own name, for a `half_float` one, whose
+/// `.vec` holds its vectors in fp16.
+const QUANTIZED_FORMATS: [&str; 2] = [
+    "Faiss1040ScalarQuantizedKnnVectorsFormat",
+    HALF_FLOAT_QUANTIZED_FORMAT,
+];
+
+/// The quantized format of a `half_float` field.
+const HALF_FLOAT_QUANTIZED_FORMAT: &str = "Faiss1040HalfFloatScalarQuantizedKnnVectorsFormat";
 
 /// k-NN's per-field formats that keep a field's vectors in its native
 /// file.
@@ -116,7 +125,7 @@ pub(super) const HOLDS_ITS_VECTORS: &str =
     "the native file holds its own vectors, not a graph over Lucene's quantized ones";
 
 /// Lucene's `VectorSimilarityFunction` names, by ordinal.
-fn similarity_name(ordinal: i32) -> Option<&'static str> {
+pub(crate) fn similarity_name(ordinal: i32) -> Option<&'static str> {
     Some(match ordinal {
         0 => "euclidean",
         1 => "dot_product",
@@ -148,11 +157,23 @@ fn similarity_is(similarity: i32, space: Space) -> bool {
 
 /// The graph's shape, as its headers record it.
 #[derive(Debug, Clone, Copy)]
-pub(super) struct Graph {
+pub(crate) struct Graph {
     pub(super) dimension: i32,
     pub(super) count: i64,
     pub(super) code_size: Option<i32>,
     pub(super) metric: Metric,
+}
+
+impl Graph {
+    /// The shape of the graph `index` is.
+    pub(crate) fn of(index: &IdMapIndex<'_>) -> Self {
+        Self {
+            dimension: index.header.d,
+            count: index.header.ntotal,
+            code_size: index.code_size(),
+            metric: index.metric(),
+        }
+    }
 }
 
 /// A `.vemq` field of the graph's dimension and count, with its file.
@@ -192,33 +213,138 @@ pub(super) fn lucene_quantized(path: &Path, graph: Graph, space: Option<Space>) 
     }
 }
 
-/// The `.vemq` of the field the segment's `.fnm` ties a graph without its
-/// vectors to, and the field's number: what `recall` searches.
+/// The files of the field the segment's `.fnm` ties a graph without its
+/// vectors to: what `recall` searches. The `.vemf` and `.vec` are held to
+/// a sound footer, the `.fnm`'s segment, and the segment suffix their
+/// name gives; the field as a whole, before it is searched, to all `scan`
+/// holds it to ([`Self::quantized`]).
 pub(crate) struct FieldFiles {
     /// The `.vemq`; the `.veq`, `.vemf`, and `.vec` share its name.
     pub(crate) vemq: PathBuf,
-    /// The field's number, which the `.vemq` and `.vemf` record it under.
+    /// The field's number, which its files record it under.
     pub(crate) number: u32,
+    /// Lucene's similarity ordinal, as the `.fnm` records it.
+    pub(crate) similarity: i32,
+    /// The `.vemf`.
+    pub(crate) raw_meta: NativeFile,
+    /// The `.vec`.
+    pub(crate) raw: NativeFile,
+    /// The field as the `.fnm` ties the native file to it.
+    tied: Tied,
+}
+
+/// The `.vemq` and `.veq` of a field `scan`'s check passes, and what it
+/// warns of, if anything.
+pub(crate) struct Quantized {
+    /// The `.vemq`, read.
+    pub(crate) meta: QuantizedVectorsMeta,
+    /// The `.veq`.
+    pub(crate) data: NativeFile,
+    /// The check's warning: a correction or the centroid's dot product
+    /// that the `.vec` and the centroid do not give back.
+    pub(crate) warning: Option<String>,
+}
+
+impl FieldFiles {
+    /// The `.vemq`, read, and the `.veq` beside it, once the field passes
+    /// the check `scan` makes of it against `graph` (`lucene_quantized`):
+    /// the `.fnm` and the `.vemq` agree, the field fits the graph, its
+    /// records are as Lucene writes them, and the `.vemf` and `.vec`
+    /// describe its float32 vectors, all of them finite. What the check
+    /// only warns of is given with them.
+    ///
+    /// # Errors
+    ///
+    /// Returns why not, as text that names the file: the check's outcome
+    /// when it is a mismatch or damage, or why it could not be made.
+    pub(crate) fn quantized(&self, graph: Graph) -> Result<Quantized, String> {
+        let outcome = by_field(&self.tied, graph, None);
+        let warning = match outcome.status {
+            CrossCheck::Match => None,
+            CrossCheck::Warning => Some(outcome.detail),
+            CrossCheck::Skipped => {
+                return Err(format!(
+                    "scan cannot check the field's files: {}",
+                    outcome.detail
+                ));
+            }
+            CrossCheck::Mismatch | CrossCheck::Damaged => {
+                return Err(format!(
+                    "the field's files come out {} as scan checks them: {}",
+                    status_name(outcome.status),
+                    outcome.detail
+                ));
+            }
+        };
+        if !self.vemq.is_file() {
+            return Err(format!("no {} beside the native file", shown(&self.vemq)));
+        }
+        let meta = match read_vemq(&self.vemq, Some((self.tied.segment_id, ".fnm"))) {
+            VemqRead::Sound(meta) => meta,
+            VemqRead::Untrusted(why) => return Err(why),
+            VemqRead::Unread(what) => {
+                return Err(format!("a format this tool does not read: {what}"));
+            }
+        };
+        let veq = self.vemq.with_extension("veq");
+        let mapped = NativeFile::open(&veq)
+            .map_err(|e| format!("{} could not be opened: {e}", shown(&veq)))?;
+        lucene_footer(mapped.bytes()).map_err(|why| format!("{} {why}", shown(&veq)))?;
+        let data = DataFile::parse(mapped.bytes())
+            .map_err(|e| format!("{} could not be read: {e}", shown(&veq)))?;
+        if data.header.segment_id != meta.header.segment_id
+            || data.header.suffix != meta.header.suffix
+        {
+            return Err(format!(
+                "{}'s header names another segment than the .vemq's",
+                shown(&veq)
+            ));
+        }
+        Ok(Quantized {
+            meta,
+            data: mapped,
+            warning,
+        })
+    }
 }
 
 /// Finds the files of the field the native file at `path` is a graph of,
-/// through the segment's `.fnm`, as [`lucene_quantized`] does.
+/// through the segment's `.fnm`, as [`lucene_quantized`] does, and opens
+/// its `.vemf` and `.vec`, held to what `scan` holds them to.
 ///
 /// # Errors
 ///
 /// Returns why not, as text: the `.fnm` is missing, unread, not the
-/// segment's, or records the field otherwise than k-NN does.
+/// segment's, or records the field otherwise than k-NN does; the field is
+/// a `half_float` one, whose fp16 vectors k-NN rescores with native
+/// kernels this tool does not port; or its `.vemf` or `.vec` is missing,
+/// damaged, or not of the `.fnm`'s segment and suffix.
 pub(crate) fn field_files(path: &Path) -> Result<FieldFiles, String> {
-    match tie(path, None) {
-        Tie::Field(t) => Ok(FieldFiles {
-            vemq: t.vemq,
-            number: t.info.number,
-        }),
-        Tie::Decided(outcome) => Err(outcome.detail),
-        Tie::Shape(why) => Err(format!(
-            "the field's quantized vectors are found through the segment's .fnm, and {why}"
-        )),
+    let t = match tie(path, None) {
+        Tie::Field(t) => t,
+        Tie::Decided(outcome) => return Err(outcome.detail),
+        Tie::Shape(why) => {
+            return Err(format!(
+                "the field's files are found through the segment's .fnm, and {why}"
+            ));
+        }
+    };
+    if t.format == HALF_FLOAT_QUANTIZED_FORMAT {
+        return Err(format!(
+            "field {:?} is a half_float field, in {}: recall does not read its fp16 vectors, which k-NN rescores with native kernels this tool does not port",
+            t.info.name, t.format
+        ));
     }
+    let suffix = name_suffix(&t.vemq).unwrap_or_default().to_owned();
+    let (raw_meta, raw) = raw_files(&t.vemq, &t.segment_id, &suffix).map_err(|(_, why)| why)?;
+    Ok(FieldFiles {
+        vemq: t.vemq.clone(),
+        number: t.info.number,
+        similarity: t.info.vector_similarity,
+        raw_meta,
+        raw,
+        tied: t,
+    })
 }
 
 /// How the native file is tied to its field.
@@ -235,6 +361,9 @@ enum Tie {
 /// The field the `.fnm` ties the native file to.
 struct Tied {
     info: FieldInfo,
+    /// The quantized format the `.fnm` records it in, one of
+    /// [`QUANTIZED_FORMATS`].
+    format: String,
     /// The `.vemq` the field's per-field format and suffix name.
     vemq: PathBuf,
     /// The segment id the `.fnm`'s header names.
@@ -272,7 +401,15 @@ fn tie(path: &Path, space: Option<Space>) -> Tie {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let fnm = dir.join(format!("{segment}.fnm"));
     if !fnm.is_file() {
-        return Tie::Shape(format!("no {segment}.fnm beside the native file"));
+        let cfs = dir.join(format!("{segment}.cfs"));
+        return Tie::Shape(if cfs.is_file() {
+            format!(
+                "the segment is compound: its .fnm and the field's files are inside {}, which this tool does not read",
+                shown(&cfs)
+            )
+        } else {
+            format!("no {segment}.fnm beside the native file")
+        });
     }
     let decided = |status, detail: String| {
         Tie::Decided(
@@ -338,9 +475,10 @@ fn tie(path: &Path, space: Option<Space>) -> Tie {
     }
     let segment_id = header.segment_id;
     match quantized_field(&infos, field, space) {
-        Ok((info, suffix)) => Tie::Field(Tied {
+        Ok((info, format, suffix)) => Tie::Field(Tied {
             info: info.clone(),
-            vemq: dir.join(format!("{segment}_{QUANTIZED_FORMAT}_{suffix}.vemq")),
+            format: format.to_owned(),
+            vemq: dir.join(format!("{segment}_{format}_{suffix}.vemq")),
             segment_id,
         }),
         Err((status, detail)) => decided(status, detail),
@@ -359,14 +497,14 @@ fn si_id(native: &Path) -> Option<[u8; SEGMENT_ID_LEN]> {
     Envelope::parse(bytes).ok()?.header.map(|h| h.segment_id)
 }
 
-/// The `.fnm`'s record of `field` and its per-field format's suffix, when
-/// it is a k-NN Faiss field of the `--space` given in the quantized
-/// format; otherwise why not, as the outcome to report.
+/// The `.fnm`'s record of `field` and its per-field format and that
+/// format's suffix, when it is a k-NN Faiss field of the `--space` given in
+/// a quantized format; otherwise why not, as the outcome to report.
 fn quantized_field<'a>(
     infos: &'a FieldInfos,
     field: &str,
     space: Option<Space>,
-) -> Result<(&'a FieldInfo, &'a str), (CrossCheck, String)> {
+) -> Result<(&'a FieldInfo, &'a str, &'a str), (CrossCheck, String)> {
     let mismatch = |detail| Err((CrossCheck::Mismatch, detail));
     let Some(info) = infos.by_name(field) else {
         return mismatch(format!(
@@ -393,11 +531,14 @@ fn quantized_field<'a>(
             space.name()
         ));
     }
-    let (Some(format), Some(suffix)) =
-        (info.knn_vectors_format(), info.knn_vectors_format_suffix())
-    else {
+    let Some(format) = info.knn_vectors_format() else {
         return mismatch(format!(
             "the .fnm records no per-field vectors format for field {field:?}"
+        ));
+    };
+    let Some(suffix) = info.knn_vectors_format_suffix() else {
+        return mismatch(format!(
+            "the .fnm records the per-field vectors format {format} for field {field:?}, but no suffix for its files"
         ));
     };
     if NATIVE_FORMATS.contains(&format) {
@@ -405,7 +546,7 @@ fn quantized_field<'a>(
             "the .fnm records field {field:?} in {format}, which keeps the vectors in the native file, not beside a graph without them"
         ));
     }
-    if format != QUANTIZED_FORMAT {
+    if !QUANTIZED_FORMATS.contains(&format) {
         return Err((
             CrossCheck::Skipped,
             format!(
@@ -420,7 +561,7 @@ fn quantized_field<'a>(
             "the .fnm records the vectors format suffix {suffix:?} for field {field:?}, which is not a number"
         ));
     }
-    Ok((info, suffix))
+    Ok((info, format, suffix))
 }
 
 /// Checks the field the `.fnm` ties the native file to: its record in
@@ -622,7 +763,7 @@ fn by_shape(path: &Path, graph: Graph, space: Option<Space>) -> LuceneQuantized 
                 "a field of the graph's shape checks out, but not every .vemq of the segment can be read".to_owned()
             }
             Some(o) if o.status != CrossCheck::Skipped => format!(
-                "not every .vemq of the segment can be read, and the field of the graph's shape that fits is a {}: {}",
+                "not every .vemq of the segment can be read, and the field of the graph's shape that fits comes out {}: {}",
                 status_name(o.status),
                 o.detail
             ),
@@ -977,7 +1118,8 @@ fn against_vec(
     records: &QuantizedVectors<'_>,
 ) -> (CrossCheck, String) {
     let vec = vemq.with_extension("vec");
-    let (meta_file, vec_file) = match raw_files(vemq, records.header) {
+    let header = records.header;
+    let (meta_file, vec_file) = match raw_files(vemq, &header.segment_id, &header.suffix) {
         Ok(files) => files,
         Err(early) => return early,
     };
@@ -1037,12 +1179,17 @@ fn against_vec(
     }
 }
 
-/// Opens the `.vemf` and `.vec` beside the `.vemq`, both sound and of
-/// the segment that `quantized`, the `.veq`'s header, names. The `.vec`
-/// check is skipped for a graph without its vectors, so a damaged or
-/// missing one is reported here: Lucene opens them with the quantized
-/// files, which a compound segment would keep inside the `.cfs` too.
-fn raw_files(vemq: &Path, quantized: &Header) -> Result<(NativeFile, NativeFile), Early> {
+/// Opens the `.vemf` and `.vec` beside the `.vemq`, both sound and of the
+/// segment `segment_id` and suffix `suffix` name: the `.veq`'s header's, or
+/// the `.fnm`'s segment's and the `.vemq`'s name's. The `.vec` check is
+/// skipped for a graph without its vectors, so a damaged or missing one is
+/// reported here: Lucene opens them with the quantized files, which a
+/// compound segment would keep inside the `.cfs` too.
+fn raw_files(
+    vemq: &Path,
+    segment_id: &[u8; SEGMENT_ID_LEN],
+    suffix: &str,
+) -> Result<(NativeFile, NativeFile), Early> {
     let flat_meta = vemq.with_extension("vemf");
     let vec = vemq.with_extension("vec");
     let missing: Vec<String> = [&flat_meta, &vec]
@@ -1080,7 +1227,7 @@ fn raw_files(vemq: &Path, quantized: &Header) -> Result<(NativeFile, NativeFile)
                 format!("{} has no codec header", shown(path)),
             ));
         };
-        if header.segment_id != quantized.segment_id || header.suffix != quantized.suffix {
+        if header.segment_id != *segment_id || header.suffix != suffix {
             return Err((
                 CrossCheck::Damaged,
                 format!(

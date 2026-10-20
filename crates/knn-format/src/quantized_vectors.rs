@@ -268,10 +268,10 @@ impl QuantizedVectorsMeta {
     /// encoding, similarity function, or scalar encoding wire number, a
     /// dimension or count beyond an `int`, a data length other than the
     /// vectors' records take, or an ord-to-doc block shift outside 2 to
-    /// 22), or bytes follow the last record, where Lucene expects the
-    /// footer.
+    /// 22), bytes follow the last record, where Lucene expects the
+    /// footer, or the file does not end with one.
     pub fn parse(bytes: &[u8]) -> Result<Self> {
-        let (header, body, base) = open(bytes, META_CODEC, EXPECTED_META)?;
+        let (header, body, base, footer) = open(bytes, META_CODEC, EXPECTED_META)?;
         let mut cur = Cursor::new(body, base);
         let mut fields = Vec::new();
         loop {
@@ -289,17 +289,25 @@ impl QuantizedVectorsMeta {
                 count: trailing,
             });
         }
+        // Lucene's reader checks the footer once the records are read
+        // (`checkFooter`).
+        if !footer {
+            return Err(Error::MissingFooter {
+                offset: bytes.len(),
+            });
+        }
         Ok(Self { header, fields })
     }
 }
 
 /// Checks a file's codec header against `codec` and version 0 and returns
-/// the header and the bytes between it and the footer, with their offset.
+/// the header and the bytes between it and the footer, or the file's end
+/// without one, with their offset, and whether the footer is there.
 fn open<'a>(
     bytes: &'a [u8],
     codec: &str,
     expected: &'static str,
-) -> Result<(Header, &'a [u8], usize)> {
+) -> Result<(Header, &'a [u8], usize, bool)> {
     let envelope = Envelope::parse(bytes)?;
     let Some(header) = envelope.header else {
         return Err(Error::UnexpectedCodec {
@@ -318,7 +326,7 @@ fn open<'a>(
     let end = envelope.footer.map_or(bytes.len(), |f| f.offset);
     let body = bytes.get(header.length..end).unwrap_or_default();
     let base = header.length;
-    Ok((header, body, base))
+    Ok((header, body, base, envelope.footer.is_some()))
 }
 
 /// Reads one record after its field number.
@@ -469,10 +477,17 @@ impl DataFile {
     ///
     /// # Errors
     ///
-    /// Returns an error when the file has no codec header or names another
-    /// codec or version.
+    /// Returns an error when the file has no codec header, names another
+    /// codec or version, or does not end with a footer.
     pub fn parse(bytes: &[u8]) -> Result<Self> {
-        let (header, body, base) = open(bytes, DATA_CODEC, EXPECTED_DATA)?;
+        let (header, body, base, footer) = open(bytes, DATA_CODEC, EXPECTED_DATA)?;
+        // Lucene's reader checks the footer's place as it opens the file,
+        // before it reads any records (`retrieveChecksum`).
+        if !footer {
+            return Err(Error::MissingFooter {
+                offset: bytes.len(),
+            });
+        }
         let end = base.saturating_add(body.len());
         Ok(Self { header, end })
     }

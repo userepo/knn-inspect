@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 
 use knn_format::Error;
 use knn_format::envelope::Envelope;
+use knn_format::faiss::CodeFormat;
 use knn_format::flat_vectors::{FlatVectorsMeta, VectorEncoding};
 use knn_format::quantized_vectors::{
     DATA_CODEC, DataFile, META_CODEC, QuantizedVectors, QuantizedVectorsMeta, ScalarEncoding,
@@ -25,12 +26,18 @@ fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/opensearch-3.9.0-binary")
 }
 
+const STEM: &str = "_2_Faiss1040ScalarQuantizedKnnVectorsFormat_0";
 const VEMQ: &str = "_2_Faiss1040ScalarQuantizedKnnVectorsFormat_0.vemq";
 const VEQ: &str = "_2_Faiss1040ScalarQuantizedKnnVectorsFormat_0.veq";
 
 /// A real `on_disk` segment, and what its one quantized field must say.
 struct Case {
     dir: &'static str,
+    /// The name of the field's files without the extension.
+    stem: &'static str,
+    /// Where its records start: the first multiple of 4 after the codec
+    /// header, which the stem's suffix lengthens.
+    data_offset: u64,
     similarity: i32,
     encoding: ScalarEncoding,
     record_size: usize,
@@ -39,33 +46,53 @@ struct Case {
 const CASES: &[Case] = &[
     Case {
         dir: "on-disk/l2",
+        stem: STEM,
+        data_offset: 112,
         similarity: 0,
         encoding: ScalarEncoding::SingleBitQueryNibble,
         record_size: 18,
     },
     Case {
         dir: "on-disk/innerproduct",
+        stem: STEM,
+        data_offset: 112,
         similarity: 3,
         encoding: ScalarEncoding::SingleBitQueryNibble,
         record_size: 18,
     },
     Case {
         dir: "on-disk/cosinesimil",
+        stem: STEM,
+        data_offset: 112,
         similarity: 2,
         encoding: ScalarEncoding::SingleBitQueryNibble,
         record_size: 18,
     },
     Case {
         dir: "on-disk-16x/l2",
+        stem: STEM,
+        data_offset: 112,
         similarity: 0,
         encoding: ScalarEncoding::DibitQueryNibble,
         record_size: 20,
     },
     Case {
         dir: "on-disk-8x/l2",
+        stem: STEM,
+        data_offset: 112,
         similarity: 0,
         encoding: ScalarEncoding::PackedNibble,
         record_size: 24,
+    },
+    // A half_float field, in k-NN's half-float quantized format: the same
+    // Lucene files under a longer suffix.
+    Case {
+        dir: "on-disk-half-float/l2",
+        stem: "_2_Faiss1040HalfFloatScalarQuantizedKnnVectorsFormat_0",
+        data_offset: 120,
+        similarity: 0,
+        encoding: ScalarEncoding::SingleBitQueryNibble,
+        record_size: 18,
     },
 ];
 
@@ -83,8 +110,8 @@ fn real_fixtures_record_one_quantized_field_of_500_vectors() {
     for case in CASES {
         let name = case.dir;
         let dir = fixtures().join(case.dir);
-        let meta_bytes = fs::read(dir.join(VEMQ)).unwrap();
-        let data_bytes = fs::read(dir.join(VEQ)).unwrap();
+        let meta_bytes = fs::read(dir.join(format!("{}.vemq", case.stem))).unwrap();
+        let data_bytes = fs::read(dir.join(format!("{}.veq", case.stem))).unwrap();
         for bytes in [&meta_bytes, &data_bytes] {
             let footer = Envelope::parse(bytes).unwrap().footer.expect("a footer");
             assert_eq!(footer.verify(bytes).unwrap(), footer.checksum, "{name}");
@@ -102,9 +129,9 @@ fn real_fixtures_record_one_quantized_field_of_500_vectors() {
         assert_eq!(field.count, 500, "{name}");
         assert_eq!(field.scalar_encoding, Some(case.encoding), "{name}");
         assert_eq!(field.record_size(), Some(case.record_size as u64), "{name}");
-        // The records start at the first multiple of 4 after the 109-byte
-        // codec header.
-        assert_eq!(field.data_offset, 112, "{name}");
+        // The records start at the first multiple of 4 after the codec
+        // header: 109 bytes for the float format's suffix.
+        assert_eq!(field.data_offset, case.data_offset, "{name}");
         assert_eq!(field.data_length, 500 * case.record_size as u64, "{name}");
         assert_eq!(field.centroid.len(), 16, "{name}");
         assert!(!field.sparse, "{name}: every document has a vector");
@@ -112,7 +139,12 @@ fn real_fixtures_record_one_quantized_field_of_500_vectors() {
         // The centroid is the vectors' mean (normalized for cosine), the
         // fixtures having no deleted documents, whose vectors a merge would
         // count too; and the stored dot product is its own.
-        let rows = vectors(&dir);
+        // A half_float field's centroid is the mean of its fp16 values.
+        let rows = if case.stem == STEM {
+            vectors(&dir)
+        } else {
+            vec_rows(&dir, case.stem)
+        };
         let mut mean = [0.0_f64; 16];
         for row in &rows {
             let norm = if case.similarity == 2 {
@@ -180,17 +212,31 @@ fn real_fixtures_record_one_quantized_field_of_500_vectors() {
     }
 }
 
-/// The float32 vectors the segment's `.vec` holds, where its `.vemf` puts
-/// them: for a cosine field, k-NN's normalized copies.
-fn vec_rows(dir: &Path) -> Vec<[f32; 16]> {
+/// The vectors the segment's `.vec` holds, where its `.vemf` puts them,
+/// as float32: for a cosine field, k-NN's normalized copies; for a
+/// `half_float` field, its fp16 values, decoded exactly.
+fn vec_rows(dir: &Path, stem: &str) -> Vec<[f32; 16]> {
     let meta =
-        FlatVectorsMeta::parse(&fs::read(dir.join(VEMQ).with_extension("vemf")).unwrap()).unwrap();
+        FlatVectorsMeta::parse(&fs::read(dir.join(format!("{stem}.vemf"))).unwrap()).unwrap();
     let field = &meta.fields[0];
-    let vec = fs::read(dir.join(VEMQ).with_extension("vec")).unwrap();
+    let vec = fs::read(dir.join(format!("{stem}.vec"))).unwrap();
     let start = usize::try_from(field.data_offset).unwrap();
     let bytes = &vec[start..start + usize::try_from(field.data_length).unwrap()];
-    let (words, _) = bytes.as_chunks::<4>();
-    let floats: Vec<f32> = words.iter().map(|w| f32::from_le_bytes(*w)).collect();
+    let floats: Vec<f32> = match field.component_bytes {
+        4 => bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|w| f32::from_le_bytes(*w))
+            .collect(),
+        2 => bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|h| CodeFormat::Fp16.decode(h).unwrap())
+            .collect(),
+        other => panic!("{other}-byte components"),
+    };
     floats.as_chunks::<16>().0.to_vec()
 }
 
@@ -201,15 +247,19 @@ fn additional_corrections_are_the_quantizers_own() {
     // for the Euclidean similarity, the dot product otherwise. Every
     // fixture's corrections recompute exactly from the `.vec`, the cosine
     // one's too: its vectors are k-NN's normalized ones, which Lucene's
-    // merge leaves as they are.
+    // merge leaves as they are; and the half_float one's from its fp16
+    // values, decoded.
     for case in CASES {
         let dir = fixtures().join(case.dir);
-        let meta = QuantizedVectorsMeta::parse(&fs::read(dir.join(VEMQ)).unwrap()).unwrap();
+        let meta = QuantizedVectorsMeta::parse(
+            &fs::read(dir.join(format!("{}.vemq", case.stem))).unwrap(),
+        )
+        .unwrap();
         let field = &meta.fields[0];
-        let data_bytes = fs::read(dir.join(VEQ)).unwrap();
+        let data_bytes = fs::read(dir.join(format!("{}.veq", case.stem))).unwrap();
         let data = DataFile::parse(&data_bytes).unwrap();
         let records = QuantizedVectors::open(&data_bytes, &data, field).unwrap();
-        for (i, row) in vec_rows(&dir).iter().enumerate() {
+        for (i, row) in vec_rows(&dir, case.stem).iter().enumerate() {
             let mut sum = 0.0_f32;
             for (&x, &c) in row.iter().zip(&field.centroid) {
                 sum += if case.similarity == 0 {
@@ -463,11 +513,18 @@ fn records_must_lie_between_header_and_footer() {
         let ok = QuantizedVectors::open(&veq, &data, &field).is_ok();
         assert!(!ok, "records at {offset}");
     }
-    // A truncated .veq ends before the records do.
+    // A truncated .veq has no footer, which Lucene requires; with its
+    // footer kept, it ends before the records do.
     field.data_offset = 112;
     let cut = &veq[..veq.len() - 40];
-    let data = DataFile::parse(cut).unwrap();
-    assert!(QuantizedVectors::open(cut, &data, &field).is_err());
+    assert!(matches!(
+        DataFile::parse(cut),
+        Err(Error::MissingFooter { .. })
+    ));
+    let mut short = veq[..veq.len() - 56].to_vec();
+    short.extend_from_slice(&veq[veq.len() - 16..]);
+    let data = DataFile::parse(&short).unwrap();
+    assert!(QuantizedVectors::open(&short, &data, &field).is_err());
 }
 
 #[test]
@@ -530,4 +587,36 @@ fn a_sparse_field_skips_its_ord_to_doc_table() {
         ),
         "{err}"
     );
+}
+
+#[test]
+fn the_footer_is_checked_where_lucene_checks_it() {
+    // The metadata's once its records are read (`checkFooter`): a record
+    // Lucene refuses is named first.
+    let real = fs::read(fixtures().join("on-disk/l2").join(VEMQ)).unwrap();
+    let end = real.len() - 16;
+    assert!(matches!(
+        QuantizedVectorsMeta::parse(&real[..end]),
+        Err(Error::MissingFooter { offset }) if offset == end
+    ));
+    let header = Envelope::parse(&real).unwrap().header.unwrap();
+    let mut bad = real[..end].to_vec();
+    // The first record's vector encoding, after its field number.
+    let at = header.length + 4;
+    bad[at..at + 4].copy_from_slice(&5_i32.to_le_bytes());
+    match QuantizedVectorsMeta::parse(&bad) {
+        Err(Error::InvalidValue { what, offset, .. }) => {
+            assert_eq!(what, "vector encoding");
+            assert_eq!(offset, at);
+        }
+        other => panic!("{other:?}"),
+    }
+    // The data file's as it is opened, before any record is read
+    // (`retrieveChecksum`).
+    let veq = fs::read(fixtures().join("on-disk/l2").join(VEQ)).unwrap();
+    let end = veq.len() - 16;
+    assert!(matches!(
+        DataFile::parse(&veq[..end]),
+        Err(Error::MissingFooter { offset }) if offset == end
+    ));
 }

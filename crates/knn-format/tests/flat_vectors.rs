@@ -39,6 +39,9 @@ const HALF_FLOAT_VEMF: &str = "_2_NativeEngines990HalfFloatKnnVectorsFormat_0.ve
 /// The `.vemf` of k-NN 3.9's `on_disk` format, whose float32 vectors Lucene
 /// keeps as any other: only the per-field format's name differs.
 const ON_DISK_VEMF: &str = "_2_Faiss1040ScalarQuantizedKnnVectorsFormat_0.vemf";
+/// The raw vectors of a `half_float` `on_disk` field, in k-NN's half-float
+/// format under the quantized format's suffix.
+const ON_DISK_HALF_FLOAT_VEMF: &str = "_2_Faiss1040HalfFloatScalarQuantizedKnnVectorsFormat_0.vemf";
 const ALL: &[&str] = &["l2", "innerproduct", "cosinesimil"];
 
 const CASES: &[Case] = &[
@@ -135,6 +138,15 @@ const CASES: &[Case] = &[
         data_offset: 128,
         component_bytes: 4,
     },
+    Case {
+        set: "opensearch-3.9.0-binary/on-disk-half-float",
+        spaces: &["l2"],
+        meta: ON_DISK_HALF_FLOAT_VEMF,
+        format: MetaFormat::Knn1040HalfFloat,
+        encoding: VectorEncoding::Float32,
+        data_offset: 128,
+        component_bytes: 2,
+    },
 ];
 
 #[test]
@@ -188,8 +200,8 @@ fn real_fixtures_record_one_field_of_500_vectors() {
         }
     }
     assert_eq!(
-        seen, 21,
-        "three float, six fp16, three bf16, two byte, one binary, one binary-encoder, five on-disk"
+        seen, 22,
+        "three float, six fp16, three bf16, two byte, one binary, one binary-encoder, six on-disk"
     );
 }
 
@@ -453,18 +465,21 @@ fn malformed_metadata_is_an_error_not_a_panic() {
         "1 unexpected byte at offset 133 after the last flat-vectors record"
     );
 
-    // Every truncation of a real file is an error but one: a file whose
-    // footer is cut off whole still parses, as a footer is not required.
-    // A footer cut partway is not recognized as one, and leaves bytes
-    // after the last record.
+    // Every truncation of a real file is an error: a footer cut partway
+    // is not recognized as one, and leaves bytes after the last record,
+    // and a file whose footer is cut off whole has none, which Lucene
+    // requires.
     let records_end = header.len() - 16;
-    for len in (0..header.len()).filter(|&len| len != records_end) {
+    for len in 0..header.len() {
         assert!(
             FlatVectorsMeta::parse(&header[..len]).is_err(),
             "prefix of {len} bytes must not parse"
         );
     }
-    assert!(FlatVectorsMeta::parse(&header[..records_end]).is_ok());
+    assert!(matches!(
+        FlatVectorsMeta::parse(&header[..records_end]),
+        Err(Error::MissingFooter { offset }) if offset == records_end
+    ));
     assert!(FlatVectorsMeta::parse(&header).is_ok());
 }
 

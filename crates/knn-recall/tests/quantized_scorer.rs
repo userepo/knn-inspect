@@ -335,8 +335,8 @@ fn the_dot_product_of_the_codes_reads_every_packing() {
             "{encoding:?}"
         );
 
-        // A seven-bit record holds no byte of 128 or more; Lucene's dot
-        // product would read one as negative.
+        // A seven-bit record holds a byte of 128 or more only from a
+        // degenerate interval; Lucene's dot product reads one as negative.
         if encoding == ScalarEncoding::SevenBit {
             let mut high = packed.clone();
             high[3] = 200;
@@ -404,4 +404,112 @@ fn what_lucene_refuses_is_refused() {
     let terms = s.query_terms();
     assert!(s.score(&[0, 0], terms).is_none());
     assert!(s.score(&[], terms).is_none());
+}
+
+#[test]
+fn query_codes_past_their_bits_are_read_as_lucene_reads_them() {
+    // A query interval of a few dozen subnormals: the float32 step rounds
+    // so coarsely that component 1 quantizes to 21, past 4 bits. Lucene's
+    // transposeHalfByte keeps its low 4 bits, 5, for 1- and 2-bit fields.
+    let mut query = [0.0_f32; 8];
+    // 22 times the least subnormal, 2^-149.
+    query[1] = f32::from_bits(22);
+    let stored = QuantizationResult {
+        lower: 0.0,
+        upper: 1e38,
+        additional: 0.0,
+        component_sum: 1,
+    };
+    for (encoding, packed, scale) in [
+        // Bit 1 set: component 1's code is 1.
+        (ScalarEncoding::SingleBitQueryNibble, vec![0x40], 1.0_f32),
+        (
+            ScalarEncoding::DibitQueryNibble,
+            vec![0x40, 0x00],
+            1.0 / 3.0,
+        ),
+    ] {
+        let scorer = QuantizedScorer::new(
+            Similarity::MaximumInnerProduct,
+            encoding,
+            &query,
+            &[0.0; 8],
+            0.0,
+        )
+        .unwrap();
+        let q = scorer.query_terms();
+        assert_eq!((q.lower, q.component_sum), (0.0, 21), "{encoding:?}");
+        // With both lower ends 0 and no additional terms, the estimate is
+        // lx ly (codes . codes), and the score 1 more.
+        let lx = (stored.upper - stored.lower) * scale;
+        let ly = (q.upper - q.lower) * (1.0 / 15.0);
+        let expected = 1.0 + lx * ly * 5.0;
+        assert_ne!(expected, 1.0 + lx * ly * 21.0);
+        assert_eq!(
+            scorer.score(&packed, stored),
+            Some(expected),
+            "{encoding:?}"
+        );
+        assert_eq!(
+            scorer.knn_native_kernel().score(&packed, stored),
+            Some(expected),
+            "{encoding:?}"
+        );
+    }
+}
+
+#[test]
+fn the_native_kernel_is_only_the_1_bit_fields() {
+    // Off 1-bit fields, k-NN scores with Lucene's scorer: a NaN distance
+    // stays NaN.
+    let nan = QuantizationResult {
+        lower: 0.0,
+        upper: 0.0,
+        additional: f32::NAN,
+        component_sum: 0,
+    };
+    let scorer = QuantizedScorer::new(
+        Similarity::Euclidean,
+        ScalarEncoding::PackedNibble,
+        &[0.5; 8],
+        &[0.5; 8],
+        2.0,
+    )
+    .unwrap()
+    .knn_native_kernel();
+    assert!(scorer.score(&[0; 4], nan).unwrap().is_nan());
+}
+
+#[test]
+fn a_seven_bit_query_code_past_127_is_a_negative_byte() {
+    // A 7-bit query over an interval of 190 subnormals: a step of one
+    // subnormal, so component 1 quantizes to 190, which Lucene's
+    // dotProduct(byte[], byte[]) reads as the byte -66.
+    let mut query = [0.0_f32; 8];
+    query[1] = f32::from_bits(190);
+    let scorer = QuantizedScorer::new(
+        Similarity::MaximumInnerProduct,
+        ScalarEncoding::SevenBit,
+        &query,
+        &[0.0; 8],
+        0.0,
+    )
+    .unwrap();
+    let q = scorer.query_terms();
+    assert_eq!((q.lower, q.component_sum), (0.0, 190));
+    let stored = QuantizationResult {
+        lower: 0.0,
+        upper: 1e38,
+        additional: 0.0,
+        component_sum: 1,
+    };
+    // Component 1's stored code is 1.
+    let packed = [0, 1, 0, 0, 0, 0, 0, 0];
+    let lx = (stored.upper - stored.lower) * (1.0 / 127.0);
+    let ly = (q.upper - q.lower) * (1.0 / 127.0);
+    let estimate = lx * ly * -66.0;
+    assert!(estimate < 0.0);
+    // scaleMaxInnerProductScore of a negative estimate.
+    let expected = 1.0 / (1.0 + -estimate);
+    assert_eq!(scorer.score(&packed, stored), Some(expected));
 }

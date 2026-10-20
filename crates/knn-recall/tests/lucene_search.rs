@@ -276,6 +276,58 @@ fn the_visit_limit_cuts_a_batch_short() {
 }
 
 #[test]
+fn a_candidate_one_ulp_above_the_kth_is_explored() {
+    // k = 2: node 1, one ulp above the entry point, fills the collector
+    // with it, so the least accepted score becomes node 1's own. It is not
+    // below that, so it is explored, and its neighbor, node 2, found.
+    let lists = vec![vec![vec![1]], vec![vec![2]], vec![vec![]]];
+    let chain = Built::new(&lists, &[1], 0, 1);
+    let scores = [1.0, 1.0_f32.next_up(), 5.0];
+    let r = run(&chain, 3, 2, NO_LIMIT, &scores);
+    assert_eq!(r.hits, hits(&[(2, 5.0), (1, 1.0_f32.next_up())]));
+    assert_eq!(r.visited, 3);
+}
+
+#[test]
+fn a_nan_drops_its_whole_batch_from_the_scan() {
+    // Every vector scanned, 64 at a time: the first batch's best is NaN,
+    // which is not above negative infinity, so none of it is collected.
+    let scores: Vec<f32> = (0..70_u8)
+        .map(|i| if i == 3 { f32::NAN } else { f32::from(i) })
+        .collect();
+    let b = line(1);
+    let r = run(&b, 70, 70, NO_LIMIT, &scores);
+    let docs: Vec<i32> = r.hits.iter().map(|h| h.doc).collect();
+    assert_eq!(docs, [69, 68, 67, 66, 65, 64]);
+    assert_eq!(r.visited, 70);
+}
+
+#[test]
+fn a_corrupt_max_level_descends_only_the_levels_described() {
+    // A max_level far past the one level the table describes searches as
+    // a max_level of 1 does, at once.
+    let mut b = line(1);
+    let expected = run(&b, 5, 2, NO_LIMIT, &LINE_SCORES);
+    b.max_level = i32::MAX;
+    let r = run(&b, 5, 2, NO_LIMIT, &LINE_SCORES);
+    assert_eq!(r.hits, expected.hits);
+    // The entry point is scored for the descent, then again for level 0.
+    assert_eq!(r.visited, expected.visited + 1);
+}
+
+#[test]
+fn an_index_is_empty_by_its_vectors_not_its_graph() {
+    // Vectors but no graph nodes: k at their count scans them all, as
+    // k-NN does for an index of vectors whatever its graph.
+    let empty = Built::new(&[], &[2], -1, 0);
+    let r = run(&empty, 5, 5, NO_LIMIT, &LINE_SCORES);
+    assert_eq!(r.hits.len(), 5);
+    // A graph but no vectors: nothing.
+    let r = run(&line(1), 0, 2, NO_LIMIT, &LINE_SCORES);
+    assert_eq!(r.hits, []);
+}
+
+#[test]
 fn every_vector_is_scored_once_k_reaches_their_count() {
     // k at the vector count: no graph search, every vector in batches,
     // results by score and then by doc.

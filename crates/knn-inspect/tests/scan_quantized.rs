@@ -220,6 +220,45 @@ fn every_on_disk_fixture_matches_its_quantized_vectors() {
 }
 
 #[test]
+fn a_half_float_on_disk_field_is_tied_by_its_own_format() {
+    // k-NN writes a half_float on_disk field in its own quantized format,
+    // a subclass of the float one under its own name: the .fnm names it,
+    // and its files carry that name. Its .vec holds fp16 components, so
+    // the corrections are not compared with it.
+    let dir = fixtures().join("on-disk-half-float/l2");
+    let (code, f) = scan(&dir, &[]);
+    assert_eq!(code, Some(0), "{f}");
+    assert_eq!(f["status"], "clean", "{f}");
+    let q = &f["lucene_quantized"];
+    assert_eq!(q["status"], "match", "{q}");
+    assert_eq!(q["field"], "vec", "{q}");
+    assert_eq!(q["encoding"], "SINGLE_BIT_QUERY_NIBBLE", "{q}");
+    // A header four bytes longer, for the longer suffix.
+    assert_eq!(q["offset"], 120, "{q}");
+    let stem = "_2_Faiss1040HalfFloatScalarQuantizedKnnVectorsFormat_0";
+    assert!(
+        q["file"]
+            .as_str()
+            .unwrap()
+            .ends_with(&format!("{stem}.vemq")),
+        "{q}"
+    );
+    assert!(
+        q["data_file"]
+            .as_str()
+            .unwrap()
+            .ends_with(&format!("{stem}.veq")),
+        "{q}"
+    );
+    assert!(
+        detail(q).ends_with(
+            "component sums agreeing; not compared with the .vec: the .vec's field holds 2-byte components, not float32"
+        ),
+        "{q}"
+    );
+}
+
+#[test]
 fn files_with_their_own_vectors_skip_the_check_quietly() {
     let dir = fixtures().join("binary/hamming");
     let (code, f) = scan(&dir, &[]);
@@ -1226,7 +1265,7 @@ fn an_unreadable_vemq_counts_only_when_matching_by_shape() {
     assert_eq!(q["status"], "damaged", "{q}");
     assert!(
         detail(q).starts_with(
-            "not every .vemq of the segment can be read, and the field of the graph's shape that fits is a warning: 500 records of 18 bytes"
+            "not every .vemq of the segment can be read, and the field of the graph's shape that fits comes out warning: 500 records of 18 bytes"
         ),
         "{q}"
     );
@@ -1421,7 +1460,7 @@ fn the_native_file_is_named_for_its_field() {
 fn the_field_infos_must_record_a_quantized_k_nn_field() {
     // A name, a change to the .fnm, and the status and detail it gives.
     type Case = (&'static str, fn(&mut Vec<u8>), &'static str, &'static str);
-    let cases: [Case; 6] = [
+    let cases: [Case; 7] = [
         (
             "knn-field",
             |b| replace_string(b, "knn_field", "knn_fielx"),
@@ -1469,6 +1508,18 @@ fn the_field_infos_must_record_a_quantized_k_nn_field() {
             },
             "mismatch",
             "the .fnm records no per-field vectors format for field \"vec\"",
+        ),
+        (
+            "no-suffix",
+            |b| {
+                replace_string(
+                    b,
+                    "PerFieldKnnVectorsFormat.suffix",
+                    "PerFieldKnnVectorsFormat.suffiy",
+                );
+            },
+            "mismatch",
+            "the .fnm records the per-field vectors format Faiss1040ScalarQuantizedKnnVectorsFormat for field \"vec\", but no suffix for its files",
         ),
         (
             "number",

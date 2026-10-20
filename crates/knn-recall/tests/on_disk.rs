@@ -17,7 +17,9 @@ use knn_format::I64;
 use knn_format::flat_vectors::{FlatField, FlatVectorsMeta, VectorEncoding};
 use knn_format::quantized_vectors::{DataFile, QuantizedVectors, QuantizedVectorsMeta};
 use knn_recall::lucene_search;
-use knn_recall::on_disk::{DEFAULT_EF_SEARCH, OnDiskField, Plan, Rescore, exact_score};
+use knn_recall::on_disk::{
+    DEFAULT_EF_SEARCH, OnDiskField, Plan, Rescore, exact_score, field_vectors,
+};
 use knn_recall::quantized_scorer::QuantizedScorer;
 use knn_recall::quantizer::Similarity;
 use knn_recall::{Error, Queries};
@@ -502,4 +504,72 @@ fn searches_return_what_the_live_index_returned() {
     }
     assert!(failures.is_empty(), "{failures:#?}");
     assert_eq!(compared, 5 * MODES.len() * 100, "every live baseline");
+}
+
+#[test]
+fn a_cosine_fields_vectors_must_be_of_unit_length() {
+    // Ground truth over the graph's inner product is the cosine's only
+    // over k-NN's normalized vectors.
+    let files = Files::of("on-disk/cosinesimil");
+    let parsed = knn_format::parse(&files.native).unwrap();
+    let flat = FlatVectorsMeta::parse(&files.vemf).unwrap();
+    let field = &flat.fields[0];
+    assert!(field_vectors(&parsed.index, Similarity::Cosine, field, &files.vec).is_ok());
+    // Vector 3 doubled: a squared norm of 4.
+    let mut vec = files.vec.clone();
+    let start = usize::try_from(field.data_offset).unwrap() + 3 * 16 * 4;
+    for i in 0..16 {
+        let at = start + 4 * i;
+        let x = f32::from_le_bytes(vec[at..at + 4].try_into().unwrap());
+        vec[at..at + 4].copy_from_slice(&(2.0 * x).to_le_bytes());
+    }
+    match field_vectors(&parsed.index, Similarity::Cosine, field, &vec) {
+        Err(Error::NotNormalized { node, squared_norm }) => {
+            assert_eq!(node, 3);
+            assert!((squared_norm - 4.0).abs() < 1e-3, "{squared_norm}");
+        }
+        other => panic!("{other:?}"),
+    }
+    // Under another similarity, any length is a vector's own.
+    assert!(field_vectors(&parsed.index, Similarity::MaximumInnerProduct, field, &vec).is_ok());
+}
+
+#[test]
+fn a_failed_query_is_named_by_its_row() {
+    with_field("on-disk/cosinesimil", |f| {
+        let plan = f.plan(10, DEFAULT_EF_SEARCH, Rescore::Default).unwrap();
+        // Rows 0 and 2 fine, row 1 of norm 0.
+        let mut rows = vec![0.5_f32; 16];
+        rows.extend([0.0; 16]);
+        rows.extend([0.25; 16]);
+        let bytes: Vec<u8> = rows.iter().flat_map(|x| x.to_le_bytes()).collect();
+        let queries = Queries::from_bytes(&bytes, 16).unwrap();
+        match f.search_all(&queries, &plan) {
+            Err(Error::AtQuery { row, cause }) => {
+                assert_eq!(row, 1);
+                assert!(matches!(*cause, Error::ZeroNormQuery));
+            }
+            other => panic!("{other:?}"),
+        }
+        // Of several that fail, the first by row, however the queries ran
+        // in parallel.
+        let mut rows = Vec::new();
+        for i in 0..400 {
+            let zero = i == 150 || i == 399;
+            rows.extend([if zero { 0.0 } else { 0.5_f32 }; 16]);
+        }
+        let bytes: Vec<u8> = rows.iter().flat_map(|x| x.to_le_bytes()).collect();
+        let queries = Queries::from_bytes(&bytes, 16).unwrap();
+        for _ in 0..3 {
+            match f.search_all(&queries, &plan) {
+                Err(Error::AtQuery { row, .. }) => assert_eq!(row, 150),
+                other => panic!("{other:?}"),
+            }
+        }
+        // A query whose norm float32 cannot hold normalizes to zeros.
+        assert!(matches!(
+            f.search(&[3e38; 16], &plan),
+            Err(Error::ZeroNormQuery)
+        ));
+    });
 }

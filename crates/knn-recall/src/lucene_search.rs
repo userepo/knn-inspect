@@ -93,7 +93,8 @@ where
     D: Fn(usize) -> i32,
 {
     let mut collector = Collector::new(k, visit_limit);
-    if graph.node_count() == 0 || k == 0 {
+    // k-NN returns nothing for an index of no vectors, whatever its graph.
+    if vectors == 0 || k == 0 {
         return Ok(collector.top_docs());
     }
     if k < vectors {
@@ -110,9 +111,23 @@ where
     Ok(collector.top_docs())
 }
 
-/// `FaissMemoryOptimizedSearcher`'s scan of every vector, in batches whose
-/// best score must beat the `k`-th collected for any of them to be
-/// collected.
+/// One past the highest level the greedy descent searches, which runs
+/// from there down to level 1: `num_levels`, Faiss's `max_level`, capped
+/// by `described`, the levels the per-level table describes. Past those
+/// no node has neighbors, and a corrupt `max_level` would spin through
+/// billions of empty levels (Lucene's `FaissHnswGraph` throws there). A
+/// `max_level` of 0 or less descends through none.
+fn descent_top(num_levels: i32, described: usize) -> usize {
+    usize::try_from(num_levels).unwrap_or(0).min(described)
+}
+
+/// `FaissMemoryOptimizedSearcher`'s scan of every vector, in batches of
+/// [`EXHAUSTIVE_BATCH`], each collected only when its best score is above
+/// the collector's least competitive one. The collector holds `k`, at
+/// least the vector count, so it fills only with the last batch: until
+/// then that score is negative infinity, and the gate drops only a batch
+/// whose best is NaN, as `Math.max` makes it when one score is, or
+/// negative infinity.
 fn exhaustive(
     vectors: usize,
     collector: &mut Collector,
@@ -165,7 +180,9 @@ fn bulk_score(
 /// `HnswGraphSearcher` over a Faiss graph, without a filter.
 struct Searcher<'g, 'a> {
     graph: &'g HnswGraph<'a>,
-    /// `graph.size()`, which `FaissHnswGraph` gives as the vector count.
+    /// The graph's nodes, which stand for `graph.size()`: `FaissHnswGraph`
+    /// gives the index's vector count, which a graph of one level list
+    /// per vector, as `on_disk` requires, equals.
     size: usize,
     visited: Vec<bool>,
     /// A max-heap of Lucene keys: the best score first, then the lowest
@@ -224,8 +241,8 @@ impl Searcher<'_, '_> {
         self.prepare();
         let mut current_score = score(current).ok_or(Error::Unscored { node: current })?;
         collector.inc_visited(1);
-        for level in (1..num_levels.max(1)).rev() {
-            let level = usize::try_from(level).unwrap_or(0);
+        let described = self.graph.cum_nneighbor_per_level.len().saturating_sub(1);
+        for level in (1..descent_top(num_levels, described)).rev() {
             let mut found_better = true;
             if let Some(seen) = self.visited.get_mut(current) {
                 *seen = true;
@@ -466,6 +483,14 @@ fn decode_node(key: i64) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_descent_stops_at_the_levels_described() {
+        assert_eq!(descent_top(3, 16), 3);
+        assert_eq!(descent_top(i32::MAX, 16), 16);
+        assert_eq!(descent_top(0, 16), 0);
+        assert_eq!(descent_top(-5, 16), 0);
+    }
 
     #[test]
     fn keys_order_by_score_then_by_the_lower_id() {

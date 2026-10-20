@@ -254,6 +254,15 @@ fn what_cannot_be_searched_is_said_so() {
         String::from_utf8_lossy(&o.stderr)
     );
 
+    // A half_float field, whose fp16 vectors k-NN rescores natively.
+    let o = run(&["recall", &native("on-disk-half-float/l2"), "--sample", "5"]);
+    assert_eq!(o.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        err.contains("field \"vec\" is a half_float field, in Faiss1040HalfFloatScalarQuantizedKnnVectorsFormat"),
+        "{err}"
+    );
+
     // A graph without its .fnm: its field cannot be found.
     let dir = std::env::temp_dir().join(format!("knn-inspect-recall-nofnm-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -273,8 +282,338 @@ fn what_cannot_be_searched_is_said_so() {
     assert_eq!(o.status.code(), Some(1));
     let err = String::from_utf8_lossy(&o.stderr);
     assert!(
-        err.contains("the field's quantized vectors are found through the segment's .fnm, and no _2.fnm beside the native file"),
+        err.contains("the field's files are found through the segment's .fnm, and no _2.fnm beside the native file"),
         "{err}"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A copy of an `on_disk` fixture in a directory of its own, removed when
+/// dropped.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn of(name: &str, fixture: &str) -> Self {
+        let dir =
+            std::env::temp_dir().join(format!("knn-inspect-recall-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for entry in std::fs::read_dir(fixtures().join(fixture)).unwrap() {
+            let p = entry.unwrap().path();
+            std::fs::copy(&p, dir.join(p.file_name().unwrap())).unwrap();
+        }
+        Self(dir)
+    }
+
+    fn native(&self) -> String {
+        self.0.join("_2_165_vec.faiss").to_str().unwrap().to_owned()
+    }
+
+    /// Rewrites `name` with `edit` applied, its footer resealed when
+    /// `reseal`.
+    fn edit(&self, name: &str, reseal: bool, edit: impl FnOnce(&mut Vec<u8>)) {
+        let path = self.0.join(name);
+        let mut bytes = std::fs::read(&path).unwrap();
+        edit(&mut bytes);
+        if reseal {
+            let footer = knn_format::envelope::Envelope::parse(&bytes)
+                .unwrap()
+                .footer
+                .unwrap();
+            if let Err(knn_format::Error::ChecksumMismatch { computed, .. }) = footer.verify(&bytes)
+            {
+                let at = bytes.len() - 8;
+                bytes[at..].copy_from_slice(&u64::from(computed).to_be_bytes());
+            }
+        }
+        std::fs::write(&path, bytes).unwrap();
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+const STEM: &str = "_2_Faiss1040ScalarQuantizedKnnVectorsFormat_0";
+
+/// Runs `recall` and returns its exit code and error output.
+fn refused(args: &[&str]) -> (Option<i32>, String) {
+    let o = run(args);
+    (
+        o.status.code(),
+        String::from_utf8_lossy(&o.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn the_fields_files_are_held_to_what_scan_holds_them_to() {
+    // A .vemq and .veq of another segment, resealed: scan calls them
+    // damaged, and recall does not search them.
+    let s = Scratch::of("other-segment", "on-disk/l2");
+    for ext in ["vemq", "veq"] {
+        s.edit(&format!("{STEM}.{ext}"), true, |b| {
+            let header = knn_format::envelope::Envelope::parse(b)
+                .unwrap()
+                .header
+                .unwrap();
+            let at = header.length - 1 - header.suffix.len() - 16;
+            b[at] ^= 0xFF;
+        });
+    }
+    let (code, err) = refused(&["recall", &s.native(), "--sample", "5"]);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(
+        err.contains(".vemq's header names another segment than the .fnm's"),
+        "{err}"
+    );
+
+    // A .vec whose footer fails its checksum.
+    let s = Scratch::of("vec-footer", "on-disk/l2");
+    s.edit(&format!("{STEM}.vec"), false, |b| {
+        let at = b.len() - 1;
+        b[at] ^= 0xFF;
+    });
+    let (code, err) = refused(&["recall", &s.native(), "--sample", "5"]);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains(".vec fails its footer checksum"), "{err}");
+
+    // A compound segment keeps its .fnm inside its .cfs.
+    let s = Scratch::of("compound", "on-disk/l2");
+    std::fs::remove_file(s.0.join("_2.fnm")).unwrap();
+    std::fs::write(s.0.join("_2.cfs"), b"").unwrap();
+    let (code, err) = refused(&["recall", &s.native(), "--sample", "5"]);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("the segment is compound"), "{err}");
+}
+
+#[test]
+fn result_lists_need_only_the_vec() {
+    // Scoring lists from elsewhere reads the .vemf and .vec, not the
+    // quantized files.
+    let s = Scratch::of("results-only", "on-disk/l2");
+    for ext in ["vemq", "veq"] {
+        std::fs::remove_file(s.0.join(format!("{STEM}.{ext}"))).unwrap();
+    }
+    let dir = fixtures().join("on-disk/l2");
+    let v = json(&[
+        "recall",
+        &s.native(),
+        "--queries",
+        dir.join("queries.f32").to_str().unwrap(),
+        "--results",
+        dir.join("results.jsonl").to_str().unwrap(),
+        "--json",
+    ]);
+    assert_eq!(v["queries"], 100, "{v}");
+    // Its own search needs them.
+    let (code, err) = refused(&["recall", &s.native(), "--sample", "5"]);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(
+        err.contains("no ") && err.contains(&format!("{STEM}.vemq beside the native file")),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_veq_of_another_segment_than_its_vemq_is_refused() {
+    let s = Scratch::of("veq-segment", "on-disk/l2");
+    s.edit(&format!("{STEM}.veq"), true, |b| {
+        let header = knn_format::envelope::Envelope::parse(b)
+            .unwrap()
+            .header
+            .unwrap();
+        let at = header.length - 1 - header.suffix.len() - 16;
+        b[at] ^= 0xFF;
+    });
+    let (code, err) = refused(&["recall", &s.native(), "--sample", "5"]);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(
+        err.contains(".veq's header names another segment than the .vemq's"),
+        "{err}"
+    );
+}
+
+#[test]
+fn result_lists_are_held_to_the_id_map_too() {
+    // An ID map one label short of the graph's 500 nodes: the labels end
+    // at 75,830, where the footer begins, after their count at 71,822.
+    let s = Scratch::of("short-id-map", "on-disk/l2");
+    s.edit("_2_165_vec.faiss", true, |b| {
+        assert_eq!(b.len(), 75_846);
+        b[71_822..71_830].copy_from_slice(&499_u64.to_le_bytes());
+        b.drain(75_822..75_830);
+    });
+    let dir = fixtures().join("on-disk/l2");
+    let (code, err) = refused(&[
+        "recall",
+        &s.native(),
+        "--queries",
+        dir.join("queries.f32").to_str().unwrap(),
+        "--results",
+        dir.join("results.jsonl").to_str().unwrap(),
+    ]);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(
+        err.contains("the native file's ID map holds 499 labels for the graph's 500 nodes"),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_query_that_cannot_be_searched_is_named_once() {
+    // Rows 1 and 2 of norm 0 on a cosine field: the first is named, from
+    // 1, and why, once.
+    let dir = std::env::temp_dir().join(format!("knn-inspect-recall-zero-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let queries = dir.join("queries.f32");
+    let mut rows = vec![0.5_f32; 16];
+    rows.extend([0.0; 32]);
+    let bytes: Vec<u8> = rows.iter().flat_map(|x| x.to_le_bytes()).collect();
+    std::fs::write(&queries, bytes).unwrap();
+    let (code, err) = refused(&[
+        "recall",
+        &native("on-disk/cosinesimil"),
+        "--queries",
+        queries.to_str().unwrap(),
+    ]);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(code, Some(1), "{err}");
+    let why = "a cosine query of norm 0, or one too large for float32, cannot be normalized";
+    assert!(
+        err.contains(&format!("query 2 (counting from 1): {why}")),
+        "{err}"
+    );
+    assert_eq!(err.matches(why).count(), 1, "{err}");
+}
+
+/// Where the records of a fixture's Lucene file begin: after its header.
+fn header_end(b: &[u8]) -> usize {
+    knn_format::envelope::Envelope::parse(b)
+        .unwrap()
+        .header
+        .unwrap()
+        .length
+}
+
+#[test]
+fn the_field_is_held_to_what_scan_holds_it_to() {
+    let dir = fixtures().join("on-disk/cosinesimil");
+    let queries = dir.join("queries.f32");
+    let results = dir.join("results.jsonl");
+    let (queries, results) = (queries.to_str().unwrap(), results.to_str().unwrap());
+
+    // The .vemq's similarity turned from cosine (2) to maximum inner
+    // product (3): the .fnm disagrees, and the field is not searched.
+    let s = Scratch::of("vemq-similarity", "on-disk/cosinesimil");
+    s.edit(&format!("{STEM}.vemq"), true, |b| {
+        // The field number and vector encoding come first.
+        let at = header_end(b) + 8;
+        assert_eq!(b[at..at + 4], 2_i32.to_le_bytes());
+        b[at..at + 4].copy_from_slice(&3_i32.to_le_bytes());
+    });
+    let (code, err) = refused(&["recall", &s.native(), "--queries", queries]);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(
+        err.contains("the field's files come out mismatch as scan checks them: the .fnm records the cosine similarity for field \"vec\", the .vemq the maximum_inner_product"),
+        "{err}"
+    );
+
+    // A .vemf that disagrees with the .fnm, for result lists, which read
+    // no .vemq.
+    let s = Scratch::of("vemf-similarity", "on-disk/cosinesimil");
+    s.edit(&format!("{STEM}.vemf"), true, |b| {
+        let at = header_end(b) + 8;
+        assert_eq!(b[at..at + 4], 2_i32.to_le_bytes());
+        b[at..at + 4].copy_from_slice(&3_i32.to_le_bytes());
+    });
+    let (code, err) = refused(&[
+        "recall",
+        &s.native(),
+        "--queries",
+        queries,
+        "--results",
+        results,
+    ]);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(
+        err.contains(
+            ".vemf records the maximum_inner_product similarity for field 6, the .fnm the cosine"
+        ),
+        "{err}"
+    );
+
+    // A NaN in the .vec, which k-NN refuses: damage to the search, and
+    // no ground truth for result lists.
+    let s = Scratch::of("vec-nan", "on-disk/l2");
+    s.edit(&format!("{STEM}.vec"), true, |b| {
+        // The vectors start at 128.
+        b[128..132].copy_from_slice(&f32::NAN.to_le_bytes());
+    });
+    let (code, err) = refused(&["recall", &s.native(), "--sample", "5"]);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(
+        err.contains("the field's files come out damaged as scan checks them")
+            && err.contains("holds a value that is not finite"),
+        "{err}"
+    );
+    let l2 = fixtures().join("on-disk/l2");
+    let (code, err) = refused(&[
+        "recall",
+        &s.native(),
+        "--queries",
+        l2.join("queries.f32").to_str().unwrap(),
+        "--results",
+        l2.join("results.jsonl").to_str().unwrap(),
+    ]);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(
+        err.contains("the field's vector 0 holds a value that is not finite at component 0"),
+        "{err}"
+    );
+}
+
+#[test]
+fn what_scan_only_warns_of_is_searched_and_said() {
+    // Record 7's additional correction doubled: the .vec does not give it
+    // back, which scan warns of. The field is searched, and the warning
+    // shown.
+    let s = Scratch::of("spoiled-correction", "on-disk/l2");
+    s.edit(&format!("{STEM}.veq"), true, |b| {
+        // Records of 18 bytes from 112: the packed bits (2 bytes), then
+        // the lower and upper ends, then the additional correction.
+        let at = 112 + 7 * 18 + 2 + 8;
+        let x = f32::from_le_bytes(b[at..at + 4].try_into().unwrap());
+        b[at..at + 4].copy_from_slice(&(2.0 * x).to_le_bytes());
+    });
+    let o = run(&["recall", &s.native(), "--sample", "5", "--json"]);
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert_eq!(o.status.code(), Some(0), "{err}");
+    assert!(
+        err.starts_with("warning: ")
+            && err.contains("1 of 500 records' additional corrections differ from their vectors'"),
+        "{err}"
+    );
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["queries"], 5, "{v}");
+}
+
+#[test]
+fn a_field_scan_cannot_check_is_not_searched() {
+    // A .vemq of a codec version this tool does not read, sound: scan
+    // skips the field, and recall says why it cannot search it.
+    let s = Scratch::of("vemq-newer", "on-disk/l2");
+    s.edit(&format!("{STEM}.vemq"), true, |b| {
+        // The version, after the magic and the codec name.
+        let name_len = usize::from(b[4]);
+        let at = 4 + 1 + name_len;
+        b[at..at + 4].copy_from_slice(&1_i32.to_be_bytes());
+    });
+    let (code, err) = refused(&["recall", &s.native(), "--sample", "5"]);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(
+        err.contains("scan cannot check the field's files: the field's .vemq is in a format this tool does not read"),
+        "{err}"
+    );
 }

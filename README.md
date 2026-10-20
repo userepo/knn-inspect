@@ -151,17 +151,27 @@ default, the first pass keeps `min(10000, max(100, ceil(k x f)))`
 results, `f` 2 for a 1-bit (32x) field and 1 for 2 and 4 bits (16x, 8x),
 and the graph is searched with a beam of that or `max(k, ef_search)`,
 whichever is larger, where `ef_search` is the index setting
-`index.knn.algo_param.ef_search` (100 unless set), not the efSearch the
-file records: `--ef-search` gives the index's. `--k` is at most 10,000
-for such a file, as k-NN's query requires. `--oversample F` rescores
-with an `oversample_factor` of F, from 1 to 100, as a query that gives
-one does, and `--no-rescore` keeps the first pass's top k, as
+`index.knn.algo_param.ef_search` or a query's
+`method_parameters.ef_search` (100 unless set), not the efSearch the
+file records: `--ef-search` gives it. For its own search of such a file,
+`--k` is at most 10,000, as k-NN's query requires. `--oversample F`
+rescores with an `oversample_factor` of F, from 1 to 100, as a query
+that gives one does, and `--no-rescore` keeps the first pass's top k, as
 `"rescore": false` does. This is the search of a one-segment index
-without a filter, with the arithmetic k-NN runs on an x86-64 host with
-AVX2: on the fixtures, every result list the live index returned, with
-and without rescoring, is reproduced bit for bit, doc ids and scores. On
-another host, k-NN's own float32 sums can differ in a last bit (see
-[docs/format-notes.md](docs/format-notes.md)).
+without a filter or deleted documents, under k-NN's default settings
+(shard-level rescoring on), with the arithmetic k-NN runs on an x86-64
+host with AVX2: on the fixtures, every result list the live index
+returned, with and without rescoring, is reproduced bit for bit, doc ids
+and scores. On another host, k-NN's own float32 sums can differ in a
+last bit (see [docs/format-notes.md](docs/format-notes.md)). Before the
+search, the field must pass the check `scan` makes of it
+(`lucene_quantized`), and what that check only warns of is printed on
+stderr; a cosine field's `.vec` vectors must also be of unit length, as
+k-NN keeps them. Result lists from elsewhere (`--results`) are scored
+against the `.vemf` and `.vec` alone, which must be sound, of the
+field's segment, of the similarity the `.fnm` records, and finite. A
+`half_float` field in `on_disk` mode, whose fp16 vectors k-NN rescores
+with native kernels, is not searched.
 
 `scan` finds every `.faiss` and `.faissc` file under a directory,
 subdirectories included, and runs `verify` on each, printing one summary
@@ -308,8 +318,9 @@ an `on_disk` field or an `sq` encoder of 1, 2, or 4 bits, keeping the
 quantized vectors in Lucene's files; with or without the Lucene footer.
 Every command reads all of them, except that `recall` on a graph without
 its vectors needs the segment's `.fnm` and the field's `.vemq`, `.veq`,
-`.vemf`, and `.vec` loose, not in a compound file. Fixtures and format
-notes target OpenSearch 3.9.0.
+`.vemf`, and `.vec` loose, not in a compound file, and is refused for a
+`half_float` field in `on_disk` mode. Fixtures and format notes target
+OpenSearch 3.9.0.
 
 Not yet: other scalar-quantized storage, product quantization, IVF, and
 the float graph without its vectors (a CAGRA graph, `IHc2` or the older
@@ -368,7 +379,9 @@ whose results come from Lucene 10.5.1 itself.
   (`results-ef-search-300.jsonl`); the 150 nearest
   (`results-k-150.jsonl`); and the 10 nearest without rescoring at an
   `ef_search` of 10 (`results-no-rescore-ef-search-10.jsonl`), which
-  `recall`'s search must reproduce bit for bit
+  `recall`'s search must reproduce bit for bit; and of a `half_float`
+  field in `on_disk` mode, in k-NN's own quantized format, its `.vec` in
+  fp16 (`on-disk-half-float/l2/`), with graph statistics
 - `*.stats.json` beside each synthetic fixture and `stats.json` beside
   each real one - the graph statistics Faiss Python computes from the
   same file (for a graph without its vectors, from a copy Faiss can
@@ -452,6 +465,7 @@ docker compose -f tools\docker-compose.yml up -d
 .venv\Scripts\python tools\extract_opensearch.py --out fixtures\opensearch-3.9.0-binary\on-disk --encoding on-disk --spaces innerproduct cosinesimil --queries 100
 .venv\Scripts\python tools\extract_opensearch.py --out fixtures\opensearch-3.9.0-binary\on-disk-16x --encoding on-disk --compression 16x --spaces l2 --queries 100
 .venv\Scripts\python tools\extract_opensearch.py --out fixtures\opensearch-3.9.0-binary\on-disk-8x --encoding on-disk --compression 8x --spaces l2 --queries 100
+.venv\Scripts\python tools\extract_opensearch.py --out fixtures\opensearch-3.9.0-binary\on-disk-half-float --encoding on-disk-half-float --spaces l2
 docker compose -f tools\docker-compose.yml down -v
 ```
 

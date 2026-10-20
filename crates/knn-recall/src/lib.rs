@@ -126,7 +126,7 @@ pub enum Error {
     /// Lucene's files for the field: [`on_disk::OnDiskField`] searches it
     /// over them, as k-NN does.
     #[error(
-        "the file holds the graph only, no vectors for Faiss's search: k-NN keeps the field's vectors in Lucene's .veq and .vec files, which on_disk::OnDiskField searches"
+        "the file holds the graph only, no vectors for Faiss's search: k-NN keeps the field's vectors in Lucene's .veq and .vec files, over which recall searches it as k-NN does"
     )]
     NoVectors,
     /// Two nodes carry the same label, so a result cannot be resolved.
@@ -204,9 +204,48 @@ pub enum Error {
         /// As given.
         factor: f32,
     },
-    /// A cosine query of norm 0, which k-NN cannot normalize.
-    #[error("a cosine query of norm 0 cannot be normalized")]
+    /// A cosine query of norm 0, which k-NN cannot normalize, or one whose
+    /// norm float32 cannot hold, which normalizing turns into one of norm 0.
+    #[error("a cosine query of norm 0, or one too large for float32, cannot be normalized")]
     ZeroNormQuery,
+    /// A cosine field's float32 vector that is not of unit length, which
+    /// k-NN's normalized vectors are.
+    #[error(
+        "the field's vector {node} has a squared norm of {squared_norm}, where k-NN keeps a cosine field's vectors of unit length"
+    )]
+    NotNormalized {
+        /// The vector's node.
+        node: usize,
+        /// Its squared norm, summed in f64.
+        squared_norm: f64,
+    },
+    /// A float32 vector of the field holds a value that is not finite,
+    /// which k-NN refuses to index.
+    #[error("the field's vector {node} holds a value that is not finite at component {component}")]
+    NotFinite {
+        /// The vector's node.
+        node: usize,
+        /// The component.
+        component: usize,
+    },
+    /// A query of a run that failed, and why: its row, counting
+    /// from 0, shown counting from 1, as lines of `--results` are.
+    #[error("query {} (counting from 1): {cause}", .row + 1)]
+    AtQuery {
+        /// The query's row, from 0.
+        row: usize,
+        /// Why it failed.
+        cause: Box<Error>,
+    },
+    /// The ID map of a graph without its vectors holds another number of
+    /// labels than the graph has nodes.
+    #[error("the native file's ID map holds {labels} labels for the graph's {nodes} nodes")]
+    LabelCount {
+        /// The graph's nodes.
+        nodes: usize,
+        /// The ID map's labels.
+        labels: usize,
+    },
     /// A search reached a node whose stored vector could not be scored.
     #[error("node {node} has no stored vector to score")]
     Unscored {

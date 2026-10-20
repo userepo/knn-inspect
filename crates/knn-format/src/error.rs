@@ -136,6 +136,14 @@ pub enum Error {
         offset: usize,
     },
 
+    /// A Lucene file does not end with a codec footer, which Lucene's
+    /// reader requires after the last record.
+    #[error("no codec footer at offset {offset}, where the file must end with one")]
+    MissingFooter {
+        /// The file's length.
+        offset: usize,
+    },
+
     /// Two field infos share a name or a number, or both carry the
     /// soft-deletes or the parent field flag, which Lucene's `FieldInfos`
     /// refuses.
@@ -166,6 +174,7 @@ impl Error {
             | Self::UnknownChecksumAlgorithm { offset, .. }
             | Self::InvalidChecksum { offset, .. }
             | Self::InvalidString { offset }
+            | Self::MissingFooter { offset }
             | Self::DuplicateField { offset, .. } => Some(*offset),
             Self::Io(_) | Self::ChecksumMismatch { .. } => None,
         }

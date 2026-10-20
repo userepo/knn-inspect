@@ -134,6 +134,17 @@ const CASES: &[Case] = &[
         dimension: "16",
         sq_bits: Some(4),
     },
+    // k-NN's own quantized format for a half_float field, a subclass of
+    // the float one under its own name.
+    Case {
+        set: "opensearch-3.9.0-binary/on-disk-half-float",
+        spaces: &["l2"],
+        data_type: "half_float",
+        format: "Faiss1040HalfFloatScalarQuantizedKnnVectorsFormat",
+        encoding: VectorEncoding::Float32,
+        dimension: "16",
+        sq_bits: Some(1),
+    },
 ];
 
 /// Lucene's `VectorSimilarityFunction` ordinal k-NN records for a space:
@@ -207,8 +218,8 @@ fn real_fixtures_describe_the_same_seven_fields() {
         }
     }
     assert_eq!(
-        seen, 21,
-        "three float, six fp16, three bf16, two byte, one binary, one binary-encoder, five on-disk"
+        seen, 22,
+        "three float, six fp16, three bf16, two byte, one binary, one binary-encoder, six on-disk"
     );
 }
 
@@ -544,6 +555,21 @@ fn values_lucene_refuses_are_errors() {
             ..spec("a", 0)
         }],
     );
+    // Point counts and bytes, which checkConsistency refuses when
+    // negative.
+    for (points, what) in [
+        ((1 << 31, 1, 4), "point data dimension count"),
+        ((1, 1 << 31, 4), "point index dimension count"),
+        ((1, 1, 1 << 31), "point bytes per dimension"),
+    ] {
+        invalid(
+            what,
+            &[Spec {
+                points,
+                ..spec("a", 0)
+            }],
+        );
+    }
 }
 
 #[test]
@@ -604,7 +630,7 @@ fn files_lucene_refuses_are_errors() {
         }
     }
 
-    // Bytes where the footer should be.
+    // Bytes where the footer should be, and no footer at all.
     let mut file = fnm(2, &[spec("a", 0)]);
     let end = file.len() - 16;
     file.insert(end, 0);
@@ -612,6 +638,22 @@ fn files_lucene_refuses_are_errors() {
         FieldInfos::parse(&file).unwrap_err(),
         Error::TrailingBytes { count: 1, .. }
     ));
+    let file = fnm(2, &[spec("a", 0)]);
+    let end = file.len() - 16;
+    assert!(matches!(
+        FieldInfos::parse(&file[..end]).unwrap_err(),
+        Error::MissingFooter { offset } if offset == end
+    ));
+
+    // A field number of i32::MAX, one past which FieldInfos' table by
+    // number overflows.
+    match err(&[spec("a", 0), spec("b", 0x7FFF_FFFF)]) {
+        Error::InvalidValue { what, value, .. } => {
+            assert_eq!(what, "field number");
+            assert_eq!(value, 0x7FFF_FFFF);
+        }
+        other => panic!("{other}"),
+    }
 
     // A count the records do not live up to.
     let mut file = fnm(2, &[spec("a", 0)]);
@@ -678,6 +720,92 @@ fn the_first_fault_is_the_one_lucene_names() {
 }
 
 #[test]
+fn a_record_is_checked_once_read_and_the_file_once_every_record_is() {
+    fn err(file: &[u8]) -> Error {
+        FieldInfos::parse(file).unwrap_err()
+    }
+    // A field that is both the soft-deletes and the parent field, or one
+    // whose vector dimension is negative, is refused once its record is
+    // read: a later byte of the record Lucene refuses comes first, and so
+    // does a record cut short.
+    let both = Spec {
+        flags: 0x18,
+        index_options: 6,
+        ..spec("a", 0)
+    };
+    match err(&fnm(2, &[both])) {
+        Error::InvalidValue { what, .. } => assert_eq!(what, "index options"),
+        other => panic!("{other}"),
+    }
+    let negative = Spec {
+        dimension: 1 << 31,
+        encoding: 2,
+        ..spec("a", 0)
+    };
+    match err(&fnm(2, &[negative])) {
+        Error::InvalidValue { what, .. } => assert_eq!(what, "vector encoding"),
+        other => panic!("{other}"),
+    }
+    let file = fnm(
+        2,
+        &[Spec {
+            flags: 0x18,
+            ..spec("a", 0)
+        }],
+    );
+    let header_end = Envelope::parse(&file).unwrap().header.unwrap().length;
+    // The field count, the name, the number, and the flags.
+    let flags_end = header_end + 1 + 2 + 1 + 1;
+    assert!(matches!(
+        err(&file[..flags_end]),
+        Error::UnexpectedEof { .. }
+    ));
+    // Point counts before the vector dimension, and that before the flags,
+    // in checkConsistency's order.
+    match err(&fnm(
+        2,
+        &[Spec {
+            flags: 0x18,
+            points: (1, 1 << 31, 4),
+            dimension: 1 << 31,
+            ..spec("a", 0)
+        }],
+    )) {
+        Error::InvalidValue { what, .. } => assert_eq!(what, "point index dimension count"),
+        other => panic!("{other}"),
+    }
+    match err(&fnm(
+        2,
+        &[Spec {
+            flags: 0x18,
+            dimension: 1 << 31,
+            ..spec("a", 0)
+        }],
+    )) {
+        Error::InvalidValue { what, .. } => assert_eq!(what, "vector dimension"),
+        other => panic!("{other}"),
+    }
+    // A missing footer before a repeated name, and a field number of
+    // i32::MAX after one but before a repeated number.
+    let file = fnm(2, &[spec("a", 0), spec("a", 1)]);
+    assert!(matches!(
+        err(&file[..file.len() - 16]),
+        Error::MissingFooter { .. }
+    ));
+    match err(&fnm(2, &[spec("a", 0x7FFF_FFFF), spec("a", 1)])) {
+        Error::DuplicateField { what, .. } => assert_eq!(what, "name"),
+        other => panic!("{other}"),
+    }
+    match err(&fnm(
+        2,
+        &[spec("a", 0), spec("b", 0), spec("c", 0x7FFF_FFFF)],
+    )) {
+        Error::InvalidValue { what, .. } => assert_eq!(what, "field number"),
+        other => panic!("{other}"),
+    }
+}
+
+#[test]
 fn what_lucene_reads_leniently_is_read_alike() {
     // A name that is not UTF-8 decodes as Java's String does: here,
     // where neither byte can start a sequence, each to U+FFFD.
@@ -706,9 +834,13 @@ fn what_lucene_reads_leniently_is_read_alike() {
 #[test]
 fn malformed_files_are_errors_not_panics() {
     let real = fs::read(fixtures().join("opensearch-3.9.0-binary/on-disk/l2/_2.fnm")).unwrap();
+    // Every cut is an error: one inside a record runs out, one inside the
+    // footer leaves bytes after the last record, and one at the footer
+    // leaves the file without the footer Lucene requires.
     for cut in 0..real.len() {
-        let _ = FieldInfos::parse(&real[..cut]);
+        assert!(FieldInfos::parse(&real[..cut]).is_err(), "cut at {cut}");
     }
+    assert!(FieldInfos::parse(&real).is_ok());
     for i in 0..real.len() {
         let mut flipped = real.clone();
         flipped[i] ^= 0xFF;
