@@ -1,6 +1,7 @@
 //! Any byte string must parse to `Ok` or `Err`, never panic, as a
 //! native file, a segment info file, a field infos file, a flat-vectors
-//! metadata file, and a scalar-quantized vectors metadata or data file,
+//! metadata file and the rows of a `.vec`, and a scalar-quantized vectors
+//! metadata or data file,
 //! and every check, the graph statistics, and an HNSW search must run
 //! over whatever parsed (a graph without its vectors must refuse the
 //! search), as must the search k-NN runs with Lucene's searcher over any
@@ -30,6 +31,48 @@ fuzz_target!(|data: &[u8]| {
         let _ = meta.format.codec();
         for field in &meta.fields {
             let _ = field.vector_bytes();
+            // Where it puts its vectors, in the same bytes.
+            if let Some(rows) = field.vector_rows(data) {
+                let _ = rows.row(0).map(Iterator::count);
+            }
+        }
+    }
+    // As a .vec: its rows from the second byte on, of the dimension the
+    // first byte says, 0 included, for every component size, as many as
+    // fit: as float32 and fp16 rows, which only 4 and 2 bytes give, and
+    // as float32 components.
+    if let [dimension, ..] = data {
+        use knn_format::flat_vectors::{FlatField, VectorEncoding};
+        let dimension = u32::from(*dimension);
+        for component_bytes in 1..=4_u32 {
+            let per = u64::from(dimension) * u64::from(component_bytes);
+            let room = data.len().saturating_sub(1) as u64;
+            let count = u32::try_from(room.checked_div(per).unwrap_or(0)).unwrap_or(u32::MAX);
+            let field = FlatField {
+                field_number: 0,
+                encoding: VectorEncoding::Float32,
+                similarity: None,
+                data_offset: 1,
+                data_length: per * u64::from(count),
+                dimension,
+                count,
+                component_bytes,
+                sparse: false,
+            };
+            if let Some(rows) = field.vector_rows(data) {
+                assert_eq!(rows.len(), count as usize);
+                for i in 0..rows.len().min(64) {
+                    let row = rows.row(i).expect("a row that fits");
+                    assert_eq!(row.len(), dimension as usize);
+                    row.for_each(|x| {
+                        std::hint::black_box(x);
+                    });
+                }
+            }
+            let _ = field
+                .float32_rows(data)
+                .map(|rows| rows.row(0).map(Iterator::count));
+            let _ = field.float32_components(data).map(<[_]>::len);
         }
     }
     if let Ok(meta) = knn_format::quantized_vectors::QuantizedVectorsMeta::parse(data) {

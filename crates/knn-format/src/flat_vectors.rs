@@ -134,6 +134,24 @@ impl FlatField {
     }
 
     /// The field's vectors in `vec`, the `.vec` this record describes, as
+    /// float32 rows, whether stored as float32 or, by k-NN's half-float
+    /// format, as fp16: `None` unless the field holds float32 vectors of
+    /// four or two bytes a component, all of them inside the file.
+    #[must_use]
+    pub fn vector_rows<'a>(&self, vec: &'a [u8]) -> Option<VectorRows<'a>> {
+        if self.encoding != VectorEncoding::Float32 || !matches!(self.component_bytes, 2 | 4) {
+            return None;
+        }
+        let start = usize::try_from(self.data_offset).ok()?;
+        let length = usize::try_from(self.vector_bytes()?).ok()?;
+        Some(VectorRows {
+            data: vec.get(start..start.checked_add(length)?)?,
+            component_bytes: usize::try_from(self.component_bytes).ok()?,
+            dimension: usize::try_from(self.dimension).ok()?,
+        })
+    }
+
+    /// The field's vectors in `vec`, the `.vec` this record describes, as
     /// float32 rows: `None` unless the field holds float32 components, four
     /// bytes each, all of them inside the file.
     #[must_use]
@@ -148,6 +166,65 @@ impl FlatField {
             words: data.as_chunks::<4>().0,
             dimension: usize::try_from(self.dimension).ok()?,
         })
+    }
+}
+
+/// A float32 field's vectors in a `.vec`, as float32 rows, row i the
+/// vector of ordinal i: four bytes a component in Lucene's format, or two,
+/// fp16, in k-NN's half-float format, decoded exactly.
+#[derive(Debug, Clone, Copy)]
+pub struct VectorRows<'a> {
+    data: &'a [u8],
+    component_bytes: usize,
+    dimension: usize,
+}
+
+impl VectorRows<'_> {
+    /// Rows held in full; none for a dimension of 0.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.data
+            .len()
+            .checked_div(self.component_bytes.saturating_mul(self.dimension))
+            .unwrap_or(0)
+    }
+
+    /// Whether no row is held.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Components per row.
+    #[must_use]
+    pub fn dimension(&self) -> usize {
+        self.dimension
+    }
+
+    /// Bytes per component: 4 for float32, 2 for fp16.
+    #[must_use]
+    pub fn component_bytes(&self) -> usize {
+        self.component_bytes
+    }
+
+    /// Row `i`'s components as float32, or `None` past the last row.
+    #[must_use]
+    pub fn row(&self, i: usize) -> Option<impl ExactSizeIterator<Item = f32> + '_> {
+        if i >= self.len() {
+            return None;
+        }
+        let size = self.component_bytes.checked_mul(self.dimension)?;
+        let start = i.checked_mul(size)?;
+        let bytes = self.data.get(start..start.checked_add(size)?)?;
+        Some(
+            bytes
+                .chunks_exact(self.component_bytes)
+                .map(|component| match *component {
+                    [b0, b1, b2, b3] => f32::from_le_bytes([b0, b1, b2, b3]),
+                    [low, high] => crate::faiss::f16_to_f32(u16::from_le_bytes([low, high])),
+                    _ => f32::NAN,
+                }),
+        )
     }
 }
 

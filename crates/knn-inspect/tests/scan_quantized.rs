@@ -223,8 +223,9 @@ fn every_on_disk_fixture_matches_its_quantized_vectors() {
 fn a_half_float_on_disk_field_is_tied_by_its_own_format() {
     // k-NN writes a half_float on_disk field in its own quantized format,
     // a subclass of the float one under its own name: the .fnm names it,
-    // and its files carry that name. Its .vec holds fp16 components, so
-    // the corrections are not compared with it.
+    // and its files carry that name. Its .vec holds fp16 components, from
+    // which Lucene quantized the records: the corrections recompute from
+    // them.
     let dir = fixtures().join("on-disk-half-float/l2");
     let (code, f) = scan(&dir, &[]);
     assert_eq!(code, Some(0), "{f}");
@@ -251,9 +252,41 @@ fn a_half_float_on_disk_field_is_tied_by_its_own_format() {
         "{q}"
     );
     assert!(
-        detail(q).ends_with(
-            "component sums agreeing; not compared with the .vec: the .vec's field holds 2-byte components, not float32"
-        ),
+        detail(q)
+            .contains("component sums agreeing; corrections agree with the 500 fp16 vectors of"),
+        "{q}"
+    );
+}
+
+#[test]
+fn a_half_float_fields_fp16_vec_is_compared() {
+    // The fp16 .vec holds its vectors from offset 128, two bytes a
+    // component: doubling vector 3's first component, which its record's
+    // correction no longer matches, warns; a NaN (0x7E00) is damage.
+    let vec = "_2_Faiss1040HalfFloatScalarQuantizedKnnVectorsFormat_0.vec";
+    let at = 128 + 3 * 32;
+    let s = Scratch::of("half-float-spoiled", "on-disk-half-float/l2");
+    s.edit(vec, |b| {
+        let h = u16::from_le_bytes([b[at], b[at + 1]]);
+        // The exponent up by one: twice the value, for a normal one.
+        b[at..at + 2].copy_from_slice(&(h + 0x0400).to_le_bytes());
+    });
+    let (code, f) = scan(&s.0, &[]);
+    let q = &f["lucene_quantized"];
+    assert_eq!(code, Some(2), "{q}");
+    assert_eq!(q["status"], "warning", "{q}");
+    assert!(detail(q).contains("first: record 3 stores"), "{q}");
+
+    let s = Scratch::of("half-float-nan", "on-disk-half-float/l2");
+    s.edit(vec, |b| {
+        b[at..at + 2].copy_from_slice(&0x7E00_u16.to_le_bytes());
+    });
+    let (code, f) = scan(&s.0, &[]);
+    let q = &f["lucene_quantized"];
+    assert_eq!(code, Some(1), "{q}");
+    assert_eq!(q["status"], "damaged", "{q}");
+    assert!(
+        detail(q).contains("holds a value that is not finite: vector 3, component 0"),
         "{q}"
     );
 }

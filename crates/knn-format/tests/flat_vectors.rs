@@ -590,3 +590,65 @@ fn float32_rows_read_the_vectors_where_the_record_puts_them() {
     };
     assert!(past.float32_rows(&vec).is_none());
 }
+
+#[test]
+fn vector_rows_read_float32_and_fp16_alike() {
+    // Float32: the same rows float32_rows reads.
+    let dir = fixtures().join("opensearch-3.9.0/nocfs/l2");
+    let meta = FlatVectorsMeta::parse(&fs::read(dir.join(LUCENE_VEMF)).unwrap()).unwrap();
+    let field = meta.fields[0];
+    let vec = fs::read(dir.join(LUCENE_VEMF).with_extension("vec")).unwrap();
+    let (rows, float32) = (
+        field.vector_rows(&vec).unwrap(),
+        field.float32_rows(&vec).unwrap(),
+    );
+    assert_eq!((rows.len(), rows.component_bytes()), (500, 4));
+    for i in [0, 250, 499] {
+        let a: Vec<f32> = rows.row(i).unwrap().collect();
+        let b: Vec<f32> = float32.row(i).unwrap().collect();
+        assert_eq!(a, b, "row {i}");
+    }
+
+    // fp16, in k-NN's half-float format: each two bytes decoded exactly.
+    let dir = fixtures().join("opensearch-3.9.0-binary/on-disk-half-float/l2");
+    let meta =
+        FlatVectorsMeta::parse(&fs::read(dir.join(ON_DISK_HALF_FLOAT_VEMF)).unwrap()).unwrap();
+    let field = meta.fields[0];
+    let vec = fs::read(dir.join(ON_DISK_HALF_FLOAT_VEMF).with_extension("vec")).unwrap();
+    assert!(field.float32_rows(&vec).is_none(), "two bytes a component");
+    let rows = field.vector_rows(&vec).unwrap();
+    assert_eq!(
+        (rows.len(), rows.dimension(), rows.component_bytes()),
+        (500, 16, 2)
+    );
+    let start = usize::try_from(field.data_offset).unwrap();
+    for i in [0, 499] {
+        let row: Vec<f32> = rows.row(i).unwrap().collect();
+        let want: Vec<f32> = vec[start + i * 32..start + (i + 1) * 32]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|h| knn_format::faiss::CodeFormat::Fp16.decode(h).unwrap())
+            .collect();
+        assert_eq!(row, want, "row {i}");
+        // Within fp16's rounding of the vectors as indexed.
+        let indexed = fs::read(dir.join("vectors.f32")).unwrap();
+        for (j, x) in row.iter().enumerate() {
+            let at = (i * 16 + j) * 4;
+            let y = f32::from_le_bytes(indexed[at..at + 4].try_into().unwrap());
+            assert!(
+                (x - y).abs() <= y.abs() * 1e-3 + 1e-4,
+                "row {i}: {x} vs {y}"
+            );
+        }
+    }
+    assert!(rows.row(500).is_none());
+    // Not all inside the file: no rows.
+    assert!(field.vector_rows(&vec[..vec.len() / 2]).is_none());
+    let byte_field = FlatField {
+        encoding: VectorEncoding::Byte,
+        component_bytes: 1,
+        ..field
+    };
+    assert!(byte_field.vector_rows(&vec).is_none());
+}

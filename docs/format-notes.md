@@ -877,10 +877,10 @@ fixture of one (`on-disk-half-float/l2`) shows the records quantized
 from the fp16 values: every record's additional correction recomputes
 bit for bit from the `.vec`'s fp16 components, decoded, and the centroid
 is their mean. `scan` checks such a field as any other (since 0.10.0
-through the `.fnm`, by shape before), but does not yet compare its
-corrections with the `.vec`; `recall` does not search it, since k-NN
-rescores its fp16 vectors with native kernels
-(`KNN1040HalfFloatVectorScorer`).
+through the `.fnm`, by shape before), its corrections against the
+`.vec`'s fp16 values, decoded (`knn_format::flat_vectors::VectorRows`,
+since 0.10.1); `recall` does not search it, since k-NN rescores its fp16
+vectors with native kernels (`KNN1040HalfFloatVectorScorer`).
 
 After the big-endian index header (109 bytes in the fixtures: the codec
 name and the segment suffix `Faiss1040ScalarQuantizedKnnVectorsFormat_0`

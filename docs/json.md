@@ -258,16 +258,18 @@ than a relative 1e-4, far beyond float rounding.
   is not sound, or names another segment, a `.vemf` whose field length
   or offset Lucene's reader would refuse, or a `.vec` that holds a value
   that is not finite, is `damaged`, since Lucene opens them with the
-  quantized files. When the `.vemf` is sound but in a format this tool
-  does not read, or the field's components are not float32, the
-  comparison with the `.vec` is left out and `detail` says why. Tied by
-  the `.fnm`, the check is skipped when the field's `.vemq` is sound, of
-  the segment and suffix its name and the `.fnm` give, but in a format
-  this tool does not read. Matched by shape, it is skipped when the
-  segment's files cannot be listed; when no `.vemq` of the segment lies
-  beside the native file, as in a compound segment, whose `.fnm` is
-  inside the `.cfs` too; when no sound `.vemq` holds a field the graph
-  can have been built over and one is in a format this tool does not
-  read; and when every field of the graph's shape that fits records no
-  vectors. It is skipped for a file that holds its own vectors, which
-  the text report then leaves out.
+  quantized files. A `half_float` field's `.vec` holds fp16 components,
+  which are decoded and compared as float32 ones are (since 0.10.1).
+  When the `.vemf` is sound but in a format this tool does not read, or
+  the field's components are neither float32 nor fp16, the comparison
+  with the `.vec` is left out and `detail` says why. Tied by the `.fnm`,
+  the check is skipped when the field's `.vemq` is sound, of the segment
+  and suffix its name and the `.fnm` give, but in a format this tool
+  does not read. Matched by shape, it is skipped when the segment's
+  files cannot be listed; when no `.vemq` of the segment lies beside the
+  native file, as in a compound segment, whose `.fnm` is inside the
+  `.cfs` too; when no sound `.vemq` holds a field the graph can have
+  been built over and one is in a format this tool does not read; and
+  when every field of the graph's shape that fits records no vectors. It
+  is skipped for a file that holds its own vectors, which the text
+  report then leaves out.

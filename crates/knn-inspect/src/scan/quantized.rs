@@ -14,7 +14,7 @@ use knn_format::NativeFile;
 use knn_format::envelope::{Envelope, Header, SEGMENT_ID_LEN};
 use knn_format::faiss::{IdMapIndex, Metric};
 use knn_format::field_infos::{FieldInfo, FieldInfos};
-use knn_format::flat_vectors::{FlatField, FlatVectorsMeta, Float32Rows, VectorEncoding};
+use knn_format::flat_vectors::{FlatField, FlatVectorsMeta, VectorEncoding, VectorRows};
 use knn_format::quantized_vectors::{
     DataFile, QuantizedField, QuantizedVectors, QuantizedVectorsMeta, ScalarEncoding,
 };
@@ -1167,8 +1167,13 @@ fn against_vec(
         None => (
             CrossCheck::Match,
             format!(
-                "corrections agree with the {} vectors of {}",
+                "corrections agree with the {} {}vectors of {}",
                 rows.len(),
+                if rows.component_bytes() == 2 {
+                    "fp16 "
+                } else {
+                    ""
+                },
                 shown(&vec)
             ),
         ),
@@ -1292,13 +1297,13 @@ fn raw_field<'a>(
     Ok(raw)
 }
 
-/// The raw field's float32 rows in `vec`. A field of other components
-/// leaves the comparison out; a length or offset Lucene's reader refuses
-/// is damage.
-fn raw_rows<'a>(raw: &FlatField, vec: &'a [u8]) -> Result<Float32Rows<'a>, Early> {
-    // The encoding is float32, as the quantized field's is; k-NN's
-    // half-float format stores it in two bytes.
-    if raw.component_bytes != 4 {
+/// The raw field's rows in `vec`, as float32: four bytes a component, or
+/// two, fp16, in k-NN's half-float format, whose records Lucene quantized
+/// from those fp16 values. A field of other components leaves the
+/// comparison out; a length or offset Lucene's reader refuses is damage.
+fn raw_rows<'a>(raw: &FlatField, vec: &'a [u8]) -> Result<VectorRows<'a>, Early> {
+    // The encoding is float32, as the quantized field's is.
+    if !matches!(raw.component_bytes, 2 | 4) {
         return Err(not_compared(&format!(
             "the .vec's field holds {}-byte components, not float32",
             raw.component_bytes
@@ -1318,7 +1323,7 @@ fn raw_rows<'a>(raw: &FlatField, vec: &'a [u8]) -> Result<Float32Rows<'a>, Early
             ),
         ));
     }
-    raw.float32_rows(vec).ok_or_else(|| {
+    raw.vector_rows(vec).ok_or_else(|| {
         (
             CrossCheck::Damaged,
             format!(
@@ -1376,7 +1381,7 @@ fn dot_product_doubt(field: &QuantizedField) -> Option<String> {
 fn corrections_doubt(
     field: &QuantizedField,
     records: &QuantizedVectors<'_>,
-    rows: &Float32Rows<'_>,
+    rows: &VectorRows<'_>,
 ) -> Option<String> {
     let euclidean = field.similarity == 0;
     let mut off = 0_usize;
