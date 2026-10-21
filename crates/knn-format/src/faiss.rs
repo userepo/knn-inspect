@@ -894,8 +894,8 @@ pub struct HnswIndex<'a> {
     /// k-NN's local build writes such a graph under `IBHf` for an
     /// `on_disk` field, or a float field whose `sq` encoder keeps 1, 2, or
     /// 4 bits, keeping the quantized vectors in Lucene's files. (Its remote
-    /// build writes `null` under a CAGRA graph, `IHc2`, a layout this
-    /// crate refuses.)
+    /// build writes `null` under a CAGRA graph, `IHc2`, for the latter, a
+    /// layout this crate refuses.)
     pub storage: Option<Storage<'a>>,
 }
 

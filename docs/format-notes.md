@@ -594,13 +594,18 @@ copy with zero-filled `IBxF` storage in place of the `null` and plain
 binary headers, which leaves the graph's bytes as they are; `stats`
 matches the statistics it computes.
 
-k-NN's remote index build, which hands the graph to a GPU builder,
-writes a float CAGRA graph instead and leaves its storage out the same
-way, `IxMp` > `IHc2` (or the older `IHNc`, as the builder's Faiss writes
-it) > `null` (`RemoteIndexBuildStrategy.shouldSkipStoredVectors`, and
-`FaissFlatIndexFactory.maybeSetFlatBinaryIndex` wiring the flat vectors
-back in at load). Faiss at `5616caa` writes `IHc2` for a CAGRA graph and
-still reads the older `IHNc`; `knn-inspect` refuses both at the fourcc.
+k-NN's remote index build, which hands the vectors to a GPU builder,
+writes a CAGRA graph in place of the HNSW one, whatever the data type:
+`IHc2` over the storage the local build writes (`IxF2` or `IxFI`, and
+`IxSQ` for fp16 and byte vectors), or `IBHc` over `IBxF` for a binary
+field. It leaves the storage out only for a float field whose `sq`
+encoder keeps 1, 2, or 4 bits, `IxMp` > `IHc2` > `null`
+(`RemoteIndexBuildStrategy.shouldSkipStoredVectors` returns
+`isFaissSQMultiBit()`, and `FaissFlatIndexFactory.maybeSetFlatBinaryIndex`
+wires the quantized vectors back in at load). The builder's Faiss
+(1.14.3) writes `IHc2`, as Faiss at `5616caa` does; `5616caa` also
+reads the older `IHNc`, which only k-NN's own test files hold.
+`knn-inspect` refuses all three at the fourcc.
 
 ### Synthetic binary fixtures
 

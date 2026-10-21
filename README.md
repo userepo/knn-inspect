@@ -334,8 +334,8 @@ its vectors needs the segment's `.fnm` and the field's `.vemq`, `.veq`,
 notes target OpenSearch 3.9.0.
 
 Not yet: other scalar-quantized storage, product quantization, IVF, and
-the float graph without its vectors (a CAGRA graph, `IHc2` or the older
-`IHNc`, over `null`) that k-NN's remote index build writes. Files in
+the CAGRA graphs (`IHc2`, or `IBHc` for a binary field) that k-NN's
+remote index build writes. Files in
 another layout or scalar quantizer type are refused rather than misread:
 `verify` fails them, and `scan` reports those whose footer verifies as
 `unsupported`. NMSLIB and Lucene-engine fields write no `.faiss` file,
