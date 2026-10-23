@@ -50,6 +50,22 @@ pub enum Error {
         qtype: i32,
     },
 
+    /// A scalar quantizer type this crate decodes, under a graph k-NN never
+    /// writes it under: `QT_bf16` under a CAGRA graph, which k-NN's remote
+    /// index build writes over fp16 or byte storage only.
+    #[error(
+        "scalar quantizer type {qtype} ({}) at offset {offset} under {graph}, which k-NN's remote index build writes over fp16 (4) or byte (8) storage only",
+        crate::faiss::quantizer_type_name(*.qtype).unwrap_or("not a Faiss type")
+    )]
+    UnexpectedQuantizer {
+        /// Where the type sits.
+        offset: usize,
+        /// The type read.
+        qtype: i32,
+        /// The graph's fourcc.
+        graph: crate::faiss::FourCc,
+    },
+
     /// A count in the file is beyond what Faiss itself accepts (2^40) or
     /// what this process can address.
     #[error("{what} count {count} at offset {offset} is too large")]
@@ -167,6 +183,7 @@ impl Error {
             Self::UnexpectedEof { offset, .. }
             | Self::UnsupportedLayout { offset, .. }
             | Self::UnsupportedQuantizer { offset, .. }
+            | Self::UnexpectedQuantizer { offset, .. }
             | Self::CountTooLarge { offset, .. }
             | Self::InvalidValue { offset, .. }
             | Self::TrailingBytes { offset, .. }

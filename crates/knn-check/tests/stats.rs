@@ -13,7 +13,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use knn_check::graph_stats;
+use knn_check::{base_level_stats, graph_stats, index_stats};
 use knn_format::faiss::HnswGraph;
 use knn_format::{F64, I32, U64};
 
@@ -23,7 +23,7 @@ fn fixtures() -> PathBuf {
 
 /// Every baseline: `<name>.stats.json` beside each synthetic fixture,
 /// `stats.json` beside each real one, float, fp16, bf16, byte, binary,
-/// and a graph without its vectors.
+/// CAGRA, and a graph without its vectors.
 fn baselines() -> Vec<PathBuf> {
     let mut out = Vec::new();
     for synthetic in [
@@ -32,6 +32,7 @@ fn baselines() -> Vec<PathBuf> {
         "synthetic-bf16",
         "synthetic-byte",
         "synthetic-binary",
+        "synthetic-cagra",
     ] {
         for entry in fs::read_dir(fixtures().join(synthetic)).unwrap() {
             let p = entry.unwrap().path();
@@ -79,8 +80,8 @@ fn stats_match_faiss_python() {
 
         let bytes = fs::read(&file).unwrap();
         let parsed = knn_format::parse(&bytes).unwrap();
-        let graph = &parsed.index.index.graph;
-        let stats = graph_stats(graph);
+        let index = &parsed.index.index;
+        let stats = index_stats(index);
         assert_eq!(
             serde_json::to_value(&stats).unwrap(),
             expected,
@@ -89,18 +90,141 @@ fn stats_match_faiss_python() {
         );
 
         // Deterministic, and the level sizes agree with `info`.
-        assert_eq!(graph_stats(graph), stats, "{}", file.display());
+        assert_eq!(index_stats(index), stats, "{}", file.display());
         let sizes: Vec<usize> = stats.layers.iter().map(|l| l.nodes).collect();
-        assert_eq!(sizes, graph.level_counts(), "{}", file.display());
+        assert_eq!(sizes, index.level_counts(), "{}", file.display());
 
         unreachable_seen += stats.layers.iter().map(|l| l.unreachable).sum::<usize>();
         seen += 1;
     }
-    assert_eq!(seen, 45, "18 synthetic and 27 real baselines");
+    assert_eq!(seen, 50, "23 synthetic and 27 real baselines");
     // l2-4000x64 has unreachable nodes on levels 0 and 1, and the build of
     // on-disk-16x/l2 one on level 1, so the search itself is compared, not
-    // only the empty case.
+    // only the empty case. Every node of the CAGRA fixtures is listed by
+    // some other node.
     assert_eq!(unreachable_seen, 9);
+}
+
+#[test]
+fn a_cagra_graph_has_one_level_and_no_fixed_entry() {
+    // The baselines above hold the numbers; this spells out the shape: a
+    // CAGRA graph of its base level is one layer, level 0, however many
+    // random levels its nodes keep, and every one of its nodes is listed
+    // by another, so none is unreached.
+    for name in [
+        "ip-100x64-cagra",
+        "l2-1000x64-cagra",
+        "hamming-100x64-binary-cagra",
+    ] {
+        let bytes = fs::read(fixtures().join(format!("synthetic-cagra/{name}.faiss"))).unwrap();
+        let parsed = knn_format::parse(&bytes).unwrap();
+        let graph = &parsed.index.index.graph;
+        let stats = index_stats(&parsed.index.index);
+        assert_eq!(stats, base_level_stats(graph), "{name}: the flag decides");
+        assert_eq!(stats.entry_point, -1, "{name}");
+        assert_eq!(stats.max_level, -1, "{name}");
+        assert_eq!(stats.layers.len(), 1, "{name}");
+        let base = &stats.layers[0];
+        assert_eq!(base.nodes, stats.nodes, "{name}");
+        assert_eq!(base.slots, 32, "{name}: a graph of degree 2M");
+        assert_eq!(base.degree_max, Some(32), "{name}: level 0 lists are full");
+        assert!(base.degree_min >= Some(27), "{name}: or nearly so");
+        assert_eq!(base.unreachable, 0, "{name}");
+        assert!(
+            graph.levels.iter().any(|l| l.get() > 1),
+            "{name}: nodes keep random upper levels"
+        );
+        // Read as an HNSW graph, the same bytes reach nothing: the entry
+        // point is -1.
+        let as_hnsw = graph_stats(graph);
+        assert_eq!(as_hnsw.layers.len(), 1, "{name}");
+        assert_eq!(as_hnsw.layers[0].unreachable, stats.nodes, "{name}");
+    }
+}
+
+#[test]
+fn a_node_no_list_leads_to_is_unreached_from_random_entries() {
+    // A CAGRA fixture with node 5 cut out of every level-0 list: no search
+    // reaches it except one that draws it as an entry. Rust and Python
+    // agree on the clean fixtures only in the empty case, so this is the
+    // case `tools/graph_stats.py` was run on by hand when the rule was
+    // written (it reports [5] too).
+    let bytes = fs::read(fixtures().join("synthetic-cagra/ip-100x64-cagra.faiss")).unwrap();
+    let parsed = knn_format::parse(&bytes).unwrap();
+    let graph = &parsed.index.index.graph;
+    let start = knn_format::view_offset(&bytes, graph.neighbors).unwrap();
+    let mut cut = bytes.clone();
+    for (i, v) in graph.neighbors.iter().enumerate() {
+        if v.get() == 5 {
+            let at = start + i * 4;
+            cut[at..at + 4].copy_from_slice(&(-1_i32).to_le_bytes());
+        }
+    }
+    assert_ne!(cut, bytes, "node 5 was listed");
+    let parsed = knn_format::parse(&cut).unwrap();
+    let index = &parsed.index.index;
+    assert!(index.base_level_only());
+    let stats = index_stats(index);
+    assert_eq!(stats.layers.len(), 1);
+    assert_eq!(stats.layers[0].unreachable_nodes, vec![5]);
+    // Node 5 still lists its own 32 neighbors; the lists that named it
+    // end at the first -1 now, so a few are shorter.
+    assert_eq!(stats.layers[0].degree_max, Some(32));
+    assert!(stats.layers[0].edges < 3200);
+    // The flag off, the same bytes are an HNSW graph without an entry
+    // point, and nothing is reached.
+    let flag = parsed.index.index.kind.cagra().unwrap().offset + 1;
+    let mut off = cut.clone();
+    off[flag] = 0;
+    let parsed = knn_format::parse(&off).unwrap();
+    assert!(!parsed.index.index.base_level_only());
+    let stats = index_stats(&parsed.index.index);
+    assert_eq!(stats.layers.len(), 1);
+    assert_eq!(stats.layers[0].unreachable, 100);
+    // The level arrays are untouched by either splice.
+    let levels = |g: &HnswGraph<'_>| g.levels.iter().map(|l| l.get()).collect::<Vec<i32>>();
+    assert_eq!(levels(&parsed.index.index.graph), levels(graph));
+}
+
+#[test]
+fn base_level_stats_reach_a_node_when_some_node_lists_it() {
+    // Level 0 alone: node 0 lists 1, node 1 lists 2, node 2 lists
+    // nothing, and 3 is listed by nobody. A search starts from any node,
+    // so 0 and 3 are the ones no neighbor list leads to; the entry point
+    // and max_level, whatever they hold, are not read.
+    for (entry, max_level) in [(-1, -1), (0, -1), (-1, 0), (3, 0)] {
+        let mut b = Built::new(&[2], &[&[&[1]], &[&[2]], &[&[]], &[&[]]], entry);
+        b.max_level = max_level;
+        let stats = base_level_stats(&b.graph());
+        assert_eq!(stats.layers.len(), 1, "{entry} {max_level}");
+        assert_eq!(stats.layers[0].nodes, 4);
+        assert_eq!(stats.layers[0].unreachable_nodes, vec![0, 3]);
+        assert_eq!(stats.layers[0].degree_histogram, vec![2, 2]);
+        assert_eq!((stats.entry_point, stats.max_level), (entry, max_level));
+    }
+    // A node's own list leads nowhere new, and a neighbor that is not a
+    // node reaches nothing: node 0 lists itself and 9, node 1 nothing, so
+    // neither is reached.
+    let b = Built::new(&[2], &[&[&[0, 9]], &[&[]]], -1);
+    let stats = base_level_stats(&b.graph());
+    assert_eq!(stats.layers[0].unreachable_nodes, vec![0, 1]);
+    // Listed by another node, a node that also lists itself is reached.
+    let b = Built::new(&[2], &[&[&[0, 1]], &[&[0]]], -1);
+    let stats = base_level_stats(&b.graph());
+    assert_eq!(stats.layers[0].unreachable, 0);
+    // Upper levels are not reported, even where nodes have them.
+    let b = Built::new(&[2, 2], &[&[&[1], &[1]], &[&[0], &[0]]], 0);
+    assert_eq!(base_level_stats(&b.graph()).layers.len(), 1);
+    assert_eq!(graph_stats(&b.graph()).layers.len(), 2);
+    // No nodes, no levels.
+    let empty = Built::new(&[2], &[], -1);
+    assert_eq!(base_level_stats(&empty.graph()).layers.len(), 0);
+    // As an HNSW graph, the entry point decides: 0 reaches 1 and 2.
+    let mut b = Built::new(&[2], &[&[&[1]], &[&[2]], &[&[]], &[&[]]], 0);
+    b.max_level = -1;
+    let stats = graph_stats(&b.graph());
+    assert_eq!(stats.layers.len(), 1, "a graph of nodes has its level 0");
+    assert_eq!(stats.layers[0].unreachable_nodes, vec![3]);
 }
 
 /// A graph spelled out per node: one neighbor list per level the node is

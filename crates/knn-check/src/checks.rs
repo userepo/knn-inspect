@@ -4,7 +4,8 @@ use std::collections::BTreeMap;
 
 use knn_format::envelope::Envelope;
 use knn_format::faiss::{
-    CodeFormat, HeaderKind, HnswGraph, IdMapIndex, IndexHeader, Metric, SqStorage, Storage,
+    CagraFields, CodeFormat, HeaderKind, HnswGraph, IdMapIndex, IndexHeader, Metric, SqStorage,
+    Storage,
 };
 use knn_format::{Parsed, view_offset};
 
@@ -48,6 +49,9 @@ const CORRECTION_BYTES: i32 = 16;
 /// use. (A graph without its vectors records its build metric instead.)
 const BINARY_METRIC_TYPE: i32 = 1;
 
+/// Why a CAGRA graph's entry point and `max_level` are never read.
+const RANDOM_ENTRY: &str = "a search of this graph starts from random entry points on level 0 and never reads it; k-NN's remote build writes -1";
+
 /// Runs every check over `bytes`.
 #[must_use]
 pub fn verify(bytes: &[u8], options: &Options) -> Report {
@@ -79,15 +83,20 @@ pub fn verify(bytes: &[u8], options: &Options) -> Report {
     check_headers(&mut col, bytes, idx);
     check_metric(&mut col, idx, options.space);
     let graph = &idx.index.graph;
+    // A CAGRA graph of its base level only is searched from random entry
+    // points on level 0: its entry point, max_level, and upper levels are
+    // never read, so what k-NN's builder leaves in them warns when it is
+    // not what the builder writes, and never fails.
+    let base_only = idx.index.base_level_only();
     check_offsets(&mut col, bytes, graph);
     check_level_table(&mut col, bytes, graph);
-    check_levels(&mut col, bytes, graph, idx.header.ntotal);
-    check_entry_point(&mut col, graph);
+    check_levels(&mut col, bytes, graph, idx.header.ntotal, base_only);
+    check_entry_point(&mut col, graph, base_only);
     check_neighbor_ids(&mut col, bytes, graph);
     check_vector_count(&mut col, idx);
     check_id_map_length(&mut col, bytes, idx);
     check_vector_values(&mut col, bytes, idx);
-    check_neighbor_lists(&mut col, bytes, graph);
+    check_neighbor_lists(&mut col, bytes, graph, base_only);
     check_norms(&mut col, bytes, idx, options.space);
     col.finish()
 }
@@ -152,16 +161,19 @@ fn check_trailing(col: &mut Collector, parsed: &Parsed<'_>) {
 
 fn check_headers(col: &mut Collector, bytes: &[u8], idx: &IdMapIndex<'_>) {
     let storage = idx.index.storage.as_ref();
-    // How each header's metric type is used. A graph without its vectors
-    // records the distance it was built for, where binary storage computes
-    // hamming distance whatever its headers say.
+    // How each header's metric type is used. A binary graph without its
+    // vectors records the distance it was built for, where binary storage
+    // computes hamming distance whatever its headers say; a float one (a
+    // CAGRA graph of k-NN's remote build) has float headers, read as any
+    // float layout's are.
     let graph_only = storage.is_none();
+    let binary_graph_only = graph_only && matches!(idx.header.kind, HeaderKind::Binary { .. });
     let role = |h: &IndexHeader| match h.kind {
         HeaderKind::Float { .. } => MetricRole::Read,
         HeaderKind::Binary { .. } if graph_only => MetricRole::Read,
         HeaderKind::Binary { .. } => MetricRole::Hamming,
     };
-    let graph_role = if graph_only {
+    let graph_role = if binary_graph_only {
         MetricRole::Unread
     } else {
         role(&idx.index.header)
@@ -238,6 +250,50 @@ fn check_headers(col: &mut Collector, bytes: &[u8], idx: &IdMapIndex<'_>) {
         } else {
             check_binary_shape(col, first, code_size);
         }
+    }
+    if let Some(cagra) = idx.index.kind.cagra() {
+        check_cagra(col, cagra);
+    }
+}
+
+/// The fields a CAGRA graph stores after its header. A search draws
+/// `search_entry_points` nodes at random to start from and Faiss refuses
+/// to search with none ("Could not find a valid entrypoint"), so 0 or
+/// fewer fails. The two flags are what k-NN's remote build writes
+/// (`GpuIndexCagra::copyTo` sets both): a graph without `base_level_only`
+/// is searched as an HNSW graph, from its entry point, and one without
+/// `keep_max_size_level0` changes no search, so either warns. The numeric
+/// type describes nothing (k-NN discards it, and the Faiss it builds
+/// leaves it uninitialized), so it is not checked.
+fn check_cagra(col: &mut Collector, cagra: &CagraFields) {
+    // Two flags of a byte each, then the count.
+    let count_at = cagra.offset.checked_add(2);
+    if cagra.search_entry_points <= 0 {
+        col.fail(
+            Check::Headers,
+            format!(
+                "the graph draws {} random entry points per search; Faiss finds no entry point and refuses every search",
+                cagra.search_entry_points
+            ),
+            count_at,
+            None,
+        );
+    }
+    if !cagra.base_level_only {
+        col.warn(
+            Check::Headers,
+            "the graph's base_level_only flag is off, so Faiss searches it as an HNSW graph, from its entry point down its levels; k-NN's remote build sets it".to_owned(),
+            cagra.offset.checked_add(1),
+            None,
+        );
+    }
+    if !cagra.keep_max_size_level0 {
+        col.warn(
+            Check::Headers,
+            "the graph's keep_max_size_level0 flag is off, which changes no search; k-NN's remote build sets it".to_owned(),
+            Some(cagra.offset),
+            None,
+        );
     }
 }
 
@@ -640,8 +696,16 @@ fn check_level_table(col: &mut Collector, bytes: &[u8], graph: &HnswGraph<'_>) {
 }
 
 /// Each node's level against its slot count and the table, and
-/// `max_level` against the highest node level.
-fn check_levels(col: &mut Collector, bytes: &[u8], graph: &HnswGraph<'_>, ntotal: i64) {
+/// `max_level` against the highest node level. For a graph searched on
+/// its base level only, `max_level` is never read, so a value other than
+/// the -1 k-NN's builder writes warns instead.
+fn check_levels(
+    col: &mut Collector,
+    bytes: &[u8],
+    graph: &HnswGraph<'_>,
+    ntotal: i64,
+    base_only: bool,
+) {
     let cum = graph.cum_nneighbor_per_level;
     if let Ok(n) = usize::try_from(ntotal)
         && graph.levels.len() != n
@@ -703,6 +767,17 @@ fn check_levels(col: &mut Collector, bytes: &[u8], graph: &HnswGraph<'_>, ntotal
             );
         }
     }
+    if base_only {
+        if graph.max_level != -1 {
+            col.warn(
+                Check::Levels,
+                format!("max_level is {}; {RANDOM_ENTRY}", graph.max_level),
+                None,
+                None,
+            );
+        }
+        return;
+    }
     let expected_max = if graph.levels.is_empty() {
         -1
     } else {
@@ -721,9 +796,23 @@ fn check_levels(col: &mut Collector, bytes: &[u8], graph: &HnswGraph<'_>, ntotal
     }
 }
 
-fn check_entry_point(col: &mut Collector, graph: &HnswGraph<'_>) {
+/// The entry point exists and sits on the top level. For a graph searched
+/// on its base level only, it is never read, so a value other than the -1
+/// k-NN's builder writes warns instead.
+fn check_entry_point(col: &mut Collector, graph: &HnswGraph<'_>, base_only: bool) {
     let n = graph.levels.len();
     let entry = graph.entry_point;
+    if base_only {
+        if entry != -1 {
+            col.warn(
+                Check::EntryPoint,
+                format!("entry point is {entry}; {RANDOM_ENTRY}"),
+                None,
+                None,
+            );
+        }
+        return;
+    }
     if n == 0 {
         if entry != -1 {
             col.fail(
@@ -903,7 +992,11 @@ fn check_vector_values(col: &mut Collector, bytes: &[u8], idx: &IdMapIndex<'_>) 
     }
 }
 
-fn check_neighbor_lists(col: &mut Collector, bytes: &[u8], graph: &HnswGraph<'_>) {
+/// Every neighbor list: a neighbor on a level it is not on, a node listing
+/// itself, and a neighbor listed twice. For a graph searched on its base
+/// level only, whose upper levels k-NN's builder leaves empty and no
+/// search reads, a neighbor on an upper level warns too.
+fn check_neighbor_lists(col: &mut Collector, bytes: &[u8], graph: &HnswGraph<'_>, base_only: bool) {
     let base = view_offset(bytes, graph.neighbors);
     let n_levels = graph.cum_nneighbor_per_level.len().saturating_sub(1);
     for node in 0..graph.levels.len() {
@@ -914,6 +1007,19 @@ fn check_neighbor_lists(col: &mut Collector, bytes: &[u8], graph: &HnswGraph<'_>
             let slot_base = view_offset(bytes, slots).or(base);
             let at = |k: usize| slot_base.and_then(|b| b.checked_add(k.checked_mul(4)?));
             let node_id = i64::try_from(node).unwrap_or(-2);
+            if base_only
+                && level > 0
+                && let Some(k) = slots.iter().position(|v| v.get() != -1)
+            {
+                col.warn(
+                    Check::Levels,
+                    format!(
+                        "node {node} lists neighbors on level {level}, which a search of this graph never reads: it searches level 0 alone, from random entry points, and k-NN's remote build leaves the upper levels empty"
+                    ),
+                    at(k),
+                    Some(node),
+                );
+            }
             for (k, v) in slots.iter().enumerate() {
                 let id = i64::from(v.get());
                 if id == -1 {

@@ -571,7 +571,7 @@ fn only_the_pairs_k_nn_writes_are_accepted() {
             offset, expected, ..
         } => {
             assert_eq!(offset, HNSW_TAG);
-            assert_eq!(expected, "IHNf or IHNs");
+            assert_eq!(expected, "IHNf, IHNs, IHc2, or IHNc");
         }
         other => panic!("{other:?}"),
     }

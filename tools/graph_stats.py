@@ -11,7 +11,13 @@ a level ends at its first -1 slot. Reachability is a breadth-first search
 per level, top level first: the top level starts from the entry point,
 each lower level from every node reached on the level above (any of them
 can be where a search descends), and the search follows only neighbors
-that exist and are on that level.
+that exist and are on that level. A CAGRA graph with `base_level_only`
+set, as k-NN's remote build writes one, is searched on level 0 alone
+from nodes drawn at random, so any node can be where a search starts: a
+node is unreached there when no other node on the level lists it, and
+level 0 is its only level, whatever its max_level says.
+For any other graph the levels are those an HNSW search reads: max_level
++ 1, or level 0 alone when max_level is negative and the graph has nodes.
 
 A graph without its vectors (`IBMp` > `IBHf` > `null`, as k-NN writes an
 `on_disk` field's) is read through a copy Faiss accepts: zero-filled
@@ -95,10 +101,11 @@ def load_graph(path: pathlib.Path) -> dict:
         # read: the downcast views do not own what they point at.
         payload = np.frombuffer(with_zero_storage(payload), dtype=np.uint8)
         index = faiss.deserialize_index_binary(payload)
-        graph = faiss.downcast_IndexBinary(faiss.downcast_IndexBinary(index).index).hnsw
+        inner = faiss.downcast_IndexBinary(faiss.downcast_IndexBinary(index).index)
     else:
         index = faiss.deserialize_index(np.frombuffer(payload, dtype=np.uint8))
-        graph = faiss.downcast_index(faiss.downcast_index(index).index).hnsw
+        inner = faiss.downcast_index(faiss.downcast_index(index).index)
+    graph = inner.hnsw
     return {
         "levels": faiss.vector_to_array(graph.levels),
         "offsets": faiss.vector_to_array(graph.offsets),
@@ -106,6 +113,8 @@ def load_graph(path: pathlib.Path) -> dict:
         "cum": faiss.vector_to_array(graph.cum_nneighbor_per_level),
         "entry_point": int(graph.entry_point),
         "max_level": int(graph.max_level),
+        # Only a CAGRA index (IndexHNSWCagra, IndexBinaryHNSWCagra) has the flag.
+        "base_level_only": bool(getattr(inner, "base_level_only", False)),
     }
 
 
@@ -118,11 +127,19 @@ def graph_stats(path: pathlib.Path) -> dict:
     entry = graph["entry_point"]
     max_level = graph["max_level"]
     n = len(levels)
-    n_levels = min(max_level + 1, len(cum) - 1)
+    random_entry = graph["base_level_only"]
+    # As HnswGraph::searched_levels and HnswIndex::level_counts count them:
+    # an empty graph that records a max_level still has that many levels.
+    searched = (1 if n else 0) if random_entry else max(max_level + 1, 1 if n else 0)
+    n_levels = min(searched, len(cum) - 1)
 
     def neighbor_list(node: int, level: int) -> list[int]:
         begin = int(offsets[node]) + int(cum[level])
         end = int(offsets[node]) + int(cum[level + 1])
+        # As HnswGraph::neighbors_of: a range that leaves the node's own
+        # slots (a level table at odds with the offsets) is an empty list.
+        if begin > end or end > int(offsets[node + 1]):
+            return []
         out = []
         for v in neighbors[begin:end]:
             if v < 0:
@@ -138,9 +155,15 @@ def graph_stats(path: pathlib.Path) -> dict:
         degrees = [len(neighbor_list(i, level)) for i in on_level]
 
         seeds = set(reached_above)
-        if entry in on_set:
+        if entry in on_set and not random_entry:
             seeds.add(entry)
         reached = set(seeds)
+        if random_entry:
+            # Every node is a possible entry: the nodes reached are the
+            # ones some other node on the level lists. A node's own list
+            # leads nowhere new.
+            for node in on_level:
+                reached.update(v for v in neighbor_list(node, level) if v in on_set and v != node)
         queue = collections.deque(sorted(seeds))
         while queue:
             node = queue.popleft()
@@ -199,7 +222,14 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.fixtures:
-        for synthetic in ("synthetic", "synthetic-fp16", "synthetic-bf16", "synthetic-byte", "synthetic-binary"):
+        for synthetic in (
+            "synthetic",
+            "synthetic-fp16",
+            "synthetic-bf16",
+            "synthetic-byte",
+            "synthetic-binary",
+            "synthetic-cagra",
+        ):
             for path in sorted((args.fixtures / synthetic).glob("*.faiss")):
                 write(graph_stats(path), path.with_suffix(".stats.json"))
         for manifest in sorted(

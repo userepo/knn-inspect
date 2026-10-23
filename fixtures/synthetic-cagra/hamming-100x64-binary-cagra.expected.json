@@ -1,0 +1,70 @@
+{
+  "file": "hamming-100x64-binary-cagra.faiss",
+  "size": 16249,
+  "faiss_version": "1.15.1",
+  "seed": 20261013,
+  "layout": [
+    "IBMp",
+    "IBHc",
+    "IBxF"
+  ],
+  "dimension": 64,
+  "count": 100,
+  "metric": "hamming",
+  "faiss_metric_type": 1,
+  "code_size": 8,
+  "storage": "binary",
+  "cagra": {
+    "keep_max_size_level0": true,
+    "base_level_only": true,
+    "num_base_level_search_entrypoints": 32,
+    "numeric_type": null
+  },
+  "hnsw": {
+    "m": 16,
+    "ef_construction": 100,
+    "ef_search": 16,
+    "max_level": -1,
+    "entry_point": -1,
+    "level_counts": [
+      100
+    ],
+    "node_levels_max": 2,
+    "cum_nneighbor_per_level": [
+      0,
+      32,
+      48,
+      64,
+      80,
+      96,
+      112,
+      128,
+      144
+    ],
+    "levels_len": 100,
+    "offsets_len": 101,
+    "neighbors_len": 3296,
+    "levels_crc32": 3073793771,
+    "neighbors_crc32": 1239652846
+  },
+  "ids": {
+    "len": 100,
+    "first": 1000,
+    "last": 1099,
+    "crc32": 1526159279
+  },
+  "codes": {
+    "bytes": 800,
+    "crc32": 3978710787,
+    "first": [
+      183,
+      125,
+      228,
+      214,
+      198,
+      125,
+      209,
+      18
+    ]
+  }
+}

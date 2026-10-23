@@ -33,7 +33,7 @@ pub fn run(path: &Path, json: bool) -> anyhow::Result<ExitCode> {
     let parsed = file
         .parse()
         .with_context(|| format!("parsing {}", path.display()))?;
-    let stats = knn_check::graph_stats(&parsed.index.index.graph);
+    let stats = knn_check::index_stats(&parsed.index.index);
 
     if json {
         let out = Output {

@@ -402,7 +402,8 @@ fn scan_file(path: &Path, options: &Options) -> FileReport {
     let unsupported = matches!(
         parsed,
         Err(knn_format::Error::UnsupportedLayout { .. }
-            | knn_format::Error::UnsupportedQuantizer { .. })
+            | knn_format::Error::UnsupportedQuantizer { .. }
+            | knn_format::Error::UnexpectedQuantizer { .. })
     ) && report.failures == 1
         && report
             .result(Check::Checksum)
@@ -413,6 +414,9 @@ fn scan_file(path: &Path, options: &Options) -> FileReport {
         Err(knn_format::Error::UnsupportedQuantizer { .. }) => {
             "the native file's scalar quantizer type is not supported"
         }
+        Err(knn_format::Error::UnexpectedQuantizer { .. }) => {
+            "the native file's scalar quantizer type is not one k-NN writes under its graph"
+        }
         _ => "the native file's layout is not supported",
     };
     let parsed = parsed.ok();
@@ -422,6 +426,11 @@ fn scan_file(path: &Path, options: &Options) -> FileReport {
         let index = &p.index;
         let quantized = if index.index.storage.is_some() {
             LuceneQuantized::skipped(HOLDS_ITS_VECTORS.to_owned())
+        } else if index.index.kind.cagra().is_some() {
+            // The float headers of k-NN's remote build record no code size
+            // to hold the field's records to; the cross-check of this
+            // layout comes with step b of M15.
+            LuceneQuantized::skipped(CAGRA_GRAPH_ONLY.to_owned())
         } else {
             lucene_quantized(path, Graph::of(index), options.space)
         };
@@ -586,6 +595,13 @@ fn lucene_footer(bytes: &[u8]) -> Result<(), String> {
 /// Why a graph without its vectors has none to look for in a `.vec`.
 const GRAPH_ONLY: &str = "the native file holds the graph only: k-NN keeps the field's quantized vectors in Lucene's .veq file, checked under lucene_quantized";
 
+/// Why the quantized vectors of a CAGRA graph without its vectors are not
+/// checked yet.
+const CAGRA_GRAPH_ONLY: &str = "the native file holds a CAGRA graph without its vectors (k-NN's remote index build): the check of the field's .vemq and .veq against it does not read this layout yet";
+
+/// Why such a graph has nothing to look for in a `.vec` either.
+const CAGRA_GRAPH_ONLY_VEC: &str = "the native file holds a CAGRA graph without its vectors (k-NN's remote index build): nothing to compare with a .vec, and the check against the field's .vemq and .veq does not read this layout yet";
+
 /// The bytes to look for in a `.vec`, how else the `.vec` may hold them,
 /// and the stored vectors' shape; or why there is nothing to look for.
 fn stored_vectors<'a>(
@@ -641,7 +657,11 @@ fn lucene_vectors(path: &Path, bytes: &[u8], parsed: &knn_format::Parsed<'_>) ->
     // Said first: whatever .vec lies beside it, or none, a graph without
     // its vectors has nothing to compare with one.
     let Some(all) = parsed.index.index.storage else {
-        return skipped(GRAPH_ONLY.to_owned());
+        return skipped(if parsed.index.index.kind.cagra().is_some() {
+            CAGRA_GRAPH_ONLY_VEC.to_owned()
+        } else {
+            GRAPH_ONLY.to_owned()
+        });
     };
     let candidates = match segment_files(path, "vec") {
         Ok(c) => c,

@@ -15,7 +15,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use knn_format::faiss::{
-    FlatStorage, FourCc, HeaderKind, HnswGraph, HnswIndex, IndexHeader, Metric, Storage,
+    FlatStorage, FourCc, GraphKind, HeaderKind, HnswGraph, HnswIndex, IndexHeader, Metric, Storage,
 };
 use knn_format::{F32, F64, I32, U64};
 use knn_recall::{
@@ -272,6 +272,7 @@ impl Built {
         HnswIndex {
             fourcc: FourCc::HNSW_FLAT,
             header,
+            kind: GraphKind::Hnsw,
             graph: HnswGraph {
                 assign_probas: &self.probas,
                 cum_nneighbor_per_level: &self.cum,
@@ -547,6 +548,61 @@ fn a_graph_without_its_vectors_has_nothing_to_search() {
         search_all(index, &queries, 0, 16),
         Err(Error::ZeroK)
     ));
+}
+
+#[test]
+fn a_cagra_graph_is_refused_not_searched() {
+    // k-NN's remote build writes a CAGRA graph of its base level, which
+    // Faiss searches from random entry points; the HNSW descent from the
+    // entry point has nothing to start from (-1), so the search is
+    // refused with a reason, over every storage.
+    for name in [
+        "ip-100x64-cagra",
+        "l2-100x64-fp16-cagra",
+        "l2-100x64-byte-cagra",
+    ] {
+        let bytes = fs::read(fixtures().join(format!("synthetic-cagra/{name}.faiss"))).unwrap();
+        let parsed = knn_format::parse(&bytes).unwrap();
+        let index = &parsed.index.index;
+        assert!(index.base_level_only(), "{name}");
+        let mut s = Searcher::new(index.graph.node_count());
+        let query = [0.0_f32; 64];
+        assert!(
+            matches!(
+                s.search(index, &query, 10, 16),
+                Err(Error::RandomEntryPoints)
+            ),
+            "{name}"
+        );
+        let queries = Queries::from_rows(64, query.to_vec()).unwrap();
+        assert!(
+            matches!(
+                search_all(index, &queries, 10, 16),
+                Err(Error::RandomEntryPoints)
+            ),
+            "{name}"
+        );
+        // k is still checked first.
+        assert!(matches!(s.search(index, &query, 0, 16), Err(Error::ZeroK)));
+    }
+    let bytes =
+        fs::read(fixtures().join("synthetic-cagra/hamming-100x64-binary-cagra.faiss")).unwrap();
+    let parsed = knn_format::parse(&bytes).unwrap();
+    let index = &parsed.index.index;
+    let mut s = Searcher::new(index.graph.node_count());
+    assert!(matches!(
+        s.search(index, Query::Bits(&[0_u8; 8]), 10, 16),
+        Err(Error::RandomEntryPoints)
+    ));
+    // The brute force over the file's vectors does not care which graph
+    // sits above them.
+    let Some(storage) = &index.storage else {
+        panic!("binary storage");
+    };
+    let queries = Queries::from_bits(&[0_u8; 8], 64).unwrap();
+    let truth = ground_truth(storage, &queries, 10).unwrap();
+    assert_eq!(truth.len(), 1);
+    assert_eq!(truth.k(), 10);
 }
 
 #[test]

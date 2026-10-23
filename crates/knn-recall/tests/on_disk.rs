@@ -753,3 +753,54 @@ fn a_failed_query_is_named_by_its_row() {
         ));
     });
 }
+
+#[test]
+fn a_cagra_graph_is_refused_before_its_field_is_read() {
+    // k-NN's remote build writes a float field's sq-multibit graph as
+    // IxMp > IHc2 > null, which k-NN searches from random entry points:
+    // the descent from the entry point below would start from -1 and find
+    // nothing, so the field is refused before any of its parts is held to
+    // the graph, whatever shape they have.
+    let files = Files::of("on-disk/l2");
+    let meta = QuantizedVectorsMeta::parse(&files.vemq).unwrap();
+    let data = DataFile::parse(&files.veq).unwrap();
+    let records = QuantizedVectors::open(&files.veq, &data, &meta.fields[0]).unwrap();
+    let flat = FlatVectorsMeta::parse(&files.vemf).unwrap();
+    let bytes = fs::read(fixtures().join("../synthetic-cagra/ip-100x64-cagra.faiss")).unwrap();
+    let storage = bytes.windows(4).position(|w| w == b"IxFI").unwrap();
+    let count_at = storage + 4 + 33;
+    let floats = usize::try_from(u64::from_le_bytes(
+        bytes[count_at..count_at + 8].try_into().unwrap(),
+    ))
+    .unwrap();
+    let mut graph_only = bytes[..storage].to_vec();
+    graph_only.extend_from_slice(b"null");
+    graph_only.extend_from_slice(&bytes[count_at + 8 + floats * 4..]);
+    let parsed = knn_format::parse(&graph_only).unwrap();
+    assert!(parsed.index.index.storage.is_none());
+    assert!(parsed.index.index.base_level_only());
+    assert!(matches!(
+        OnDiskField::new(
+            &parsed.index,
+            &meta.fields[0],
+            records,
+            &flat.fields[0],
+            &files.vec
+        ),
+        Err(Error::RandomEntryPoints)
+    ));
+    // Lucene's searcher over the same graph starts from its -1 entry point
+    // and finds nothing for a k below the vector count.
+    let graph = &parsed.index.index.graph;
+    let found = lucene_search::search(
+        graph,
+        100,
+        10,
+        u64::MAX,
+        |_| Some(1.0),
+        |ord| i32::try_from(ord).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(found.hits, Vec::new());
+    assert_eq!(found.visited, 0);
+}

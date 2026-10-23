@@ -76,6 +76,12 @@ pub struct TopDocs {
 /// `ord_to_doc` the doc id an ordinal maps to, which results are reported
 /// and tied by.
 ///
+/// The search starts from the graph's entry point, as k-NN's does over an
+/// HNSW graph. A CAGRA graph of its base level stores -1 there and k-NN
+/// searches it from random entry points instead, so over such a graph
+/// this search finds nothing unless `k` reaches `vectors`;
+/// [`OnDiskField::new`](crate::on_disk::OnDiskField::new) refuses it.
+///
 /// # Errors
 ///
 /// Returns [`Error::Unscored`] when `score` gives none for a node the

@@ -9,7 +9,10 @@ writes for HNSW fields, with no Faiss dependency: `IxMp` >
 (scalar-quantized storage, such as fp16), `IBMp` > `IBHf` > `IBxF`
 (binary storage, packed bits), and `IBMp` > `IBHf` > `null` (a graph
 without its vectors, which k-NN writes for an `on_disk` field and keeps
-the quantized vectors in Lucene's files).
+the quantized vectors in Lucene's files); and the CAGRA graphs k-NN's
+remote index build writes in place of the HNSW one: `IHc2` (or Faiss's
+older `IHNc`) over any of the float storages or `null`, and `IBHc` over
+`IBxF`, each with its CAGRA fields between the header and the graph.
 A file with a Lucene envelope is accepted; the footer is skipped (see
 strip_envelope.py for its layout).
 
@@ -111,9 +114,13 @@ class Walker:
         out["idmap"] = self.index_header("idmap")
 
         hnsw_tag = self.fourcc("hnsw.fourcc")
-        if hnsw_tag not in ("IHNf", "IHNs"):
-            raise ValueError(f"expected IHNf or IHNs, found {hnsw_tag!r}")
+        if hnsw_tag not in ("IHNf", "IHNs", "IHc2", "IHNc"):
+            raise ValueError(f"expected IHNf, IHNs, IHc2, or IHNc, found {hnsw_tag!r}")
         out["hnsw"] = self.index_header("hnsw")
+        out["graph"] = "hnsw"
+        if hnsw_tag in ("IHc2", "IHNc"):
+            out["graph"] = "cagra"
+            out["cagra"] = self.cagra_fields(with_numeric_type=hnsw_tag == "IHc2")
         self.hnsw_graph(out)
         self.storage(out, hnsw_tag)
         self.vector("idmap.id_map", "<q")
@@ -123,12 +130,16 @@ class Walker:
     def walk_binary(self, out: dict) -> dict:
         out["idmap"] = self.binary_header("idmap")
         hnsw_tag = self.fourcc("hnsw.fourcc")
-        if hnsw_tag != "IBHf":
-            raise ValueError(f"expected IBHf under IBMp, found {hnsw_tag!r}")
+        if hnsw_tag not in ("IBHf", "IBHc"):
+            raise ValueError(f"expected IBHf or IBHc under IBMp, found {hnsw_tag!r}")
         out["hnsw"] = self.binary_header("hnsw")
+        out["graph"] = "hnsw"
+        if hnsw_tag == "IBHc":
+            out["graph"] = "cagra"
+            out["cagra"] = self.cagra_fields(with_numeric_type=False)
         self.hnsw_graph(out)
         tag = self.fourcc("storage.fourcc")
-        if tag == "null":
+        if tag == "null" and hnsw_tag == "IBHf":
             # k-NN's patch 0008: the storage left out, the tag alone.
             self.fields[-1]["note"] = "no storage: the vectors are in Lucene's files"
             out["storage"] = None
@@ -137,10 +148,26 @@ class Walker:
             # read_vector(xb): a byte vector, ntotal * code_size bytes.
             self.vector("storage.codes", "<B")
         else:
-            raise ValueError(f"expected IBxF or null under IBHf, found {tag!r}")
+            expected = "IBxF or null under IBHf" if hnsw_tag == "IBHf" else "IBxF under IBHc"
+            raise ValueError(f"expected {expected}, found {tag!r}")
         self.vector("idmap.id_map", "<q")
         out["end"] = self.base + self.pos
         return out
+
+    def cagra_fields(self, with_numeric_type: bool) -> dict:
+        """The fields `IndexHNSWCagra` and `IndexBinaryHNSWCagra` store after the header.
+
+        Two bools and an int32; `IHc2` adds the storage's numeric type as
+        an int32, which k-NN reads and discards.
+        """
+        keep = self._take("<?", "cagra.keep_max_size_level0", "level 0 lists kept at full size while building")
+        base_only = self._take("<?", "cagra.base_level_only", "searched on level 0 alone, from random entry points")
+        entrypoints = self._take("<i", "cagra.num_base_level_search_entrypoints", "random entry points drawn per search")
+        fields = {"keep_max_size_level0": keep, "base_level_only": base_only, "num_base_level_search_entrypoints": entrypoints}
+        if with_numeric_type:
+            numeric = self._take("<i", "cagra.numeric_type", "0 Float32, 1 Float16, 2 UInt8, 3 Int8; stored, never read")
+            fields["numeric_type"] = numeric
+        return fields
 
     def hnsw_graph(self, out: dict) -> None:
         self.vector("hnsw.assign_probas", "<d")
@@ -154,13 +181,23 @@ class Walker:
         out["hnsw"]["ef_search"] = self._take("<i", "hnsw.efSearch")
         self._take("<i", "hnsw.upper_beam", "deprecated, always written as 1")
         levels = struct.unpack_from(f"<{nlevels_vec}i", self.data, levels_start)
-        out["hnsw"]["level_counts"] = [sum(1 for v in levels if v > i) for i in range(out["hnsw"]["max_level"] + 1)]
+        # The levels a search reads: max_level + 1, or level 0 alone for a
+        # graph of nodes whose max_level is -1, as a CAGRA graph's is.
+        searched = max(out["hnsw"]["max_level"] + 1, 1 if nlevels_vec else 0)
+        out["hnsw"]["level_counts"] = [sum(1 for v in levels if v > i) for i in range(searched)]
 
     def storage(self, out: dict, hnsw_tag: str) -> None:
         tag = self.fourcc("storage.fourcc")
-        if hnsw_tag == "IHNf":
+        cagra = hnsw_tag in ("IHc2", "IHNc")
+        if cagra and tag == "null":
+            # k-NN's remote build leaves the storage out for a float field
+            # whose sq encoder keeps 1, 2, or 4 bits.
+            self.fields[-1]["note"] = "no storage: the vectors are in Lucene's files"
+            out["storage"] = None
+        elif hnsw_tag == "IHNf" or (cagra and tag != "IxSQ"):
             if tag not in ("IxF2", "IxFI", "IxFl"):
-                raise ValueError(f"expected flat storage, found {tag!r}")
+                expected = "IxF2, IxFI, IxSQ, or null under a CAGRA graph" if cagra else "flat storage"
+                raise ValueError(f"expected {expected}, found {tag!r}")
             out["storage"] = self.index_header("storage")
             self.vector("storage.codes", "<B", size_multiplier=4)
         else:
@@ -227,8 +264,13 @@ def main() -> int:
             metric = METRICS.get(summary["idmap"]["metric_type"])
         else:
             metric = "hamming" if "code_size" in storage else METRICS.get(storage["metric_type"])
+        cagra = summary.get("cagra")
+        graph = "" if cagra is None else (
+            f" graph=cagra(base_level_only={int(cagra['base_level_only'])}, "
+            f"entrypoints={cagra['num_base_level_search_entrypoints']})"
+        )
         print(f"summary: d={summary['idmap']['d']} n={summary['idmap']['ntotal']} metric={metric} "
-              f"levels={h['level_counts']} entry={h['entry_point']} efC={h['ef_construction']} efS={h['ef_search']}")
+              f"levels={h['level_counts']} entry={h['entry_point']} efC={h['ef_construction']} efS={h['ef_search']}{graph}")
     return 0 if trailing == 0 else 2
 
 

@@ -3,7 +3,7 @@
 
 use std::collections::VecDeque;
 
-use knn_format::faiss::HnswGraph;
+use knn_format::faiss::{HnswGraph, HnswIndex};
 use serde::Serialize;
 
 /// Statistics for one HNSW graph.
@@ -37,13 +37,30 @@ pub struct LayerStats {
     /// Nodes per out-degree: entry `k` counts the nodes with `k`
     /// neighbors. Ends at the largest degree present.
     pub degree_histogram: Vec<usize>,
-    /// Nodes on this level that no search reaches.
+    /// Nodes on this level that no search reaches. For a graph searched
+    /// from random entry points ([`base_level_stats`]), the nodes no
+    /// other node's neighbor list leads to, which a search returns only
+    /// when it draws them as an entry.
     pub unreachable: usize,
     /// Those nodes, in id order.
     pub unreachable_nodes: Vec<usize>,
 }
 
-/// Computes per-level statistics for `graph`.
+/// Computes the statistics of `index`'s graph as Faiss searches it:
+/// [`base_level_stats`] for a CAGRA graph with `base_level_only` set,
+/// which k-NN's remote index build writes, and [`graph_stats`] for any
+/// other, HNSW or CAGRA, searched from its entry point.
+#[must_use]
+pub fn index_stats(index: &HnswIndex<'_>) -> GraphStats {
+    if index.base_level_only() {
+        base_level_stats(&index.graph)
+    } else {
+        graph_stats(&index.graph)
+    }
+}
+
+/// Computes per-level statistics for `graph`, searched as an HNSW graph
+/// is, from its entry point.
 ///
 /// A node's neighbor list on a level ends at its first negative slot, as
 /// Faiss's search reads it; that list is the node's out-degree.
@@ -52,26 +69,68 @@ pub struct LayerStats {
 /// top level starts from the entry point, and each lower level from every
 /// node reached on the level above, since a search can descend from any of
 /// them. Only neighbors that exist and are on the level are followed. A
-/// node left unreached on a level can never be visited there by any query.
+/// node left unreached on a level can never be visited there by any query;
+/// with no entry point (-1), nothing is reached.
 ///
-/// Malformed graphs yield statistics, never a panic. Levels come from
-/// `max_level`, capped by the level table; neighbor ranges that fall
-/// outside a node's slots count as empty. Allocations are bounded by the
-/// arrays the file actually holds.
+/// Malformed graphs yield statistics, never a panic. Levels are those a
+/// search reads ([`HnswGraph::searched_levels`]), capped by the level
+/// table; neighbor ranges that fall outside a node's slots count as
+/// empty. Allocations are bounded by the arrays the file actually holds.
 #[must_use]
 pub fn graph_stats(graph: &HnswGraph<'_>) -> GraphStats {
+    stats(graph, graph.searched_levels(), false)
+}
+
+/// Computes the statistics of `graph`'s level 0, searched as Faiss
+/// searches a CAGRA graph with `base_level_only` set: from random entry
+/// points, never reading the entry point, `max_level`, or the upper
+/// levels. Any node can be where a search starts, so a node is unreached
+/// when no other node on the level lists it (its own list leads nowhere
+/// new), and a search returns it only when it draws it as an entry. The
+/// one layer is level 0; the entry point and `max_level` are reported as
+/// stored.
+#[must_use]
+pub fn base_level_stats(graph: &HnswGraph<'_>) -> GraphStats {
+    let n_levels = usize::from(graph.node_count() > 0)
+        .min(graph.cum_nneighbor_per_level.len().saturating_sub(1));
+    stats(graph, n_levels, true)
+}
+
+/// The statistics of `graph`'s lowest `n_levels` levels, reachability
+/// seeded from every node's neighbor lists (`random_entry`) or from the
+/// entry point.
+fn stats(graph: &HnswGraph<'_>, n_levels: usize, random_entry: bool) -> GraphStats {
     let n = graph.node_count();
-    let cum = graph.cum_nneighbor_per_level;
-    let n_levels = usize::try_from(graph.max_level)
-        .map_or(0, |l| l.saturating_add(1))
-        .min(cum.len().saturating_sub(1));
-    let entry = usize::try_from(graph.entry_point).ok().filter(|&e| e < n);
+    let entry = if random_entry {
+        None
+    } else {
+        usize::try_from(graph.entry_point).ok().filter(|&e| e < n)
+    };
 
     let mut layers = Vec::with_capacity(n_levels);
     let mut reached_above = vec![false; n];
     let mut queue = VecDeque::new();
     for level in (0..n_levels).rev() {
         let mut reached = vec![false; n];
+        if random_entry {
+            // Every node is a possible entry, so the nodes reached are the
+            // ones some other node on the level lists; a node's own list
+            // leads nowhere new.
+            for node in 0..n {
+                if !on_level(graph, node, level) {
+                    continue;
+                }
+                for v in neighbor_list(graph, node, level) {
+                    let Ok(v) = usize::try_from(v) else { continue };
+                    if v != node
+                        && on_level(graph, v, level)
+                        && let Some(r) = reached.get_mut(v)
+                    {
+                        *r = true;
+                    }
+                }
+            }
+        }
         for (node, (r, &above)) in reached.iter_mut().zip(&reached_above).enumerate() {
             if above || (Some(node) == entry && on_level(graph, node, level)) {
                 *r = true;

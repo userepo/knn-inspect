@@ -19,7 +19,9 @@ map's values, which k-NN sets to Lucene doc ids.
 | `envelope.footer` | object, nullable | Lucene footer: `offset`, `algorithm`, `checksum` (hex string), `verified` (whether the CRC32 matches) |
 | `payload.offset`, `payload.length` | integer | Where the Faiss payload lies |
 | `payload.trailing_bytes` | integer | Bytes between the end of the index and the footer; 0 in a well-formed file |
-| `layout` | array of strings | The Faiss fourccs, outermost first: `IxMp`, then `IHNf` and `IxF2` or `IxFI` (float32 storage), or `IHNs` and `IxSQ` (fp16, bf16, or byte storage); or `IBMp`, `IBHf`, and `IBxF` (binary storage, since 0.7.0); or `IBMp`, `IBHf`, and `null` (a graph without its vectors, as k-NN writes an `on_disk` field's, since 0.8.0) |
+| `layout` | array of strings | The Faiss fourccs, outermost first: `IxMp`, then `IHNf` and `IxF2` or `IxFI` (float32 storage), or `IHNs` and `IxSQ` (fp16, bf16, or byte storage); or `IBMp`, `IBHf`, and `IBxF` (binary storage, since 0.7.0); or `IBMp`, `IBHf`, and `null` (a graph without its vectors, as k-NN writes an `on_disk` field's, since 0.8.0). For the CAGRA graph k-NN's remote index build writes (since 0.12.0): `IxMp`, `IHc2` (or Faiss's older `IHNc`), and `IxF2`, `IxFI`, `IxSQ`, or `null`; or `IBMp`, `IBHc`, and `IBxF` |
+| `graph` | string | `hnsw`, or `cagra` for the graph k-NN's remote index build writes (CAGRA, Cuda Anns GRAph-based: the GPU-built graph index of NVIDIA's cuVS library), which Faiss searches on its base level alone, from random entry points. Since 0.12.0 |
+| `cagra` | object, optional | For a CAGRA graph, the fields after its header: `keep_max_size_level0` and `base_level_only` (booleans; k-NN's remote build sets both), `search_entry_points` (nodes a search draws at random to start from), and `numeric_type` (integer, optional: as stored under `IHc2`, absent under `IHNc` and `IBHc`; Faiss's `NumericType`, 0 `Float32`, 1 `Float16`, 2 `UInt8`, 3 `Int8`, which k-NN discards). Since 0.12.0 |
 | `dimension` | integer | Vector dimension; bits for binary storage, components for a graph without its vectors |
 | `count` | integer | Vector count from the ID map's header |
 | `metric` | string | `l2` or `inner_product` as the file records it; a cosine field reads `inner_product`. `hamming` for binary storage, which computes Hamming distance whatever metric type its headers record (since 0.7.0). A graph without its vectors reads `l2` or `inner_product`, the metric k-NN built it for, as its ID map's header records it and k-NN reads it (since 0.8.0). Any other metric type `n` reads `metric_n` |
@@ -27,8 +29,8 @@ map's values, which k-NN sets to Lucene doc ids.
 | `quantizer` | object, optional | For scalar-quantized storage, the quantizer as stored: `qtype` (4, 7, or 8), `name` (`QT_fp16`, `QT_bf16`, or `QT_8bit_direct_signed`), `dimension`, `code_size` (bytes per vector: twice the dimension for fp16 and bf16, the dimension for byte), `trained` (number of trained values; none of the three formats uses any). Since 0.4.0; bf16 since 0.5.0; byte since 0.6.0 |
 | `hnsw.m` | integer, nullable | Neighbor slots per node on the upper levels; `null` if the level table is too short to say |
 | `hnsw.ef_construction`, `hnsw.ef_search` | integer | As stored |
-| `hnsw.max_level`, `hnsw.entry_point` | integer | As stored; `-1` for an empty graph |
-| `hnsw.level_counts` | array of integers | Nodes on each level, level 0 first |
+| `hnsw.max_level`, `hnsw.entry_point` | integer | As stored; `-1` for an empty graph, and for a CAGRA graph, whose search never reads them |
+| `hnsw.level_counts` | array of integers | Nodes on each level a search reads, level 0 first: `max_level + 1` levels, or level 0 alone for a CAGRA graph with `base_level_only` set, whatever its `max_level` says |
 | `hnsw.neighbor_slots` | integer | Length of the neighbor array |
 | `ids.len` | integer | Labels in the ID map |
 | `ids.first`, `ids.last` | integer, nullable | First and last label; `null` when there are none |
@@ -59,8 +61,8 @@ Each entry of `checks`:
 | --- | --- | --- |
 | `file` | string | The path as given |
 | `nodes` | integer | Nodes in the graph |
-| `entry_point`, `max_level` | integer | As stored |
-| `layers` | array | One entry per level, level 0 first (see below) |
+| `entry_point`, `max_level` | integer | As stored; `-1` for a CAGRA graph, whose search never reads them |
+| `layers` | array | One entry per level a search reads, level 0 first (see below): `max_level + 1` levels, or level 0 alone for a CAGRA graph with `base_level_only` set, whatever its `max_level` says |
 
 Each entry of `layers`:
 
@@ -72,7 +74,7 @@ Each entry of `layers`:
 | `edges` | integer | Neighbors listed, summed over the level's nodes; a list ends at its first empty slot |
 | `degree_min`, `degree_max` | integer, nullable | Out-degree range; `null` on an empty level |
 | `degree_histogram` | array of integers | Entry `k` is the number of nodes with `k` neighbors |
-| `unreachable` | integer | Nodes on this level no search can reach |
+| `unreachable` | integer | Nodes on this level no search can reach. For a graph searched from random entry points (a CAGRA graph with `base_level_only` set), the nodes no other node's neighbor list leads to, which a search returns only when it draws them as an entry (since 0.12.0) |
 | `unreachable_nodes` | array of integers | Those nodes, in id order |
 
 ## `recall`

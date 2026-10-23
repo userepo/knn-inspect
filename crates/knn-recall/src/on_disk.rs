@@ -318,10 +318,12 @@ impl<'a> OnDiskField<'a> {
     ///
     /// # Errors
     ///
-    /// Returns an error when the field holds no vectors or not in an
-    /// encoding k-NN writes, its similarity is not Lucene's, its labels
-    /// repeat or are not doc ids, the parts disagree on the dimension or the
-    /// vector count, or as [`field_vectors`] does.
+    /// Returns an error when the graph is a CAGRA graph of its base level,
+    /// which k-NN searches from random entry points, not as below; when
+    /// the field holds no vectors or not in an encoding k-NN writes, its
+    /// similarity is not Lucene's, its labels repeat or are not doc ids,
+    /// the parts disagree on the dimension or the vector count; or as
+    /// [`field_vectors`] does.
     pub fn new(
         index: &'a IdMapIndex<'a>,
         field: &'a QuantizedField,
@@ -329,6 +331,12 @@ impl<'a> OnDiskField<'a> {
         flat: &FlatField,
         vec: &'a [u8],
     ) -> Result<Self> {
+        // k-NN searches a CAGRA graph of its base level from random entry
+        // points, not with the descent below, which would start from its
+        // -1 entry point and find nothing.
+        if index.index.base_level_only() {
+            return Err(Error::RandomEntryPoints);
+        }
         if index.index.storage.is_some() {
             return Err(Error::HasVectors);
         }

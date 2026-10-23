@@ -5,7 +5,7 @@ use std::process::ExitCode;
 
 use anyhow::Context;
 use knn_format::NativeFile;
-use knn_format::faiss::{Storage, quantizer_type_name};
+use knn_format::faiss::{GraphKind, Storage, numeric_type_name, quantizer_type_name};
 use serde::Serialize;
 
 /// What `info` says of a graph without its vectors in place of them.
@@ -18,6 +18,8 @@ struct Report {
     envelope: EnvelopeReport,
     payload: PayloadReport,
     layout: Vec<String>,
+    /// `hnsw`, or `cagra` for the graph k-NN's remote index build writes.
+    graph: &'static str,
     dimension: i32,
     count: i64,
     metric: String,
@@ -29,8 +31,21 @@ struct Report {
     kind: Kind,
     #[serde(skip_serializing_if = "Option::is_none")]
     quantizer: Option<QuantizerReport>,
+    /// The fields a CAGRA graph stores after its header.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cagra: Option<CagraReport>,
     hnsw: HnswReport,
     ids: IdsReport,
+}
+
+#[derive(Serialize)]
+struct CagraReport {
+    keep_max_size_level0: bool,
+    base_level_only: bool,
+    search_entry_points: i32,
+    /// As stored under `IHc2`; absent under `IHNc` and `IBHc`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    numeric_type: Option<i32>,
 }
 
 /// The three kinds of storage a file can have, as text output tells them
@@ -141,6 +156,7 @@ pub fn run(path: &Path, json: bool) -> anyhow::Result<ExitCode> {
             trailing_bytes: parsed.trailing,
         },
         layout: idx.layout().iter().map(ToString::to_string).collect(),
+        graph: idx.index.kind.name(),
         dimension: idx.header.d,
         count: idx.header.ntotal,
         metric: idx.metric().name(),
@@ -162,13 +178,22 @@ pub fn run(path: &Path, json: bool) -> anyhow::Result<ExitCode> {
                 trained: s.quantizer.trained.len(),
             }),
         },
+        cagra: match idx.index.kind {
+            GraphKind::Hnsw => None,
+            GraphKind::Cagra(c) => Some(CagraReport {
+                keep_max_size_level0: c.keep_max_size_level0,
+                base_level_only: c.base_level_only,
+                search_entry_points: c.search_entry_points,
+                numeric_type: c.numeric_type,
+            }),
+        },
         hnsw: HnswReport {
             m: graph.m(),
             ef_construction: graph.ef_construction,
             ef_search: graph.ef_search,
             max_level: graph.max_level,
             entry_point: graph.entry_point,
-            level_counts: graph.level_counts(),
+            level_counts: idx.index.level_counts(),
             neighbor_slots: graph.neighbors.len(),
         },
         ids: IdsReport {
@@ -219,6 +244,31 @@ fn print_text(r: &Report) {
         r.payload.offset, r.payload.length, r.payload.trailing_bytes
     );
     println!("  layout          {}", r.layout.join(" > "));
+    if let Some(c) = &r.cagra {
+        if c.base_level_only {
+            println!(
+                "  graph           CAGRA (k-NN's remote index build), base level only, {} random entry points per search",
+                c.search_entry_points
+            );
+        } else {
+            println!(
+                "  graph           CAGRA (k-NN's remote index build) with base_level_only off: searched as HNSW, from its entry point; {} random entry points stored, unused",
+                c.search_entry_points
+            );
+        }
+        println!(
+            "  cagra fields    keep_max_size_level0 {}, base_level_only {}, numeric type {}",
+            u8::from(c.keep_max_size_level0),
+            u8::from(c.base_level_only),
+            match c.numeric_type {
+                Some(t) => format!(
+                    "{t} ({}; stored, never read)",
+                    numeric_type_name(t).unwrap_or("not a Faiss type")
+                ),
+                None => "none stored".to_owned(),
+            }
+        );
+    }
     match (r.kind, r.code_size) {
         (Kind::Binary, Some(size)) => println!(
             "  dimension       {} bits, code size {size} bytes",

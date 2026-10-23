@@ -74,6 +74,7 @@ impl Searcher {
     /// # Errors
     ///
     /// Returns an error when `k` is 0, the file holds no vectors, its
+    /// graph is a CAGRA graph searched from random entry points, its
     /// dimension, code size, or metric is unusable, or `query` has another
     /// dimension or is of the other kind: float32 for binary storage, or
     /// bits for any other.
@@ -88,6 +89,11 @@ impl Searcher {
             return Err(Error::ZeroK);
         }
         let query = query.into();
+        // Said before the storage: a graph of this kind is not searched
+        // here with or without its vectors.
+        if index.base_level_only() {
+            return Err(Error::RandomEntryPoints);
+        }
         let storage = index.storage.as_ref().ok_or(Error::NoVectors)?;
         let vectors = Vectors::of(storage)?;
         check_query(&vectors, query.kind(), query.dimension())?;
@@ -252,9 +258,10 @@ pub(crate) fn neighbor_list<'g>(
 ///
 /// # Errors
 ///
-/// Returns an error when `k` is 0, the file holds no vectors, its
-/// dimension, code size, or metric is unusable, or the queries' kind or
-/// dimension differs from the file's.
+/// Returns an error when `k` is 0, the file holds no vectors, its graph
+/// is a CAGRA graph searched from random entry points, its dimension,
+/// code size, or metric is unusable, or the queries' kind or dimension
+/// differs from the file's.
 pub fn search_all(
     index: &HnswIndex<'_>,
     queries: &Queries,
@@ -263,6 +270,9 @@ pub fn search_all(
 ) -> Result<Vec<Vec<Hit>>> {
     if k == 0 {
         return Err(Error::ZeroK);
+    }
+    if index.base_level_only() {
+        return Err(Error::RandomEntryPoints);
     }
     let storage = index.storage.as_ref().ok_or(Error::NoVectors)?;
     checked_vectors(storage, queries)?;

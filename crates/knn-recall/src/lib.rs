@@ -122,6 +122,13 @@ pub enum Error {
     /// `k` was 0.
     #[error("k must be at least 1")]
     ZeroK,
+    /// The graph is a CAGRA graph of its base level only, which k-NN's
+    /// remote index build writes and Faiss searches from random entry
+    /// points: a search this crate does not run yet.
+    #[error(
+        "the graph is a CAGRA graph (k-NN's remote index build), searched from random entry points, which this crate does not search yet"
+    )]
+    RandomEntryPoints,
     /// The file is a graph without its vectors, which k-NN keeps in
     /// Lucene's files for the field: [`on_disk::OnDiskField`] searches it
     /// over them, as k-NN does.

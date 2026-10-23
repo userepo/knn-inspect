@@ -3,7 +3,8 @@
 One libFuzzer target, `parse_and_verify`, feeds arbitrary bytes to
 `knn_format::parse`, `knn_check::verify`, `knn_check::graph_stats`, and
 an HNSW search (`knn_recall::Searcher`) over whatever graph parsed (one
-without its vectors must refuse the search) and the search k-NN runs
+without its vectors, or a CAGRA graph of its base level, must refuse the
+search) and the search k-NN runs
 with Lucene's searcher (`knn_recall::lucene_search`), to the segment
 info, field infos, flat-vectors metadata, and scalar-quantized vectors
 readers, the readers of a `.vec`'s rows, float32 and fp16,

@@ -4,7 +4,12 @@
 //! or byte scalar-quantized storage; or, for binary vectors, `IBMp`
 //! wrapping `IBHf` over `IBxF`, packed bits compared by Hamming distance;
 //! or `IBMp` wrapping `IBHf` over `null`, a graph whose vectors k-NN keeps
-//! in Lucene's files, as it writes an `on_disk` field's.
+//! in Lucene's files, as it writes an `on_disk` field's. k-NN's remote
+//! index build writes a CAGRA graph in place of the HNSW one: `IHc2` (or
+//! Faiss's older `IHNc`) over any of the float storages or `null`, and
+//! `IBHc` over `IBxF`; each adds a few fields ([`CagraFields`]) before the
+//! same HNSW block, and Faiss searches it on its base level alone, from
+//! random entry points.
 //!
 //! Every array is a view into the file's bytes. Element types are the
 //! unaligned little-endian wrappers from `zerocopy`; call `.get()` on an
@@ -33,6 +38,16 @@ impl FourCc {
     pub const HNSW_FLAT: Self = Self(*b"IHNf");
     /// `IndexHNSWSQ`.
     pub const HNSW_SQ: Self = Self(*b"IHNs");
+    /// `IndexHNSWCagra`: the graph k-NN's remote index build writes, over
+    /// any float storage or none.
+    pub const HNSW_CAGRA: Self = Self(*b"IHc2");
+    /// `IndexHNSWCagra` as Faiss wrote it before the numeric type was
+    /// added. Faiss at `5616caa` still reads it; only k-NN's own test
+    /// files hold it.
+    pub const HNSW_CAGRA_OLD: Self = Self(*b"IHNc");
+    /// `IndexBinaryHNSWCagra`: the graph k-NN's remote index build writes
+    /// for a binary field.
+    pub const BINARY_HNSW_CAGRA: Self = Self(*b"IBHc");
     /// `IndexFlatL2`.
     pub const FLAT_L2: Self = Self(*b"IxF2");
     /// `IndexFlatIP`.
@@ -304,17 +319,30 @@ impl<'a> HnswGraph<'a> {
         }
     }
 
-    /// Nodes present on each level, level 0 first. Empty for an empty
-    /// graph.
-    ///
-    /// The number of levels comes from `max_level`, capped by the levels
-    /// the per-level table describes (one fewer than its entries) so a
-    /// corrupt `max_level` cannot drive an allocation; a node's own level
-    /// is clamped the same way.
+    /// The levels an HNSW search reads: `max_level + 1`, or the base
+    /// level alone for a graph of nodes whose `max_level` is negative, as
+    /// a CAGRA graph's -1 is. Capped by the levels the per-level table
+    /// describes (one fewer than its entries), so a corrupt `max_level`
+    /// cannot drive an allocation. 0 for an empty graph whose `max_level`
+    /// is -1, as Faiss leaves one; an empty graph that records a
+    /// `max_level` has that many levels, all empty. A CAGRA graph with
+    /// `base_level_only` set is searched on level 0 whatever its
+    /// `max_level` says: see [`HnswIndex::level_counts`].
+    #[must_use]
+    pub fn searched_levels(&self) -> usize {
+        let claimed = match usize::try_from(self.max_level) {
+            Ok(top) => top.saturating_add(1),
+            Err(_) => usize::from(!self.levels.is_empty()),
+        };
+        claimed.min(self.cum_nneighbor_per_level.len().saturating_sub(1))
+    }
+
+    /// Nodes present on each level, level 0 first, for the levels of
+    /// [`Self::searched_levels`]: empty when those are none. A node's own
+    /// level is clamped to those levels.
     #[must_use]
     pub fn level_counts(&self) -> Vec<usize> {
-        let claimed = usize::try_from(self.max_level).map_or(0, |l| l.saturating_add(1));
-        let n_levels = claimed.min(self.cum_nneighbor_per_level.len().saturating_sub(1));
+        let n_levels = self.searched_levels();
         let mut counts = vec![0_usize; n_levels];
         for level in self.levels {
             let n = usize::try_from(level.get()).unwrap_or(0).min(n_levels);
@@ -880,23 +908,135 @@ impl<'a> Storage<'a> {
     }
 }
 
+/// The fields a CAGRA graph (`IHc2`, `IHNc`, or `IBHc`) stores between
+/// its index header and the HNSW block, as `IndexHNSWCagra` and
+/// `IndexBinaryHNSWCagra` keep them. CAGRA (Cuda Anns GRAph-based) is the
+/// GPU-built graph index of NVIDIA's cuVS library, which Faiss wraps as
+/// `GpuIndexCagra`.
+///
+/// k-NN's remote index build makes such a graph on a GPU and copies it
+/// into the base level of an HNSW index (`GpuIndexCagra::copyTo`): level
+/// 0 holds the CAGRA graph, every node's upper-level slots stay empty,
+/// and the entry point and `max_level` stay -1. With `base_level_only`
+/// set, Faiss searches level 0 alone, starting from the nearest of
+/// `search_entry_points` nodes drawn at random for each query, so the
+/// entry point and `max_level` are never read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CagraFields {
+    /// File offset of the first field, right after the index header.
+    pub offset: usize,
+    /// `keep_max_size_level0`: whether level 0's neighbor lists are kept
+    /// at their full size while building. The GPU copy sets it.
+    pub keep_max_size_level0: bool,
+    /// `base_level_only`: whether the graph is searched on level 0 alone,
+    /// from random entry points. k-NN's remote build sets it; an index
+    /// with it set refuses to add vectors.
+    pub base_level_only: bool,
+    /// `num_base_level_search_entrypoints`: how many nodes a search draws
+    /// at random to start from, when `base_level_only` is set. Faiss
+    /// refuses to search with none.
+    pub search_entry_points: i32,
+    /// `numeric_type_` as stored, for `IHc2` only: the storage's numeric
+    /// type as Faiss names it (0 `Float32`, 1 `Float16`, 2 `UInt8`, 3
+    /// `Int8`; see [`numeric_type_name`]). k-NN reads and discards it, and
+    /// the Faiss it builds leaves it uninitialized, so it describes
+    /// nothing and is shown, never checked.
+    pub numeric_type: Option<i32>,
+}
+
+/// The name Faiss gives a `NumericType`, or `None` for a number it does
+/// not define.
+#[must_use]
+pub fn numeric_type_name(numeric_type: i32) -> Option<&'static str> {
+    Some(match numeric_type {
+        0 => "Float32",
+        1 => "Float16",
+        2 => "UInt8",
+        3 => "Int8",
+        _ => return None,
+    })
+}
+
+/// Which graph an index holds: the HNSW graph k-NN's local build writes,
+/// or the CAGRA graph its remote index build writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphKind {
+    /// `IHNf`, `IHNs`, or `IBHf`: an HNSW graph, searched from its entry
+    /// point down its levels.
+    Hnsw,
+    /// `IHc2`, `IHNc`, or `IBHc`: a CAGRA graph, with the fields that
+    /// follow its header.
+    Cagra(CagraFields),
+}
+
+impl GraphKind {
+    /// `hnsw` or `cagra`.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Hnsw => "hnsw",
+            Self::Cagra(_) => "cagra",
+        }
+    }
+
+    /// The CAGRA fields, for a CAGRA graph.
+    #[must_use]
+    pub fn cagra(&self) -> Option<&CagraFields> {
+        match self {
+            Self::Hnsw => None,
+            Self::Cagra(fields) => Some(fields),
+        }
+    }
+}
+
 /// An HNSW index: the graph plus its storage.
 #[derive(Debug, Clone, Copy)]
 pub struct HnswIndex<'a> {
     /// `IHNf` over float32 storage, `IHNs` over fp16, bf16, or byte, or
-    /// `IBHf` over binary storage or none.
+    /// `IBHf` over binary storage or none; or `IHc2` (or `IHNc`) over any
+    /// of the float storages or none, or `IBHc` over binary storage, for
+    /// a CAGRA graph.
     pub fourcc: FourCc,
     /// The HNSW index's own header.
     pub header: IndexHeader,
+    /// Whether the graph is an HNSW or a CAGRA one, with the latter's
+    /// fields.
+    pub kind: GraphKind,
     /// The graph.
     pub graph: HnswGraph<'a>,
     /// The vectors; `None` for a graph without them (`null` in the file).
     /// k-NN's local build writes such a graph under `IBHf` for an
     /// `on_disk` field, or a float field whose `sq` encoder keeps 1, 2, or
-    /// 4 bits, keeping the quantized vectors in Lucene's files. (Its remote
-    /// build writes `null` under a CAGRA graph, `IHc2`, for the latter, a
-    /// layout this crate refuses.)
+    /// 4 bits, keeping the quantized vectors in Lucene's files; its remote
+    /// build writes `null` under `IHc2` for the latter.
     pub storage: Option<Storage<'a>>,
+}
+
+impl HnswIndex<'_> {
+    /// Whether Faiss searches the graph on level 0 alone, from random
+    /// entry points, never reading its entry point or `max_level`: a
+    /// CAGRA graph with `base_level_only` set, as k-NN's remote build
+    /// writes it. An HNSW graph, or a CAGRA one without the flag, is
+    /// searched from its entry point down its levels.
+    #[must_use]
+    pub fn base_level_only(&self) -> bool {
+        self.kind.cagra().is_some_and(|c| c.base_level_only)
+    }
+
+    /// Nodes on each level a search of this index reads, level 0 first:
+    /// level 0 alone for a graph searched on its base level only
+    /// ([`Self::base_level_only`]), whatever its `max_level` says, else
+    /// [`HnswGraph::level_counts`].
+    #[must_use]
+    pub fn level_counts(&self) -> Vec<usize> {
+        if !self.base_level_only() {
+            return self.graph.level_counts();
+        }
+        if self.graph.node_count() == 0 || self.graph.cum_nneighbor_per_level.len() < 2 {
+            return Vec::new();
+        }
+        vec![self.graph.levels.iter().filter(|l| l.get() >= 1).count()]
+    }
 }
 
 /// `IndexIDMap` or `IndexBinaryIDMap`: the outermost index, mapping node
@@ -935,6 +1075,8 @@ impl IdMapIndex<'_> {
     /// toward that space, not Hamming distance), records the space in both
     /// headers, and reads it back from the ID map's when it loads the file
     /// (`FaissFlatIndexFactory.maybeSetFlatBinaryIndex` at tag 3.9.0.0).
+    /// Its remote build writes the same space in both headers of a CAGRA
+    /// graph without its vectors.
     #[must_use]
     pub fn metric(&self) -> Metric {
         match &self.index.storage {
@@ -961,10 +1103,11 @@ impl IdMapIndex<'_> {
 ///
 /// # Errors
 ///
-/// Returns an error for any fourcc or HNSW and storage pairing outside the
-/// supported layouts, a scalar quantizer type other than `QT_fp16`,
-/// `QT_bf16`, or `QT_8bit_direct_signed`, a negative dimension, count, or
-/// code size, a count beyond what Faiss accepts, or a structure running
+/// Returns an error for any fourcc or graph and storage pairing outside
+/// the supported layouts, a scalar quantizer type other than `QT_fp16`,
+/// `QT_bf16`, or `QT_8bit_direct_signed`, `QT_bf16` under a CAGRA graph
+/// (which k-NN's remote build never writes), a negative dimension, count,
+/// or code size, a count beyond what Faiss accepts, or a structure running
 /// past the data.
 pub fn parse(payload: &[u8], base: usize) -> Result<IdMapIndex<'_>> {
     let mut cur = Cursor::new(payload, base);
@@ -983,38 +1126,73 @@ pub fn parse(payload: &[u8], base: usize) -> Result<IdMapIndex<'_>> {
     let hnsw_offset = cur.offset();
     let hnsw_fourcc = expect_fourcc(
         &mut cur,
-        &[FourCc::HNSW_FLAT, FourCc::HNSW_SQ],
-        "IHNf or IHNs",
+        &[
+            FourCc::HNSW_FLAT,
+            FourCc::HNSW_SQ,
+            FourCc::HNSW_CAGRA,
+            FourCc::HNSW_CAGRA_OLD,
+        ],
+        "IHNf, IHNs, IHc2, or IHNc",
     )?;
     let hnsw_header = IndexHeader::read(&mut cur, hnsw_offset)?;
+    let kind = if hnsw_fourcc == FourCc::HNSW_FLAT || hnsw_fourcc == FourCc::HNSW_SQ {
+        GraphKind::Hnsw
+    } else {
+        GraphKind::Cagra(CagraFields::read(
+            &mut cur,
+            hnsw_fourcc == FourCc::HNSW_CAGRA,
+        )?)
+    };
     let graph = HnswGraph::read(&mut cur)?;
 
-    // Faiss reads any storage under any HNSW tag; k-NN writes each tag
-    // over one kind only, and only those pairs are accepted.
+    // Faiss reads any storage under any graph tag; k-NN's local build
+    // writes each HNSW tag over one kind only, and only those pairs are
+    // accepted. Its remote build writes the CAGRA tag over whichever
+    // storage the local build would have written for the field, or over
+    // none for a float field whose `sq` encoder keeps 1, 2, or 4 bits.
     let storage_offset = cur.offset();
-    let storage = Some(if hnsw_fourcc == FourCc::HNSW_SQ {
-        expect_fourcc(&mut cur, &[FourCc::SCALAR_QUANTIZER], "IxSQ")?;
+    let accepted: (&[FourCc], &'static str) = match kind {
+        GraphKind::Hnsw if hnsw_fourcc == FourCc::HNSW_SQ => (&[FourCc::SCALAR_QUANTIZER], "IxSQ"),
+        GraphKind::Hnsw => (&[FourCc::FLAT_L2, FourCc::FLAT_IP], "IxF2 or IxFI"),
+        GraphKind::Cagra(_) => (
+            &[
+                FourCc::FLAT_L2,
+                FourCc::FLAT_IP,
+                FourCc::SCALAR_QUANTIZER,
+                FourCc::NULL,
+            ],
+            "IxF2, IxFI, IxSQ, or null",
+        ),
+    };
+    let storage_fourcc = expect_fourcc(&mut cur, accepted.0, accepted.1)?;
+    let storage = if storage_fourcc == FourCc::NULL {
+        None
+    } else if storage_fourcc == FourCc::SCALAR_QUANTIZER {
         let header = IndexHeader::read(&mut cur, storage_offset)?;
         let (quantizer, format) = ScalarQuantizer::read(&mut cur)?;
-        Storage::Sq(SqStorage {
+        // The remote build takes no bf16 field, so it never writes bf16
+        // codes under a CAGRA graph.
+        if matches!(kind, GraphKind::Cagra(_)) && format == CodeFormat::Bf16 {
+            return Err(Error::UnexpectedQuantizer {
+                offset: quantizer.offset,
+                qtype: quantizer.qtype,
+                graph: hnsw_fourcc,
+            });
+        }
+        Some(Storage::Sq(SqStorage {
             header,
             quantizer,
             format,
             codes: cur.vector("scalar-quantized codes")?,
-        })
+        }))
     } else {
-        let fourcc = expect_fourcc(
-            &mut cur,
-            &[FourCc::FLAT_L2, FourCc::FLAT_IP],
-            "IxF2 or IxFI",
-        )?;
         let header = IndexHeader::read(&mut cur, storage_offset)?;
-        Storage::Flat(FlatStorage {
-            fourcc,
+        Some(Storage::Flat(FlatStorage {
+            fourcc: storage_fourcc,
             header,
             codes: cur.xb_vector("vectors")?,
-        })
-    });
+        }))
+    };
 
     let id_map = cur.vector("id_map")?;
 
@@ -1024,6 +1202,7 @@ pub fn parse(payload: &[u8], base: usize) -> Result<IdMapIndex<'_>> {
         index: HnswIndex {
             fourcc: hnsw_fourcc,
             header: hnsw_header,
+            kind,
             graph,
             storage,
         },
@@ -1032,25 +1211,59 @@ pub fn parse(payload: &[u8], base: usize) -> Result<IdMapIndex<'_>> {
     })
 }
 
+impl CagraFields {
+    /// Reads the fields that follow a CAGRA graph's header: two bools,
+    /// the entry-point count, and, under `IHc2` (`with_numeric_type`),
+    /// the numeric type.
+    fn read(cur: &mut Cursor<'_>, with_numeric_type: bool) -> Result<Self> {
+        let offset = cur.offset();
+        let keep_max_size_level0 = cur.u8("keep_max_size_level0 flag")? != 0;
+        let base_level_only = cur.u8("base_level_only flag")? != 0;
+        let search_entry_points = cur.i32("search entry point count")?;
+        let numeric_type = if with_numeric_type {
+            Some(cur.i32("numeric type")?)
+        } else {
+            None
+        };
+        Ok(Self {
+            offset,
+            keep_max_size_level0,
+            base_level_only,
+            search_entry_points,
+            numeric_type,
+        })
+    }
+}
+
 /// The rest of a binary layout, `IBMp` read: its header, `IBHf` with its
 /// header and graph, `IBxF` with its header and codes or `null`, then the
-/// labels.
+/// labels; or `IBHc` with its header, its CAGRA fields, and graph, then
+/// `IBxF`, which is all k-NN's remote build writes under it.
 fn parse_binary(mut cur: Cursor<'_>, offset: usize) -> Result<IdMapIndex<'_>> {
     let header = IndexHeader::read_binary(&mut cur, offset)?;
 
     let hnsw_offset = cur.offset();
-    expect_fourcc(&mut cur, &[FourCc::BINARY_HNSW], "IBHf")?;
+    let hnsw_fourcc = expect_fourcc(
+        &mut cur,
+        &[FourCc::BINARY_HNSW, FourCc::BINARY_HNSW_CAGRA],
+        "IBHf or IBHc",
+    )?;
     let hnsw_header = IndexHeader::read_binary(&mut cur, hnsw_offset)?;
+    let kind = if hnsw_fourcc == FourCc::BINARY_HNSW_CAGRA {
+        GraphKind::Cagra(CagraFields::read(&mut cur, false)?)
+    } else {
+        GraphKind::Hnsw
+    };
     let graph = HnswGraph::read(&mut cur)?;
 
     // k-NN's patched `write_index_binary` writes `null` and nothing else
-    // in place of the storage it leaves out.
+    // in place of the storage it leaves out, under `IBHf` only.
     let storage_offset = cur.offset();
-    let storage_fourcc = expect_fourcc(
-        &mut cur,
-        &[FourCc::BINARY_FLAT, FourCc::NULL],
-        "IBxF or null",
-    )?;
+    let accepted: (&[FourCc], &'static str) = match kind {
+        GraphKind::Hnsw => (&[FourCc::BINARY_FLAT, FourCc::NULL], "IBxF or null"),
+        GraphKind::Cagra(_) => (&[FourCc::BINARY_FLAT], "IBxF"),
+    };
+    let storage_fourcc = expect_fourcc(&mut cur, accepted.0, accepted.1)?;
     let storage = if storage_fourcc == FourCc::NULL {
         None
     } else {
@@ -1067,8 +1280,9 @@ fn parse_binary(mut cur: Cursor<'_>, offset: usize) -> Result<IdMapIndex<'_>> {
         fourcc: FourCc::BINARY_ID_MAP,
         header,
         index: HnswIndex {
-            fourcc: FourCc::BINARY_HNSW,
+            fourcc: hnsw_fourcc,
             header: hnsw_header,
+            kind,
             graph,
             storage,
         },

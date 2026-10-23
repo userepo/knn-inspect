@@ -327,15 +327,21 @@ distance (the `binary` data type, whose only space is `hamming`, and
 float fields with the binary encoder); and the same binary ID map and
 HNSW graph without its vectors, which k-NN 3.9's local build writes for
 an `on_disk` field or an `sq` encoder of 1, 2, or 4 bits, keeping the
-quantized vectors in Lucene's files; with or without the Lucene footer.
-Every command reads all of them, except that `recall` on a graph without
-its vectors needs the segment's `.fnm` and the field's `.vemq`, `.veq`,
-`.vemf`, and `.vec` loose, not in a compound file. Fixtures and format
-notes target OpenSearch 3.9.0.
+quantized vectors in Lucene's files; and the CAGRA graphs k-NN's remote
+index build writes in place of the HNSW ones (CAGRA, Cuda Anns
+GRAph-based, is the GPU-built graph index of NVIDIA's cuVS library;
+`IHc2` over float32, fp16, or byte storage or none, `IBHc` over binary
+storage), which Faiss searches on their base level alone, from random
+entry points; with or
+without the Lucene footer. Every command reads all of them, except that
+`recall` on a graph without its vectors needs the segment's `.fnm` and
+the field's `.vemq`, `.veq`, `.vemf`, and `.vec` loose, not in a
+compound file, and `recall` refuses a CAGRA graph: its search from
+random entry points comes in a later release. Fixtures and format notes target
+OpenSearch 3.9.0.
 
 Not yet: other scalar-quantized storage, product quantization, IVF, and
-the CAGRA graphs (`IHc2`, or `IBHc` for a binary field) that k-NN's
-remote index build writes. Files in
+`recall` on CAGRA graphs. Files in
 another layout or scalar quantizer type are refused rather than misread:
 `verify` fails them, and `scan` reports those whose footer verifies as
 `unsupported`. NMSLIB and Lucene-engine fields write no `.faiss` file,
@@ -374,6 +380,12 @@ whose results come from Lucene 10.5.1 itself.
 - `fixtures/synthetic-binary/` - three binary files, one of 8 bits whose
   1,000 vectors take only 251 values, so distances nearly all tie, each
   with an `.expected.json`
+- `fixtures/synthetic-cagra/` - five files in the layouts k-NN's remote
+  index build writes, two float32, one fp16, one byte, and one binary,
+  each a CAGRA graph of its base level over 64-dimensional vectors, with
+  an `.expected.json`; faiss-cpu builds the base level as an HNSW graph,
+  then the file is cut to what the GPU copy leaves (see
+  `docs/format-notes.md`)
 - `fixtures/opensearch-3.9.0-binary/` - real segments of a binary field
   of 128 bits, the signs of the `l2` vectors (`binary/hamming/`); of a
   float field with the binary encoder, one bit per component

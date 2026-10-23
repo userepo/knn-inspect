@@ -6,8 +6,11 @@
 //! and node it points at. Nothing here panics on malformed input: a file
 //! that does not parse is reported as a failed [`Check::Structure`].
 //!
-//! [`graph_stats`] reports per-level node counts, out-degree histograms,
-//! and the nodes no search can reach.
+//! [`index_stats`] reports per-level node counts, out-degree histograms,
+//! and the nodes no search can reach, as Faiss searches the graph:
+//! [`graph_stats`] from the entry point, or [`base_level_stats`] from
+//! random entry points on level 0, as it searches the CAGRA graph k-NN's
+//! remote index build writes.
 
 mod checks;
 mod stats;
@@ -15,7 +18,7 @@ mod stats;
 use serde::Serialize;
 
 pub use checks::verify;
-pub use stats::{GraphStats, LayerStats, graph_stats};
+pub use stats::{GraphStats, LayerStats, base_level_stats, graph_stats, index_stats};
 
 /// How much a finding matters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -103,7 +106,12 @@ pub enum Check {
     /// at 1, 2, or 4 bits per component, as Lucene packs it, plus 16
     /// bytes of correction factors. Its dimension and count must still
     /// agree, as every layout's must, and a negative value is refused
-    /// when the file is parsed.
+    /// when the file is parsed. For the CAGRA graph k-NN's remote build
+    /// writes, the fields after its header too: a search draws its
+    /// entry points at random, so a count of none fails (Faiss refuses
+    /// every search); a flag k-NN's builder sets but the file has off
+    /// warns (`base_level_only`, without which Faiss searches the graph
+    /// as HNSW, and `keep_max_size_level0`, which changes no search).
     Headers,
     /// `--space` matches the metric the file records. With `--space
     /// cosine`, byte storage is also reported, as a warning or, when the
@@ -116,9 +124,16 @@ pub enum Check {
     Metric,
     /// Neighbor offsets are monotonic and end at the neighbor array.
     Offsets,
-    /// Node levels match the per-node slot counts and the level table.
+    /// Node levels match the per-node slot counts and the level table,
+    /// and `max_level` is the highest node level. A CAGRA graph of its
+    /// base level is searched on level 0 alone: its `max_level`, never
+    /// read, warns when it is not the -1 k-NN's builder writes, and so
+    /// does a neighbor on an upper level, which the builder leaves empty.
     Levels,
-    /// The entry point exists and sits on the top level.
+    /// The entry point exists and sits on the top level. A CAGRA graph of
+    /// its base level is searched from random entry points: its entry
+    /// point, never read, warns when it is not the -1 k-NN's builder
+    /// writes.
     EntryPoint,
     /// Every neighbor slot is -1 or a node id.
     NeighborIds,

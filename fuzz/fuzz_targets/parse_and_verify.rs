@@ -163,16 +163,21 @@ fuzz_target!(|data: &[u8]| {
         }
         // Reachability walks every edge, so a corrupt graph exercises it
         // as much as a clean one.
-        let stats = knn_check::graph_stats(graph);
+        let stats = knn_check::index_stats(&parsed.index.index);
         assert_eq!(stats.nodes, graph.node_count());
-        assert_eq!(stats.layers.len(), graph.level_counts().len());
+        assert_eq!(stats.layers.len(), parsed.index.index.level_counts().len());
+        let _ = knn_check::graph_stats(graph);
         let _ = parsed.index.metric();
         let _ = parsed.index.code_size();
         let _ = parsed.index.layout();
+        let _ = parsed.index.index.kind.cagra();
+        let _ = parsed.index.index.base_level_only();
         // The search k-NN runs with Lucene's searcher, over any graph,
         // with or without its vectors: scores from the node ids, many of
         // them tied, for k below, at, and past the node count, with and
-        // without a visit limit.
+        // without a visit limit. Over a CAGRA graph of its base level it
+        // starts from the -1 entry point and finds nothing, as documented;
+        // it must still not panic.
         let n = graph.node_count();
         for k in [1, 3, n, n + 2] {
             for limit in [u64::from(i32::MAX.unsigned_abs()), 4] {
@@ -190,12 +195,18 @@ fuzz_target!(|data: &[u8]| {
         }
         'storage: {
             let Some(storage) = &parsed.index.index.storage else {
-                // A graph without its vectors: nothing to search.
+                // A graph without its vectors: nothing to search; a CAGRA
+                // graph of its base level is refused before that is seen.
                 let mut searcher = knn_recall::Searcher::new(graph.node_count());
-                assert!(matches!(
-                    searcher.search(&parsed.index.index, &[0.0_f32][..], 3, 5),
-                    Err(knn_recall::Error::NoVectors)
-                ));
+                let searched = searcher.search(&parsed.index.index, &[0.0_f32][..], 3, 5);
+                if parsed.index.index.base_level_only() {
+                    assert!(matches!(
+                        searched,
+                        Err(knn_recall::Error::RandomEntryPoints)
+                    ));
+                } else {
+                    assert!(matches!(searched, Err(knn_recall::Error::NoVectors)));
+                }
                 break 'storage;
             };
             // The HNSW search over an arbitrary graph and any storage,
@@ -210,7 +221,13 @@ fuzz_target!(|data: &[u8]| {
             };
             if let Some(query) = query {
                 let mut searcher = knn_recall::Searcher::new(graph.node_count());
-                if let Ok(hits) = searcher.search(&parsed.index.index, query, 3, 5) {
+                // A CAGRA graph of its base level is refused, not searched.
+                let searched = searcher.search(&parsed.index.index, query, 3, 5);
+                assert_eq!(
+                    matches!(searched, Err(knn_recall::Error::RandomEntryPoints)),
+                    parsed.index.index.base_level_only()
+                );
+                if let Ok(hits) = searched {
                     assert!(hits.len() <= 3);
                     // Padded to k, or to the node count when the graph is
                     // smaller: no list can hold more.

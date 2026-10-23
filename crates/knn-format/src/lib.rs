@@ -16,9 +16,12 @@
 //! index over `IBxF` packed bits (the `binary` data type, and float
 //! fields with the `binary` encoder), or over `null`: a graph whose
 //! vectors k-NN keeps in Lucene's files instead (an `on_disk` field, or
-//! one whose `sq` encoder keeps 1, 2, or 4 bits). See
-//! `docs/format-notes.md` in the repository for the byte-level
-//! description.
+//! one whose `sq` encoder keeps 1, 2, or 4 bits). k-NN's remote index
+//! build writes the same layouts with a CAGRA graph in place of the HNSW
+//! one: `IHc2` (or Faiss's older `IHNc`) over any of the float storages,
+//! or over `null` for an `sq` encoder of 1, 2, or 4 bits, and `IBHc` over
+//! `IBxF`. See `docs/format-notes.md` in the repository for the
+//! byte-level description.
 //!
 //! [`segment_info`] reads one more Lucene file of the segment, as far as
 //! the document count: the segment info (`.si`). [`flat_vectors`] reads

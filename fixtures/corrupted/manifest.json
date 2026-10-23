@@ -458,5 +458,65 @@
       "check": "metric",
       "severity": "failure"
     }
+  },
+  {
+    "file": "cagra-entry-point-set.faiss",
+    "source": "fixtures/synthetic-cagra/ip-100x64-cagra.faiss",
+    "mutation": "a CAGRA graph's entry point set to 0, which no search reads; the builder writes -1",
+    "space": null,
+    "expect": {
+      "check": "entry_point",
+      "severity": "warning"
+    }
+  },
+  {
+    "file": "cagra-max-level-set.faiss",
+    "source": "fixtures/synthetic-cagra/ip-100x64-cagra.faiss",
+    "mutation": "a CAGRA graph's max_level set to 0, which no search reads; the builder writes -1",
+    "space": null,
+    "expect": {
+      "check": "levels",
+      "severity": "warning"
+    }
+  },
+  {
+    "file": "cagra-upper-level-neighbor.faiss",
+    "source": "fixtures/synthetic-cagra/ip-100x64-cagra.faiss",
+    "mutation": "a CAGRA graph's node given a neighbor on level 1, which no search reads; the builder leaves the upper levels empty",
+    "space": null,
+    "expect": {
+      "check": "levels",
+      "severity": "warning"
+    }
+  },
+  {
+    "file": "cagra-no-search-entry-points.faiss",
+    "source": "fixtures/synthetic-cagra/ip-100x64-cagra.faiss",
+    "mutation": "a CAGRA graph's random entry point count set to 0, with which Faiss finds no entry point and refuses every search",
+    "space": null,
+    "expect": {
+      "check": "headers",
+      "severity": "failure"
+    }
+  },
+  {
+    "file": "cagra-keep-max-size-off.faiss",
+    "source": "fixtures/synthetic-cagra/ip-100x64-cagra.faiss",
+    "mutation": "a CAGRA graph's keep_max_size_level0 flag cleared, which changes no search; the builder sets it",
+    "space": null,
+    "expect": {
+      "check": "headers",
+      "severity": "warning"
+    }
+  },
+  {
+    "file": "cagra-not-base-level-only.faiss",
+    "source": "fixtures/synthetic-cagra/ip-100x64-cagra.faiss",
+    "mutation": "a CAGRA graph's base_level_only flag cleared, so Faiss searches it as HNSW from its entry point, which is -1 in a graph of 100 nodes (the headers check warns of the flag)",
+    "space": null,
+    "expect": {
+      "check": "entry_point",
+      "severity": "failure"
+    }
   }
 ]

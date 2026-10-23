@@ -2711,3 +2711,223 @@ fn recall_reads_a_binary_files_rows_by_its_code_size() {
     let o = run(&["recall", file.to_str().unwrap(), "--sample", "5", "--json"]);
     assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
 }
+
+#[test]
+fn cagra_graphs_are_read_by_every_command_but_recall() {
+    // k-NN's remote index build writes a CAGRA graph of its base level:
+    // info names it, verify holds it to what the builder writes, stats
+    // reports its one level, scan sees it, and recall refuses it with a
+    // reason, since Faiss searches it from random entry points.
+    let dir = fixtures().join("synthetic-cagra");
+    let file = dir.join("l2-100x64-fp16-cagra.faiss");
+    let path = file.to_str().unwrap();
+
+    let o = run(&["info", "--json", path]);
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["layout"], serde_json::json!(["IxMp", "IHc2", "IxSQ"]));
+    assert_eq!(v["graph"], "cagra", "{v}");
+    assert_eq!(
+        v["cagra"],
+        serde_json::json!({
+            "keep_max_size_level0": true,
+            "base_level_only": true,
+            "search_entry_points": 32,
+            "numeric_type": 1
+        }),
+        "{v}"
+    );
+    assert_eq!(v["quantizer"]["name"], "QT_fp16", "{v}");
+    assert_eq!(v["hnsw"]["entry_point"], -1, "{v}");
+    assert_eq!(v["hnsw"]["max_level"], -1, "{v}");
+    assert_eq!(v["hnsw"]["level_counts"], serde_json::json!([100]), "{v}");
+    let text = stdout(&run(&["info", path]));
+    assert!(
+        text.contains("  layout          IxMp > IHc2 > IxSQ\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "  graph           CAGRA (k-NN's remote index build), base level only, 32 random entry points per search\n"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "  cagra fields    keep_max_size_level0 1, base_level_only 1, numeric type 1 (Float16; stored, never read)\n"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("  levels          100 (max level -1), entry point -1\n"),
+        "{text}"
+    );
+    // An HNSW file names its graph in JSON only; its text is unchanged.
+    let hnsw = fixtures().join("synthetic/l2-100x4.faiss");
+    let o = run(&["info", "--json", hnsw.to_str().unwrap()]);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["graph"], "hnsw", "{v}");
+    assert!(v.get("cagra").is_none(), "{v}");
+    assert!(!stdout(&run(&["info", hnsw.to_str().unwrap()])).contains("  graph "));
+
+    let o = run(&["verify", "--space", "l2", path]);
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+    let text = stdout(&o);
+    assert!(text.contains("pass  entry_point"), "{text}");
+    assert!(text.contains("pass  levels"), "{text}");
+    assert!(text.ends_with("clean; exit code 0\n"), "{text}");
+    let binary = dir.join("hamming-100x64-binary-cagra.faiss");
+    let o = run(&["verify", "--space", "hamming", binary.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+
+    let o = run(&["stats", "--json", path]);
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["entry_point"], -1, "{v}");
+    assert_eq!(v["layers"].as_array().unwrap().len(), 1, "{v}");
+    assert_eq!(v["layers"][0]["nodes"], 100, "{v}");
+    assert_eq!(v["layers"][0]["slots"], 32, "{v}");
+    assert_eq!(v["layers"][0]["unreachable"], 0, "{v}");
+    let text = stdout(&run(&["stats", path]));
+    assert!(
+        text.contains("  nodes           100, entry point -1, max level -1\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("  level 0         100 nodes, 32 slots, 3200 edges, 0 unreachable\n"),
+        "{text}"
+    );
+}
+
+#[test]
+fn cagra_graphs_refuse_recall_and_scan_clean() {
+    let dir = fixtures().join("synthetic-cagra");
+    let file = dir.join("l2-100x64-fp16-cagra.faiss");
+    let path = file.to_str().unwrap();
+    let binary = dir.join("hamming-100x64-binary-cagra.faiss");
+
+    // recall: a verdict naming the release that searches it, exit 1,
+    // whatever the options.
+    let queries = fixtures().join("synthetic/l2-4000x64.queries.f32");
+    for args in [
+        vec!["recall", path, "--queries", queries.to_str().unwrap()],
+        vec!["recall", path, "--sample", "5", "--json"],
+        vec!["recall", binary.to_str().unwrap(), "--sample", "5"],
+    ] {
+        let o = run(&args);
+        assert_eq!(o.status.code(), Some(1), "{args:?}: {}", stdout(&o));
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(
+            err.contains("a CAGRA graph (k-NN's remote index build), searched from random entry points on its base level; recall does not search it yet"),
+            "{args:?}: {err}"
+        );
+        assert!(stdout(&o).is_empty(), "{args:?}");
+    }
+
+    // scan: every file of the directory is a clean bare file with no
+    // .vec beside it.
+    let o = run(&["scan", dir.to_str().unwrap(), "--json"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(
+        v["summary"],
+        serde_json::json!({"files": 5, "clean": 5, "warnings": 0, "unsupported": 0, "failed": 0}),
+        "{v}"
+    );
+    let text = stdout(&run(&["scan", dir.to_str().unwrap()]));
+    assert!(text.contains("IxMp > IHc2 > IxSQ  d=64 n=100 l2"), "{text}");
+    assert!(
+        text.contains("IBMp > IBHc > IBxF  d=64 bits n=100 hamming"),
+        "{text}"
+    );
+
+    // A CAGRA graph without its vectors, as the remote build writes a
+    // float field whose sq encoder keeps 1, 2, or 4 bits: its float
+    // headers record no code size to hold a .veq's records to, so scan
+    // says so instead of judging the field, and the file stays clean.
+    let bytes = std::fs::read(dir.join("ip-100x64-cagra.faiss")).unwrap();
+    let storage = bytes.windows(4).position(|w| w == b"IxFI").unwrap();
+    let count_at = storage + 4 + 33;
+    let floats = usize::try_from(u64::from_le_bytes(
+        bytes[count_at..count_at + 8].try_into().unwrap(),
+    ))
+    .unwrap();
+    let mut graph_only = bytes[..storage].to_vec();
+    graph_only.extend_from_slice(b"null");
+    graph_only.extend_from_slice(&bytes[count_at + 8 + floats * 4..]);
+    let scratch = Scratch::new("cagra-graph-only");
+    let null_path = scratch.0.join("_0_165_vec.faiss");
+    std::fs::write(&null_path, &graph_only).unwrap();
+    let o = run(&["scan", scratch.0.to_str().unwrap(), "--json"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    let f = &v["files"][0];
+    assert_eq!(f["status"], "clean", "{f}");
+    assert_eq!(
+        f["layout"],
+        serde_json::json!(["IxMp", "IHc2", "null"]),
+        "{f}"
+    );
+    assert_eq!(f["metric"], "inner_product", "{f}");
+    assert!(f.get("code_size").is_none(), "{f}");
+    assert_eq!(f["lucene_quantized"]["status"], "skipped", "{f}");
+    assert!(
+        f["lucene_quantized"]["detail"]
+            .as_str()
+            .unwrap()
+            .starts_with("the native file holds a CAGRA graph without its vectors"),
+        "{f}"
+    );
+    let o = run(&["info", null_path.to_str().unwrap()]);
+    let text = stdout(&o);
+    assert!(
+        text.contains("  layout          IxMp > IHc2 > null\n"),
+        "{text}"
+    );
+    assert!(text.contains("  dimension       64\n"), "{text}");
+    assert!(
+        text.contains("  storage         none: k-NN keeps the field's quantized vectors in Lucene's .veq file\n"),
+        "{text}"
+    );
+}
+
+#[test]
+fn bf16_under_a_cagra_graph_fails_the_structure_check() {
+    // bf16 codes under a CAGRA graph, which the remote build never writes:
+    // the structure check names the quantizer type and the graph. Without
+    // a footer nothing says the file is sound, so it fails rather than
+    // counting as unsupported.
+    let dir = fixtures().join("synthetic-cagra");
+    let bytes = std::fs::read(dir.join("l2-100x64-fp16-cagra.faiss")).unwrap();
+    let qtype_at = bytes.windows(4).position(|w| w == b"IxSQ").unwrap() + 4 + 33;
+    let mut bf16 = bytes.clone();
+    bf16[qtype_at..qtype_at + 4].copy_from_slice(&7_i32.to_le_bytes());
+    let scratch = Scratch::new("cagra-bf16");
+    let bf16_path = scratch.0.join("_0_165_vec.faiss");
+    std::fs::write(&bf16_path, &bf16).unwrap();
+    let o = run(&["scan", scratch.0.to_str().unwrap(), "--json"]);
+    assert_eq!(o.status.code(), Some(1), "{}", stdout(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    let f = &v["files"][0];
+    assert_eq!(f["status"], "failed", "{f}");
+    let structure = f["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "structure")
+        .unwrap();
+    let message = structure["findings"][0]["message"].as_str().unwrap();
+    assert!(
+        message.starts_with(&format!(
+            "scalar quantizer type 7 (QT_bf16) at offset {qtype_at} under IHc2"
+        )),
+        "{message}"
+    );
+    assert_eq!(
+        f["lucene_quantized"]["detail"], "the native file did not parse",
+        "{f}"
+    );
+    let o = run(&["verify", bf16_path.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(1), "{}", stdout(&o));
+    assert!(stdout(&o).contains("FAIL  structure"), "{}", stdout(&o));
+}

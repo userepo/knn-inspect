@@ -70,6 +70,7 @@ fn synthetic_fixtures_are_clean() {
         "synthetic-bf16",
         "synthetic-byte",
         "synthetic-binary",
+        "synthetic-cagra",
     ]
     .into_iter()
     .flat_map(|d| fs::read_dir(fixtures().join(d)).unwrap());
@@ -102,8 +103,154 @@ fn synthetic_fixtures_are_clean() {
         seen += 1;
     }
     assert_eq!(
-        seen, 18,
-        "five float, three fp16, three bf16, four byte, and three binary synthetic fixtures"
+        seen, 23,
+        "five float, three fp16, three bf16, four byte, three binary, and five CAGRA synthetic fixtures"
+    );
+}
+
+#[test]
+fn a_cagra_graph_is_checked_as_its_search_reads_it() {
+    // k-NN's remote build leaves a CAGRA graph's entry point and max_level
+    // at -1 and its upper levels empty, and Faiss searches level 0 alone
+    // from random entry points: the HNSW rules for the entry point and
+    // max_level do not apply, and the file is clean.
+    let dir = fixtures().join("synthetic-cagra");
+    let bytes = fs::read(dir.join("ip-100x64-cagra.faiss")).unwrap();
+    let report = knn_check::verify(&bytes, &options(Some(Space::Cosine)));
+    assert_eq!(report.status, Status::Clean, "{report:#?}");
+    for check in [Check::EntryPoint, Check::Levels, Check::Headers] {
+        let r = report.result(check).unwrap();
+        assert_eq!(r.count, 0, "{check:?}: {r:#?}");
+        assert!(r.skipped.is_none(), "{check:?}");
+    }
+
+    // Without its vectors, as the remote build writes a float field whose
+    // sq encoder keeps 1, 2, or 4 bits: both float headers are read, the
+    // vector checks are skipped, and the metric is the ID map's.
+    let storage = bytes.windows(4).position(|w| w == b"IxFI").unwrap();
+    let count_at = storage + 4 + 33;
+    let floats = usize::try_from(u64::from_le_bytes(
+        bytes[count_at..count_at + 8].try_into().unwrap(),
+    ))
+    .unwrap();
+    let mut graph_only = bytes[..storage].to_vec();
+    graph_only.extend_from_slice(b"null");
+    graph_only.extend_from_slice(&bytes[count_at + 8 + floats * 4..]);
+    let report = knn_check::verify(&graph_only, &options(Some(Space::InnerProduct)));
+    assert_eq!(report.status, Status::Clean, "{report:#?}");
+    for check in [Check::VectorCount, Check::VectorValues, Check::Norms] {
+        let r = report.result(check).unwrap();
+        assert!(
+            r.skipped
+                .as_deref()
+                .is_some_and(|s| s.contains("graph only") || s.contains("cosine")),
+            "{check:?}: {r:#?}"
+        );
+    }
+    let report = knn_check::verify(&graph_only, &options(Some(Space::L2)));
+    let metric = report.result(Check::Metric).unwrap();
+    assert!(metric.failed(), "{metric:#?}");
+    assert_eq!(
+        metric.findings[0].message,
+        "file records metric inner_product, but an l2 field needs l2"
+    );
+    // The graph header's metric type is read for a float graph: a value
+    // other than the ID map's fails, where a binary graph-only file's
+    // only warns.
+    let hnsw = bytes.windows(4).position(|w| w == b"IHc2").unwrap();
+    let mut b = graph_only.clone();
+    b[hnsw + 4 + 29..hnsw + 4 + 33].copy_from_slice(&1_i32.to_le_bytes());
+    let report = knn_check::verify(&b, &options(None));
+    let headers = report.result(Check::Headers).unwrap();
+    assert!(headers.failed(), "{headers:#?}");
+    assert_eq!(
+        headers.findings[0].message,
+        "hnsw header metric 1 differs from the id map's 0"
+    );
+}
+
+#[test]
+fn cagra_findings_name_what_the_builder_writes() {
+    let dir = fixtures().join("corrupted");
+    let verify = |name: &str| knn_check::verify(&fs::read(dir.join(name)).unwrap(), &options(None));
+
+    let report = verify("cagra-entry-point-set.faiss");
+    assert_eq!(report.status, Status::Warnings, "{report:#?}");
+    let entry = report.result(Check::EntryPoint).unwrap();
+    assert_eq!(
+        entry.findings[0].message,
+        "entry point is 0; a search of this graph starts from random entry points on level 0 and never reads it; k-NN's remote build writes -1"
+    );
+
+    let report = verify("cagra-max-level-set.faiss");
+    let levels = report.result(Check::Levels).unwrap();
+    assert_eq!(levels.count, 1, "{levels:#?}");
+    assert!(
+        levels.findings[0]
+            .message
+            .starts_with("max_level is 0; a search of this graph"),
+        "{levels:#?}"
+    );
+
+    let report = verify("cagra-upper-level-neighbor.faiss");
+    assert_eq!(report.status, Status::Warnings, "{report:#?}");
+    let levels = report.result(Check::Levels).unwrap();
+    assert_eq!(levels.count, 1, "{levels:#?}");
+    assert!(
+        levels.findings[0]
+            .message
+            .contains("lists neighbors on level 1, which a search of this graph never reads"),
+        "{levels:#?}"
+    );
+    assert!(levels.findings[0].node.is_some());
+    assert!(levels.findings[0].offset.is_some());
+
+    let report = verify("cagra-no-search-entry-points.faiss");
+    assert_eq!(report.status, Status::Failed, "{report:#?}");
+    let headers = report.result(Check::Headers).unwrap();
+    assert_eq!(
+        headers.findings[0].message,
+        "the graph draws 0 random entry points per search; Faiss finds no entry point and refuses every search"
+    );
+    // The count follows the two flag bytes after the graph's header.
+    let bytes = fs::read(dir.join("cagra-no-search-entry-points.faiss")).unwrap();
+    let hnsw = bytes.windows(4).position(|w| w == b"IHc2").unwrap();
+    assert_eq!(headers.findings[0].offset, Some(hnsw + 4 + 33 + 2));
+
+    let report = verify("cagra-keep-max-size-off.faiss");
+    assert_eq!(report.status, Status::Warnings, "{report:#?}");
+    let headers = report.result(Check::Headers).unwrap();
+    assert!(
+        headers.findings[0]
+            .message
+            .starts_with("the graph's keep_max_size_level0 flag is off"),
+        "{headers:#?}"
+    );
+    assert_eq!(headers.findings[0].offset, Some(hnsw + 4 + 33));
+
+    // Without base_level_only, the graph is an HNSW graph to Faiss: the
+    // flag warns, and the -1 entry point fails as any HNSW graph's would.
+    let report = verify("cagra-not-base-level-only.faiss");
+    assert_eq!(report.status, Status::Failed, "{report:#?}");
+    let headers = report.result(Check::Headers).unwrap();
+    assert_eq!(headers.severity, Some(Severity::Warning), "{headers:#?}");
+    assert!(
+        headers.findings[0]
+            .message
+            .starts_with("the graph's base_level_only flag is off"),
+        "{headers:#?}"
+    );
+    let entry = report.result(Check::EntryPoint).unwrap();
+    assert_eq!(
+        entry.findings[0].message,
+        "entry point -1 is not a node (count 100)"
+    );
+    let levels = report.result(Check::Levels).unwrap();
+    assert!(
+        levels.findings[0]
+            .message
+            .starts_with("max_level is -1 but the highest node level implies"),
+        "{levels:#?}"
     );
 }
 

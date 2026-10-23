@@ -17,7 +17,11 @@ read the binary headers and codes. The `graph-only-` cases turn that
 file into a graph without its vectors, as k-NN writes an `on_disk`
 field's (`null` in place of the `IBxF` storage, the graph's code size a
 2-byte quantized vector plus 16 bytes of correction factors), then
-mutate it, for the header rules of that layout.
+mutate it, for the header rules of that layout. The `cagra-` cases
+mutate the smallest float CAGRA file, for the rules of a graph searched
+from random entry points: its entry point, `max_level`, and upper levels
+are never read, so what the builder leaves in them warns rather than
+fails, and its own fields have rules of their own.
 
 Usage:
     python tools/make_corrupted.py [--out fixtures/corrupted]
@@ -41,6 +45,7 @@ SYNTHETIC_FP16 = ROOT / "fixtures/synthetic-fp16/l2-100x4-fp16.faiss"
 SYNTHETIC_BF16 = ROOT / "fixtures/synthetic-bf16/l2-100x4-bf16.faiss"
 SYNTHETIC_BYTE = ROOT / "fixtures/synthetic-byte/l2-100x4-byte.faiss"
 SYNTHETIC_BINARY = ROOT / "fixtures/synthetic-binary/hamming-100x16-binary.faiss"
+SYNTHETIC_CAGRA = ROOT / "fixtures/synthetic-cagra/ip-100x64-cagra.faiss"
 REAL_L2 = ROOT / "fixtures/opensearch-3.9.0/nocfs/l2/_2_165_vec.faiss"
 
 
@@ -389,6 +394,50 @@ def build() -> Cases:
     c.add("graph-only-metric-unknown", SYNTHETIC_BINARY, "as a graph without its vectors, both headers' metric type set to 2, neither L2 nor inner product, which k-NN refuses to load", "headers", "failure", graph_only(graph_metric_unknown))
 
     c.add("hamming-float-file", SYNTHETIC_L2, "an L2 float file verified with --space hamming, which k-NN accepts for binary fields only", "metric", "failure", lambda d, f: d, space="hamming")
+
+    # --- cagra: a graph searched from random entry points on level 0 ---
+    def cagra_entry_point(d, f):
+        put(d, f["hnsw.entry_point"]["offset"], "<i", 0)
+        return d
+
+    c.add("cagra-entry-point-set", SYNTHETIC_CAGRA, "a CAGRA graph's entry point set to 0, which no search reads; the builder writes -1", "entry_point", "warning", cagra_entry_point)
+
+    def cagra_max_level(d, f):
+        put(d, f["hnsw.max_level"]["offset"], "<i", 0)
+        return d
+
+    c.add("cagra-max-level-set", SYNTHETIC_CAGRA, "a CAGRA graph's max_level set to 0, which no search reads; the builder writes -1", "levels", "warning", cagra_max_level)
+
+    def cagra_upper_neighbor(d, f):
+        o = f["hnsw.levels.data"]["offset"]
+        n = f["hnsw.levels.len"]["value"]
+        levels = struct.unpack_from(f"<{n}i", d, o)
+        upper = [i for i, l in enumerate(levels) if l >= 2]
+        node, neighbor = upper[0], upper[1]
+        (start,) = struct.unpack_from("<Q", d, f["hnsw.offsets.data"]["offset"] + node * 8)
+        (cum1,) = struct.unpack_from("<i", d, f["hnsw.cum_nneighbor_per_level.data"]["offset"] + 4)
+        put(d, f["hnsw.neighbors.data"]["offset"] + (start + cum1) * 4, "<i", neighbor)
+        return d
+
+    c.add("cagra-upper-level-neighbor", SYNTHETIC_CAGRA, "a CAGRA graph's node given a neighbor on level 1, which no search reads; the builder leaves the upper levels empty", "levels", "warning", cagra_upper_neighbor)
+
+    def cagra_no_entry_points(d, f):
+        put(d, f["cagra.num_base_level_search_entrypoints"]["offset"], "<i", 0)
+        return d
+
+    c.add("cagra-no-search-entry-points", SYNTHETIC_CAGRA, "a CAGRA graph's random entry point count set to 0, with which Faiss finds no entry point and refuses every search", "headers", "failure", cagra_no_entry_points)
+
+    def cagra_keep_off(d, f):
+        put(d, f["cagra.keep_max_size_level0"]["offset"], "<?", False)
+        return d
+
+    c.add("cagra-keep-max-size-off", SYNTHETIC_CAGRA, "a CAGRA graph's keep_max_size_level0 flag cleared, which changes no search; the builder sets it", "headers", "warning", cagra_keep_off)
+
+    def cagra_not_base_only(d, f):
+        put(d, f["cagra.base_level_only"]["offset"], "<?", False)
+        return d
+
+    c.add("cagra-not-base-level-only", SYNTHETIC_CAGRA, "a CAGRA graph's base_level_only flag cleared, so Faiss searches it as HNSW from its entry point, which is -1 in a graph of 100 nodes (the headers check warns of the flag)", "entry_point", "failure", cagra_not_base_only)
 
     return c
 

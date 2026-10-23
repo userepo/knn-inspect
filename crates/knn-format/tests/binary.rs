@@ -421,7 +421,10 @@ fn malformed_binary_files_are_errors_not_panics() {
 
     // Binary and float tags do not mix: each layout is read as k-NN writes
     // it.
-    for (at, tag, expected) in [(hnsw, b"IHNf", "IBHf"), (storage, b"IxF2", "IBxF or null")] {
+    for (at, tag, expected) in [
+        (hnsw, b"IHNf", "IBHf or IBHc"),
+        (storage, b"IxF2", "IBxF or null"),
+    ] {
         let mut b = bytes.clone();
         b[at..at + 4].copy_from_slice(tag);
         let err = knn_format::parse(&b).unwrap_err();
@@ -431,9 +434,9 @@ fn malformed_binary_files_are_errors_not_panics() {
         );
     }
     let float = fs::read(fixtures().join("synthetic/l2-100x4.faiss")).unwrap();
-    // `null` under a float graph is refused: k-NN's local build writes it
-    // under `IBHf` only (its remote build writes it under a CAGRA graph,
-    // `IHc2`, a layout this tool does not read, as below).
+    // `null` under a float HNSW graph is refused: k-NN's local build
+    // writes it under `IBHf` only (its remote build writes it under a
+    // CAGRA graph, `IHc2`, which the cagra tests cover).
     let mut b = float.clone();
     let float_storage = float.windows(4).position(|w| w == b"IxF2").unwrap();
     b[float_storage..float_storage + 4].copy_from_slice(b"null");
@@ -449,23 +452,14 @@ fn malformed_binary_files_are_errors_not_panics() {
         ),
         "{err:?}"
     );
-    // The CAGRA graph of k-NN's remote build, `IHc2` (or Faiss's older
-    // `IHNc`), is refused where the HNSW graph would be.
+    // A CAGRA tag on an HNSW graph's bytes reads the CAGRA fields out of
+    // the graph's first table, so the rest no longer lines up: an error,
+    // never a panic.
     let float_hnsw = float.windows(4).position(|w| w == b"IHNf").unwrap();
     for cagra in [b"IHc2", b"IHNc"] {
         let mut b = float.clone();
         b[float_hnsw..float_hnsw + 4].copy_from_slice(cagra);
-        let err = knn_format::parse(&b).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                Error::UnsupportedLayout {
-                    expected: "IHNf or IHNs",
-                    ..
-                }
-            ),
-            "{err:?}"
-        );
+        assert!(knn_format::parse(&b).is_err(), "{cagra:?}");
     }
     let mut b = float.clone();
     b[float_hnsw..float_hnsw + 4].copy_from_slice(b"IBHf");
@@ -474,7 +468,7 @@ fn malformed_binary_files_are_errors_not_panics() {
         matches!(
             err,
             Error::UnsupportedLayout {
-                expected: "IHNf or IHNs",
+                expected: "IHNf, IHNs, IHc2, or IHNc",
                 ..
             }
         ),
