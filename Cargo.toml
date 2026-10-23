@@ -10,7 +10,7 @@ members = [
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.11.0"
+version = "0.11.1"
 edition = "2024"
 rust-version = "1.99"
 authors = ["Ivan Petrouchtchak"]
@@ -24,9 +24,9 @@ knn-check = { path = "crates/knn-check" }
 knn-recall = { path = "crates/knn-recall" }
 
 # knn-format: the mapping, unaligned little-endian views, the footer CRC.
-memmap2 = "0.9.11"
+memmap2 = "0.9.12"
 zerocopy = "0.8.63"
-crc32fast = "1.5.2"
+crc32fast = "1.5.3"
 thiserror = "2.0.21"
 
 # knn-recall: brute force in parallel over queries.

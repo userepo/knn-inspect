@@ -112,9 +112,9 @@ checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
 name = "crc32fast"
-version = "1.5.2"
+version = "1.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "01a7799fd6b852db0e61728dde9a204c423b44d689dbd432522543614b490e78"
+checksum = "0ba106e844045ddc02c20768ac4b0b7cb45f2cc2ecbd833ac9f5dacb183c2055"
 dependencies = [
  "cfg-if",
 ]
@@ -170,7 +170,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "knn-check"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "knn-format",
  "serde",
@@ -179,7 +179,7 @@ dependencies = [
 
 [[package]]
 name = "knn-format"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "crc32fast",
  "memmap2",
@@ -191,7 +191,7 @@ dependencies = [
 
 [[package]]
 name = "knn-inspect"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -205,7 +205,7 @@ dependencies = [
 
 [[package]]
 name = "knn-recall"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "knn-format",
  "rayon",
@@ -228,9 +228,9 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "memmap2"
-version = "0.9.11"
+version = "0.9.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d1219ed1b7f229ee7104d281dd01d6802fe28bb6e95d292942c4daacdeb798c0"
+checksum = "6b0ca1155a9ecc25aa12e8313a119f32edf0255fea2f44839c4ac0a12b2ac157"
 dependencies = [
  "libc",
 ]
