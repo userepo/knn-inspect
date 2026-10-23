@@ -692,8 +692,13 @@ at tag 3.9.0.0) uploads a segment's vectors and doc ids to a repository,
 has the `remote-vector-index-builder` service build such a graph on a
 GPU, and downloads the file it writes, appending the Lucene footer as the
 local build does. The builder (its `faiss_index_build_service.py`) makes a
-`GpuIndexCagra` of graph degree 2M (`GRAPH_DEGREE_PER_M`) from the
-field's `m`, copies it into a CPU `IndexHNSWCagra`, or an
+`GpuIndexCagra` of graph degree 4m from the field's `m`
+(`GRAPH_DEGREE_PER_M`), lowered for a small segment so that the
+IVF-PQ search that seeds the graph can supply the neighbors
+(`calculate_effective_m`: 56 for the 500-vector fixtures below, from an
+`m` of 16, where a binary field's 64 is not lowered), so Faiss's copy
+records an `M` of half the degree, twice the field's `m` or less; it
+copies the graph into a CPU `IndexHNSWCagra`, or an
 `IndexBinaryHNSWCagra` for a binary field, with `base_level_only` set,
 puts that in an `IndexIDMap` holding the doc ids, and writes it with
 `write_index`, or `write_index_binary`. Remote builds take `l2` and
@@ -714,7 +719,7 @@ HNSW block (`read_index` and `read_index_binary` at `5616caa`):
 
 | Field | Type | Notes |
 |---|---|---|
-| `keep_max_size_level0` | bool, 1 byte | level 0 lists kept at full size while building; `GpuIndexCagra::copyTo` sets it |
+| `keep_max_size_level0` | bool, 1 byte | level 0 lists kept at full size while building; `GpuIndexCagra::copyTo` sets it, the binary copy leaves it off |
 | `base_level_only` | bool, 1 byte | searched on level 0 alone, from random entry points; the builder sets it, and an index with it set refuses `add` |
 | `num_base_level_search_entrypoints` | int32 | nodes a search draws at random to start from; 32 in every file the builder's image wrote (its Faiss 1.14.3 default); faiss-cpu 1.15.1 defaults to 256 for `IndexHNSWCagra` and 32 for `IndexBinaryHNSWCagra` |
 | `numeric_type_` | int32, `IHc2` only | Faiss's `NumericType`: 0 `Float32`, 1 `Float16`, 2 `UInt8`, 3 `Int8` |
@@ -765,7 +770,8 @@ reports `graph: cagra`, the fields, and the levels a search reads: with
 (`level_counts` has one entry; `max_level` and the entry point are shown
 as the `-1` they are). `verify` holds the graph to what the
 builder writes and what Faiss reads: a count of 0 random entry points
-fails; `base_level_only` or `keep_max_size_level0` off warns (without
+fails; `base_level_only` off, or `keep_max_size_level0` off in a float
+graph, warns (without
 the former, Faiss searches the graph as HNSW, and the HNSW rules then
 apply, so the `-1` entry point fails as any HNSW graph's would); an
 entry point or `max_level` other than `-1`, or a neighbor on an upper
@@ -853,6 +859,60 @@ float search is right on both. The generator therefore checks only that
 the binary search runs. A live CAGRA fixture, built by the builder's own
 image, is step c of M15; its build is not deterministic, so it is built
 once and kept.
+
+### Real remote-built files from OpenSearch 3.9.0
+
+`tools/extract_opensearch.py --remote --dim 64` against the stack in
+`tools/docker-compose.remote.yml` (OpenSearch 3.9.0 with the
+`repository-s3` plugin, LocalStack 4.14 as the repository, and the
+builder's `api-snapshot` image, pinned by digest, on the host's RTX 4070)
+indexed 500 random 64-dimensional vectors as k-NN's CI does, with the
+index's remote build threshold at 1 KB so every segment went to the
+builder, and copied one segment per layout the builder writes, and a
+cosine one, to `fixtures/opensearch-3.9.0-remote/`:
+`float/l2`, `float/cosinesimil`, `half-float/l2`, `byte/l2`,
+`binary/hamming`, and `on-disk/l2`. Each manifest records the builder image's digest, the
+repository and cluster settings, and k-NN's count of completed remote
+builds before and after (three per segment: two flushed segments and the
+merge). The build is not deterministic, so the files were built once and
+are kept; a rebuild would change every neighbor list.
+
+The files hold what the probe and the synthetic fixtures predicted, with
+four facts the probe could not show. The layouts are `IxMp` > `IHc2` >
+`IxF2`, `IxSQ` (`QT_fp16`, numeric type 1), `IxSQ`
+(`QT_8bit_direct_signed`, numeric type 3), and `null` (numeric type 0),
+and `IBMp` > `IBHc` > `IBxF`; the storage is byte for byte what the
+local build writes, and `scan` finds it in each segment's `.vec` as it
+finds a local file's. Every level-0 list is full, the upper slots are
+all empty, the nodes keep their random levels (1 and 2), the entry point
+and `max_level` are -1, and every search draws 32 entry points. The four
+facts: the graph's degree is 56 (`M` 28) for the 500-vector float
+fields and 64 (`M` 32) for the binary one and the 2,000-vector cosine
+one, from an `m` of 16 (above); `efConstruction`
+and `efSearch` hold the field's values, 100 and 100, except in the
+`on_disk` field's file, where `efSearch` is 256, which k-NN sends for an
+`sq` encoder of 1, 2, or 4 bits; the ID map's header says `is_trained`
+false, since the builder wraps the GPU index in its `IndexIDMap` before
+`add` trains it and never updates the flag (the graph's and the storage's
+headers say true), which k-NN never reads, so `verify` does not warn of
+it under a CAGRA graph; and the binary file's `keep_max_size_level0` is
+off, since `IndexBinaryHNSWCagra`'s default constructor leaves it so and
+the binary copy does not set it, where the float copy does, so `verify`
+warns of it off in a float graph only. Every one verifies clean with
+its space, `scan` finds the `on_disk` field's 500 records in its `.veq` and
+its corrections agree with the `.vec`, and `stats` counts no node that
+no other node lists.
+
+One more finding: the builder's GPU build of 500 random vectors failed
+for `innerproduct` and for `cosinesimil` alike (cuVS: "Could not
+generate an intermediate CAGRA graph because the initial kNN graph
+contains too many invalid or duplicated neighbor nodes"), where the
+same vectors built under `l2`, and k-NN fell back to a local HNSW
+build, which the script refused to record as remote (the native file's
+graph fourcc, read at its offset, is the guard). With 2,000 vectors
+both built, so the cosine fixture holds 2,000 (metric type 0 in all
+three headers, unit vectors, a graph of degree 64, `M` 32: the
+builder's cap did not bite). The inner-product build was not kept.
 
 ## Real files from OpenSearch 3.9.0
 

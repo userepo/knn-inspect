@@ -217,6 +217,16 @@ fn cagra_findings_name_what_the_builder_writes() {
     let hnsw = bytes.windows(4).position(|w| w == b"IHc2").unwrap();
     assert_eq!(headers.findings[0].offset, Some(hnsw + 4 + 33 + 2));
 
+    // Only the ID map's header is left untrained by the builder; the
+    // graph's and the storage's still warn.
+    let report = verify("cagra-storage-untrained.faiss");
+    assert_eq!(report.status, Status::Warnings, "{report:#?}");
+    let headers = report.result(Check::Headers).unwrap();
+    assert_eq!(
+        headers.findings[0].message,
+        "storage header says the index is not trained"
+    );
+
     let report = verify("cagra-keep-max-size-off.faiss");
     assert_eq!(report.status, Status::Warnings, "{report:#?}");
     let headers = report.result(Check::Headers).unwrap();
@@ -352,6 +362,11 @@ fn real_fixtures_are_clean_with_their_space() {
         "opensearch-3.9.0-binary/on-disk-16x",
         "opensearch-3.9.0-binary/on-disk-8x",
         "opensearch-3.9.0-binary/on-disk-half-float",
+        "opensearch-3.9.0-remote/float",
+        "opensearch-3.9.0-remote/half-float",
+        "opensearch-3.9.0-remote/byte",
+        "opensearch-3.9.0-remote/binary",
+        "opensearch-3.9.0-remote/on-disk",
     ] {
         for entry in fs::read_dir(fixtures().join(set)).unwrap() {
             let dir = entry.unwrap().path();
@@ -366,6 +381,17 @@ fn real_fixtures_are_clean_with_their_space() {
                 "{}: {report:#?}",
                 dir.display()
             );
+            // The remote build's ID map header says untrained, which k-NN
+            // never reads; the local build's say trained.
+            let remote = set.starts_with("opensearch-3.9.0-remote");
+            let parsed = knn_format::parse(&bytes).unwrap();
+            assert_eq!(
+                parsed.index.index.kind.cagra().is_some(),
+                remote,
+                "{}",
+                dir.display()
+            );
+            assert_eq!(parsed.index.header.is_trained, !remote, "{}", dir.display());
             let checksum = report.result(Check::Checksum).unwrap();
             assert_eq!(
                 checksum.severity,
@@ -378,8 +404,8 @@ fn real_fixtures_are_clean_with_their_space() {
         }
     }
     assert_eq!(
-        seen, 27,
-        "six float, six fp16, three bf16, two byte, one binary, one binary-encoder, and eight on_disk real fixtures"
+        seen, 33,
+        "six float, six fp16, three bf16, two byte, one binary, one binary-encoder, eight on_disk, and six remote-built real fixtures"
     );
 }
 

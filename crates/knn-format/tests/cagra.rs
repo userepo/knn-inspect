@@ -578,3 +578,219 @@ fn an_hnsw_graph_is_not_a_cagra_one() {
         usize::try_from(g.max_level).unwrap() + 1
     );
 }
+
+#[derive(Deserialize)]
+struct RemoteManifest {
+    encoding: String,
+    space_type: String,
+    count: usize,
+    dimension: usize,
+    vectors_file: String,
+    files: Vec<RemoteFile>,
+    remote_build: RemoteBuild,
+}
+
+#[derive(Deserialize)]
+struct RemoteFile {
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct RemoteBuild {
+    native_graph: String,
+    build_success_count_before: u32,
+    build_success_count_after: u32,
+}
+
+/// The segments k-NN's remote index build wrote, one per layout.
+fn remote_cases() -> Vec<(PathBuf, RemoteManifest)> {
+    let root = fixtures().join("opensearch-3.9.0-remote");
+    let mut cases = Vec::new();
+    for set in ["float", "half-float", "byte", "binary", "on-disk"] {
+        for entry in fs::read_dir(root.join(set)).unwrap() {
+            let dir = entry.unwrap().path();
+            let m: RemoteManifest =
+                serde_json::from_slice(&fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+            assert_eq!(m.encoding, set, "{}", dir.display());
+            cases.push((dir, m));
+        }
+    }
+    assert_eq!(
+        cases.len(),
+        6,
+        "one remote-built segment per layout, and a cosine float one"
+    );
+    cases
+}
+
+#[test]
+fn remote_built_fixtures_hold_what_the_builder_writes() {
+    for (dir, m) in remote_cases() {
+        let name = dir.display().to_string();
+        let native = m.files.iter().find(|f| f.name.contains(".faiss")).unwrap();
+        let file = NativeFile::open(dir.join(&native.name)).unwrap();
+        let bytes = file.bytes();
+        let parsed = file.parse().unwrap();
+        assert!(
+            parsed.envelope.header.is_none(),
+            "{name}: k-NN writes no header"
+        );
+        let footer = parsed.envelope.footer.expect("k-NN writes a footer");
+        assert_eq!(footer.verify(bytes).unwrap(), footer.checksum, "{name}");
+        assert_eq!(parsed.trailing, 0, "{name}");
+        assert!(
+            m.remote_build.build_success_count_after > m.remote_build.build_success_count_before,
+            "{name}: the builder completed the build"
+        );
+
+        let idx = &parsed.index;
+        let binary = m.encoding == "binary";
+        assert_eq!(
+            idx.index.fourcc.to_string(),
+            m.remote_build.native_graph,
+            "{name}"
+        );
+        assert_eq!(
+            idx.index.fourcc,
+            if binary {
+                FourCc::BINARY_HNSW_CAGRA
+            } else {
+                FourCc::HNSW_CAGRA
+            },
+            "{name}"
+        );
+        let cagra = idx.index.kind.cagra().expect("a CAGRA graph");
+        assert!(cagra.base_level_only, "{name}");
+        assert_eq!(cagra.search_entry_points, 32, "{name}");
+        // The float copy sets the flag; the binary copy leaves it off.
+        assert_eq!(cagra.keep_max_size_level0, !binary, "{name}");
+        let numeric = match m.encoding.as_str() {
+            "float" | "on-disk" => Some(0),
+            "half-float" => Some(1),
+            "byte" => Some(3),
+            _ => None,
+        };
+        assert_eq!(cagra.numeric_type, numeric, "{name}");
+        // The builder wraps the GPU index before it is trained and never
+        // updates the ID map's flag; the graph's header says trained.
+        assert!(!idx.header.is_trained, "{name}: the ID map's flag");
+        assert!(idx.index.header.is_trained, "{name}");
+        assert_eq!(idx.header.d as usize, m.dimension, "{name}");
+        assert_eq!(idx.header.ntotal as usize, m.count, "{name}");
+
+        // The graph: level 0 full at the degree the builder derives from
+        // m, the upper slots empty, random node levels, no entry point.
+        let g = &idx.index.graph;
+        assert_eq!(g.entry_point, -1, "{name}");
+        assert_eq!(g.max_level, -1, "{name}");
+        assert_eq!(g.ef_construction, 100, "{name}");
+        assert_eq!(
+            g.ef_search,
+            if m.encoding == "on-disk" { 256 } else { 100 },
+            "{name}"
+        );
+        // The builder lowers the degree for a small segment: 56 for 500
+        // float vectors, the full 64 (4m) for 2,000 or for a binary field.
+        let degree = if binary || m.count == 2000 { 64 } else { 56 };
+        assert_eq!(g.m(), Some(i32::try_from(degree / 2).unwrap()), "{name}");
+        assert_eq!(idx.index.level_counts(), vec![m.count], "{name}");
+        assert!(g.levels.iter().any(|l| l.get() > 1), "{name}");
+        for node in 0..g.node_count() {
+            let slots = g.neighbors_of(node, 0).unwrap();
+            assert_eq!(slots.len(), degree, "{name}: node {node}");
+            assert!(
+                slots.iter().all(|v| v.get() >= 0),
+                "{name}: node {node} is full"
+            );
+            for level in 1..g.cum_nneighbor_per_level.len() - 1 {
+                let Some(slots) = g.neighbors_of(node, level) else {
+                    break;
+                };
+                assert!(
+                    slots.iter().all(|v| v.get() == -1),
+                    "{name}: node {node} level {level}"
+                );
+            }
+        }
+        let labels: Vec<i64> = idx.id_map.iter().map(|v| v.get()).collect();
+        let identity: Vec<i64> = (0..i64::try_from(m.count).unwrap()).collect();
+        assert_eq!(labels, identity, "{name}: labels are doc ids");
+
+        // The storage is what the local build writes for the field.
+        let raw = fs::read(dir.join(&m.vectors_file)).unwrap();
+        match (m.encoding.as_str(), idx.index.storage) {
+            ("float", Some(Storage::Flat(flat))) => {
+                let fourcc = if m.space_type == "l2" {
+                    FourCc::FLAT_L2
+                } else {
+                    FourCc::FLAT_IP
+                };
+                assert_eq!(flat.fourcc, fourcc, "{name}");
+                if m.space_type == "cosinesimil" {
+                    // k-NN serves cosine as inner product over the vectors
+                    // normalized; the draw is the raw one.
+                    let given: Vec<f32> = raw
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|c| f32::from_le_bytes(*c))
+                        .collect();
+                    for (i, row) in given.chunks_exact(m.dimension).enumerate() {
+                        let norm = row.iter().map(|x| x * x).sum::<f32>().sqrt();
+                        for (s, g) in flat.vector(i).unwrap().iter().zip(row) {
+                            assert!((s.get() - g / norm).abs() < 1e-6, "{name}: row {i}");
+                        }
+                    }
+                } else {
+                    assert_eq!(flat.codes.as_bytes(), &raw[..], "{name}: vectors.f32");
+                }
+            }
+            ("half-float", Some(Storage::Sq(sq))) => {
+                assert_eq!(sq.format, CodeFormat::Fp16, "{name}");
+                let given: Vec<f32> = raw
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c))
+                    .collect();
+                for (i, row) in given.chunks_exact(m.dimension).enumerate() {
+                    for (x, code) in row.iter().zip(sq.row(i).unwrap().as_chunks::<2>().0) {
+                        let half =
+                            knn_format::faiss::HalfRounding::of(u16::from_le_bytes(*code)).unwrap();
+                        assert!(half.contains(*x), "{name}: row {i}");
+                    }
+                }
+            }
+            ("byte", Some(Storage::Sq(sq))) => {
+                assert_eq!(sq.format, CodeFormat::Byte, "{name}");
+                let decoded: Vec<f32> = (0..m.count).flat_map(|i| sq.decoded(i).unwrap()).collect();
+                let given: Vec<f32> = raw
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c))
+                    .collect();
+                assert_eq!(decoded, given, "{name}: vectors.f32 as int8");
+            }
+            ("binary", Some(Storage::Binary(bits))) => {
+                assert_eq!(bits.codes, &raw[..], "{name}: vectors.u8");
+                assert_eq!(idx.metric(), Metric::Hamming, "{name}");
+            }
+            ("on-disk", None) => {
+                assert_eq!(
+                    idx.layout(),
+                    [FourCc::ID_MAP, FourCc::HNSW_CAGRA, FourCc::NULL],
+                    "{name}"
+                );
+                assert_eq!(idx.metric(), Metric::L2, "{name}");
+                assert_eq!(idx.code_size(), None, "{name}");
+            }
+            (encoding, storage) => panic!("{name}: {encoding} parsed as {storage:?}"),
+        }
+        assert_eq!(
+            dir.file_name().unwrap().to_str().unwrap(),
+            m.space_type,
+            "{name}: the directory is named for the space"
+        );
+    }
+}

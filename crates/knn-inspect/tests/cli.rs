@@ -3222,3 +3222,74 @@ fn a_remote_built_graph_is_held_to_its_field_as_a_local_one_is() {
         String::from_utf8_lossy(&o.stderr).contains("a CAGRA graph (k-NN's remote index build)")
     );
 }
+
+#[test]
+fn scan_reads_the_segments_the_remote_build_wrote() {
+    // The segments k-NN's remote index build wrote on a GPU, one per
+    // layout: each verifies clean with its space, its graph is named, and
+    // the cross-checks find its vectors in the segment's Lucene files, the
+    // on_disk field's in its .veq.
+    for (set, space, layout, vectors) in [
+        ("float/l2", "l2", "IxMp > IHc2 > IxF2", "match"),
+        ("float/cosinesimil", "cosine", "IxMp > IHc2 > IxFI", "match"),
+        ("half-float/l2", "l2", "IxMp > IHc2 > IxSQ", "match"),
+        ("byte/l2", "l2", "IxMp > IHc2 > IxSQ", "match"),
+        ("binary/hamming", "hamming", "IBMp > IBHc > IBxF", "match"),
+        ("on-disk/l2", "l2", "IxMp > IHc2 > null", "skipped"),
+    ] {
+        let dir = fixtures().join("opensearch-3.9.0-remote").join(set);
+        let o = run(&["scan", "--space", space, dir.to_str().unwrap(), "--json"]);
+        assert_eq!(o.status.code(), Some(0), "{set}: {}", stdout(&o));
+        let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+        let f = &v["files"][0];
+        assert_eq!(f["status"], "clean", "{set}: {f}");
+        assert_eq!(f["graph"], "cagra", "{set}: {f}");
+        // The inner-product builds of 500 vectors failed in cuVS, so the
+        // cosine segment holds 2,000.
+        let count = if set.contains("cosinesimil") {
+            2000
+        } else {
+            500
+        };
+        assert_eq!(f["count"], count, "{set}: {f}");
+        assert_eq!(f["lucene_vectors"]["status"], vectors, "{set}: {f}");
+        assert_eq!(f["lucene_docs"]["status"], "match", "{set}: {f}");
+        let quantized = if set.starts_with("on-disk") {
+            "match"
+        } else {
+            "skipped"
+        };
+        assert_eq!(f["lucene_quantized"]["status"], quantized, "{set}: {f}");
+        let text = stdout(&run(&["scan", dir.to_str().unwrap()]));
+        assert!(
+            text.contains(&format!("    clean       {layout}  d=64")),
+            "{set}: {text}"
+        );
+        assert!(text.contains(&format!(" n={count} ")), "{set}: {text}");
+        assert!(text.contains("  cagra\n"), "{set}: {text}");
+        // recall refuses every one of them.
+        let native = dir.join("_2_165_vec.faiss");
+        let o = run(&["recall", native.to_str().unwrap(), "--sample", "5"]);
+        assert_eq!(o.status.code(), Some(1), "{set}");
+        assert!(
+            String::from_utf8_lossy(&o.stderr)
+                .contains("a CAGRA graph (k-NN's remote index build)"),
+            "{set}"
+        );
+    }
+    // The on_disk field's records are the ones checked.
+    let dir = fixtures().join("opensearch-3.9.0-remote/on-disk/l2");
+    let o = run(&["scan", "--space", "l2", dir.to_str().unwrap(), "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    let q = &v["files"][0]["lucene_quantized"];
+    assert_eq!(q["field"], "vec", "{q}");
+    assert_eq!(q["bits"], 1, "{q}");
+    assert_eq!(q["similarity"], "euclidean", "{q}");
+    assert!(
+        q["detail"]
+            .as_str()
+            .unwrap()
+            .starts_with("500 records of 24 bytes"),
+        "{q}"
+    );
+}

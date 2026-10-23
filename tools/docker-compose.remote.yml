@@ -1,0 +1,73 @@
+# OpenSearch at the pinned version with k-NN's remote index build wired to
+# the GPU builder and an S3 stand-in, as k-NN's own CI runs them
+# (`.github/workflows/remote_index_build.yml` at tag 3.9.0.0): LocalStack
+# for the repository the vectors go through, the builder image on the
+# host's GPU, and a node whose S3 client holds the stand-in's credentials.
+# tools/extract_opensearch.py --remote registers the repository, turns the
+# feature on, indexes vectors, and copies the segment out.
+#
+# The builder image is the staging snapshot, pinned by digest: the release
+# (api-latest, 1.2.0) predates the builder's PR #155, and k-NN 3.9 uploads
+# a half_float field's vectors as fp16, which 1.2.0 reads as fp32. The tag
+# moves; the digest is the image the fixtures were built with.
+#
+#   docker compose -f tools/docker-compose.remote.yml up -d
+#   docker compose -f tools/docker-compose.remote.yml down -v
+services:
+  localstack:
+    image: localstack/localstack:4.14
+    container_name: knn-inspect-localstack
+    environment:
+      - SERVICES=s3
+    ports:
+      - "4566:4566"
+
+  builder:
+    image: opensearchstaging/remote-vector-index-builder:api-snapshot@sha256:78ced9d04c4cbc1106cfceb98e32a772c71565b215c6e68be8fcdcbcdaab64da
+    container_name: knn-inspect-builder
+    environment:
+      - S3_ENDPOINT_URL=http://localstack:4566
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - AWS_DEFAULT_REGION=us-east-1
+    ports:
+      - "1025:1025"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    depends_on:
+      - localstack
+
+  opensearch:
+    image: opensearchproject/opensearch:3.9.0
+    container_name: knn-inspect-opensearch
+    environment:
+      - discovery.type=single-node
+      - DISABLE_SECURITY_PLUGIN=true
+      - OPENSEARCH_JAVA_OPTS=-Xms1g -Xmx1g
+      # The repository names LocalStack by its service name, which has no
+      # bucket subdomains to resolve.
+      - s3.client.default.path_style_access=true
+    # Every start needs the network: the plugin comes from the OpenSearch
+    # artifact server (its version is locked to the image's, so the
+    # content is fixed), and the two version tags are not digests.
+    # The image ships without repository-s3, which k-NN's CI downloads
+    # for its test cluster too; the S3 client's credentials live in the
+    # keystore, which the image does not ship either. LocalStack accepts
+    # any credentials.
+    command: >
+      bash -c "
+      opensearch-plugin list | grep -q repository-s3 || opensearch-plugin install --batch repository-s3;
+      opensearch-keystore list >/dev/null 2>&1 || opensearch-keystore create --silent;
+      echo test | opensearch-keystore add -x -f s3.client.default.access_key;
+      echo test | opensearch-keystore add -x -f s3.client.default.secret_key;
+      exec ./opensearch-docker-entrypoint.sh opensearch"
+    ports:
+      - "9200:9200"
+    depends_on:
+      - localstack
+      - builder

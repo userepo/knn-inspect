@@ -510,6 +510,16 @@
     }
   },
   {
+    "file": "cagra-storage-untrained.faiss",
+    "source": "fixtures/synthetic-cagra/ip-100x64-cagra.faiss",
+    "mutation": "a CAGRA graph's storage header says untrained; only the ID map's header is left so by the builder",
+    "space": null,
+    "expect": {
+      "check": "headers",
+      "severity": "warning"
+    }
+  },
+  {
     "file": "cagra-not-base-level-only.faiss",
     "source": "fixtures/synthetic-cagra/ip-100x64-cagra.faiss",
     "mutation": "a CAGRA graph's base_level_only flag cleared, so Faiss searches it as HNSW from its entry point, which is -1 in a graph of 100 nodes (the headers check warns of the flag)",

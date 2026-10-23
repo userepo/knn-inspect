@@ -224,7 +224,12 @@ fn check_headers(col: &mut Collector, bytes: &[u8], idx: &IdMapIndex<'_>) {
             );
         }
         check_header_metric(col, name, h, first, role);
-        if !h.is_trained {
+        // k-NN's remote build wraps the GPU index in its ID map before
+        // `add` trains it and never updates the flag, so the ID map
+        // header of a CAGRA graph says untrained in every file it writes;
+        // k-NN does not read it.
+        let builder_leaves_untrained = name == "id map" && idx.index.kind.cagra().is_some();
+        if !h.is_trained && !builder_leaves_untrained {
             col.warn(
                 Check::Headers,
                 format!("{name} header says the index is not trained"),
@@ -252,7 +257,11 @@ fn check_headers(col: &mut Collector, bytes: &[u8], idx: &IdMapIndex<'_>) {
         }
     }
     if let Some(cagra) = idx.index.kind.cagra() {
-        check_cagra(col, cagra);
+        check_cagra(
+            col,
+            cagra,
+            matches!(idx.header.kind, HeaderKind::Binary { .. }),
+        );
     }
 }
 
@@ -264,8 +273,9 @@ fn check_headers(col: &mut Collector, bytes: &[u8], idx: &IdMapIndex<'_>) {
 /// is searched as an HNSW graph, from its entry point, and one without
 /// `keep_max_size_level0` changes no search, so either warns. The numeric
 /// type describes nothing (k-NN discards it, and the Faiss it builds
-/// leaves it uninitialized), so it is not checked.
-fn check_cagra(col: &mut Collector, cagra: &CagraFields) {
+/// leaves it uninitialized), so it is not checked. `binary` says whether the
+/// graph is a binary one (`IBHc`), whose copy leaves `keep_max_size_level0` off.
+fn check_cagra(col: &mut Collector, cagra: &CagraFields, binary: bool) {
     // Two flags of a byte each, then the count.
     let count_at = cagra.offset.checked_add(2);
     if cagra.search_entry_points <= 0 {
@@ -287,10 +297,13 @@ fn check_cagra(col: &mut Collector, cagra: &CagraFields) {
             None,
         );
     }
-    if !cagra.keep_max_size_level0 {
+    // The float copy (`GpuIndexCagra::copyTo`) sets the flag; the binary
+    // one leaves the index's default, off, as every binary file the
+    // builder writes shows.
+    if !cagra.keep_max_size_level0 && !binary {
         col.warn(
             Check::Headers,
-            "the graph's keep_max_size_level0 flag is off, which changes no search; k-NN's remote build sets it".to_owned(),
+            "the graph's keep_max_size_level0 flag is off, which changes no search; k-NN's remote build sets it for a float field".to_owned(),
             Some(cagra.offset),
             None,
         );

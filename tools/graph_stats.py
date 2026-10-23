@@ -205,6 +205,7 @@ REAL_SETS = (
     "opensearch-3.9.0-bf16",
     "opensearch-3.9.0-byte",
     "opensearch-3.9.0-binary",
+    "opensearch-3.9.0-remote",
 )
 
 

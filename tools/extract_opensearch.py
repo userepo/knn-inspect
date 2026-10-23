@@ -57,6 +57,22 @@ script refuses any but the AVX2 one, whose sums `recall` follows, before
 it writes the queries, results, and manifest (the segment's files are
 copied by then).
 
+With `--remote`, the segment is built by k-NN's remote index build: the
+script creates the S3 bucket in LocalStack, registers it as a repository,
+turns the feature on with the builder's endpoint, and gives the index a
+size threshold of 1 KB, so every segment goes to the builder, which
+writes a CAGRA graph in place of the HNSW one (`IHc2`, or `IBHc` for a
+binary field). The stack is `tools/docker-compose.remote.yml`. Remote
+builds need a dimension of 64 or more and `l2`, `innerproduct`, or
+`cosinesimil` (`hamming` for a binary field); `sq-bf16` is not built
+remotely. The GPU build of a small inner-product or cosine set can
+fail (cuVS refused 500 random vectors, where 2,000 built), and k-NN
+then falls back to a local build. The script checks that the native
+file holds a CAGRA graph (a build that fell back to the local one is
+refused, and its copied segment removed) and records the
+builder image and its digest in the manifest. The GPU build is not
+deterministic, so a remote fixture is built once and kept.
+
 Usage:
     docker compose -f tools/docker-compose.yml up -d
     python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0/nocfs
@@ -72,6 +88,10 @@ Usage:
     python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-binary/on-disk-16x --encoding on-disk --compression 16x --spaces l2 --queries 100
     python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-binary/on-disk-8x --encoding on-disk --compression 8x --spaces l2 --queries 100
     python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-binary/on-disk-half-float --encoding on-disk-half-float --queries 100 --modes results.jsonl results-no-rescore.jsonl results-oversample-30.jsonl
+
+    docker compose -f tools/docker-compose.remote.yml up -d
+    python tools/extract_opensearch.py --remote --dim 64 --out fixtures/opensearch-3.9.0-remote/float --spaces l2
+    python tools/extract_opensearch.py --remote --dim 64 --out fixtures/opensearch-3.9.0-remote/on-disk --encoding on-disk --spaces l2
 """
 
 from __future__ import annotations
@@ -128,6 +148,95 @@ HALF_FLOAT_SIMD_LIBRARY = "opensearchknn_simd_avx2"
 # where the JVM compiles it.
 WARM_UP_QUERIES = 300
 WARM_UP_OVERSAMPLE = 50.0
+# The remote index build's repository, as `--remote` registers it: an S3
+# bucket in LocalStack, under a base path, as k-NN's own CI does.
+REMOTE_REPOSITORY = "knn-inspect-remote"
+REMOTE_BUCKET = "knn-inspect-remote-vectors"
+REMOTE_BASE_PATH = "vectors"
+# Segments at or above this size go to the builder: everything, here.
+REMOTE_SIZE_MIN = "1kb"
+# Remote builds take a dimension of 64 or more.
+REMOTE_MIN_DIM = 64
+
+
+def setup_remote(host: str, localstack: str, s3_endpoint: str, builder_endpoint: str) -> dict:
+    """Points k-NN's remote index build at the builder and the repository.
+
+    The bucket is created in LocalStack, which takes an unsigned request,
+    and registered as an S3 repository whose endpoint names LocalStack as
+    the node reaches it (its client credentials are in the node's
+    keystore, see docker-compose.remote.yml); the feature is turned on
+    with the builder's endpoint and no wait between polls, as
+    `KNNRestTestCase.setupRemoteIndexBuildSettings` does.
+    """
+    try:
+        r = requests.put(f"{localstack}/{REMOTE_BUCKET}", timeout=30)
+    except requests.RequestException as e:
+        sys.exit(f"LocalStack at {localstack} did not answer ({e}); is tools/docker-compose.remote.yml up?")
+    if r.status_code not in (200, 409):
+        sys.exit(f"creating bucket {REMOTE_BUCKET} in LocalStack: {r.status_code} {r.text[:300]}")
+    repository = {
+        "type": "s3",
+        "settings": {
+            "bucket": REMOTE_BUCKET,
+            "base_path": REMOTE_BASE_PATH,
+            "region": "us-east-1",
+            "endpoint": s3_endpoint,
+            "s3_upload_retry_enabled": False,
+        },
+    }
+    r = requests.put(f"{host}/_snapshot/{REMOTE_REPOSITORY}", json=repository, timeout=120)
+    if not r.ok:
+        sys.exit(f"registering repository {REMOTE_REPOSITORY}: {r.status_code} {r.text[:500]}")
+    settings = {
+        "knn.remote_index_build.enabled": True,
+        "knn.remote_index_build.repository": REMOTE_REPOSITORY,
+        "knn.remote_index_build.service.endpoint": builder_endpoint,
+        "knn.remote_index_build.poll.interval": "0s",
+    }
+    r = requests.put(f"{host}/_cluster/settings", json={"persistent": settings}, timeout=60)
+    if not r.ok:
+        sys.exit(f"cluster settings for the remote build: {r.status_code} {r.text[:500]}")
+    return {"repository": repository, "cluster_settings": settings}
+
+
+def remote_build_successes(host: str) -> int | None:
+    """k-NN's count of remote builds that completed, summed over the nodes,
+    from its stats: the value under `remote_vector_index_build_stats`
+    whose name ends in `build_success_count`, or `None` when the stats do
+    not carry it."""
+    r = requests.get(f"{host}/_plugins/_knn/stats", timeout=60)
+    if not r.ok:
+        sys.exit(f"k-NN stats: {r.status_code} {r.text[:300]}")
+    total = None
+    for node in r.json().get("nodes", {}).values():
+        stats = node.get("remote_vector_index_build_stats")
+        if not isinstance(stats, dict):
+            continue
+        for group in stats.values():
+            if isinstance(group, dict):
+                for name, value in group.items():
+                    if name.endswith("build_success_count") and isinstance(value, int):
+                        total = (total or 0) + value
+    return total
+
+
+def image_of(container: str) -> dict:
+    """The image a container runs, by reference and digest."""
+    try:
+        image_id = subprocess.run(
+            ["docker", "inspect", "--format", "{{.Image}}", container], capture_output=True, text=True, check=True
+        ).stdout.strip()
+        inspect = subprocess.run(
+            ["docker", "image", "inspect", image_id, "--format", "{{json .RepoDigests}} {{json .RepoTags}}"],
+            capture_output=True, text=True, check=True,
+        ).stdout.split(" ", 1)
+    except subprocess.CalledProcessError as e:
+        sys.exit(f"docker could not describe container {container} (is the stack up?): {e.stderr.strip()}")
+    except FileNotFoundError:
+        sys.exit("docker is not on PATH")
+    digests, tags = json.loads(inspect[0]), json.loads(inspect[1])
+    return {"id": image_id, "repo_digests": digests, "repo_tags": tags}
 
 
 def wait_for_cluster(host: str, timeout: float) -> dict:
@@ -154,7 +263,7 @@ def plugin_version(host: str, name: str) -> str | None:
     return None
 
 
-def create_index(host: str, index: str, space: str, dim: int, compound: bool, encoding: str, compression: str | None) -> dict:
+def create_index(host: str, index: str, space: str, dim: int, compound: bool, encoding: str, compression: str | None, remote: bool = False) -> dict:
     parameters: dict = {"m": M, "ef_construction": EF_CONSTRUCTION}
     if encoding in ("sq-fp16", "sq-bf16"):
         # Indexes created by 3.6.0 or later must give the encoder's bits;
@@ -192,6 +301,11 @@ def create_index(host: str, index: str, space: str, dim: int, compound: bool, en
         },
         "mappings": {"properties": {"pos": {"type": "integer"}, "vec": field}},
     }
+    if remote:
+        # On by default once the cluster setting is; the threshold is what
+        # keeps a small segment local, so it is lowered below any.
+        body["settings"]["index"]["knn.remote_index_build.enabled"] = True
+        body["settings"]["index"]["knn.remote_index_build.size.min"] = REMOTE_SIZE_MIN
     requests.delete(f"{host}/{index}", timeout=30)
     r = requests.put(f"{host}/{index}", json=body, timeout=60)
     r.raise_for_status()
@@ -355,7 +469,19 @@ def main() -> None:
     parser.add_argument("--compression", choices=COMPRESSIONS, help="the on-disk encodings only: the field's compression level, 32x when absent")
     parser.add_argument("--queries", type=int, default=0, help="the on-disk encodings only: query the live index this many times and record the results")
     parser.add_argument("--modes", nargs="+", choices=list(QUERY_MODES), help="with --queries: the modes to record, by result file; default: every mode")
+    parser.add_argument("--remote", action="store_true", help="build the segment with k-NN's remote index build (tools/docker-compose.remote.yml)")
+    parser.add_argument("--localstack", default="http://localhost:4566", help="with --remote: LocalStack, as this script reaches it")
+    parser.add_argument("--s3-endpoint", default="http://localstack:4566", help="with --remote: LocalStack, as the node reaches it")
+    parser.add_argument("--builder-endpoint", default="http://builder:1025", help="with --remote: the builder, as the node reaches it")
+    parser.add_argument("--builder-container", default="knn-inspect-builder", help="with --remote: the builder's container, for the manifest")
     args = parser.parse_args()
+    if args.remote:
+        if args.dim < REMOTE_MIN_DIM:
+            parser.error(f"--remote needs --dim of at least {REMOTE_MIN_DIM}: k-NN builds smaller fields locally")
+        if args.encoding == "sq-bf16":
+            parser.error("--remote: k-NN does not build bf16 fields remotely")
+        if args.queries:
+            parser.error("--remote: live queries are not recorded for a CAGRA graph, which k-NN searches from random entry points")
     if args.count > MAX_RESULT_WINDOW:
         parser.error(f"--count above {MAX_RESULT_WINDOW} exceeds index.max_result_window, which doc_order reads in one page")
     allowed = {"byte": BYTE_SPACES, "binary": BINARY_SPACES}.get(args.encoding, SPACES)
@@ -380,6 +506,11 @@ def main() -> None:
         f"OpenSearch {os_version}, k-NN plugin {knn_version}, compound files {'on' if args.compound else 'off'}, "
         f"encoding {args.encoding}" + (f", compression {args.compression}" if args.compression else "")
     )
+    remote: dict | None = None
+    if args.remote:
+        remote = setup_remote(args.host, args.localstack, args.s3_endpoint, args.builder_endpoint)
+        remote["builder"] = image_of(args.builder_container)
+        print(f"remote index build on: repository {REMOTE_REPOSITORY}, builder {remote['builder']['repo_digests']}")
 
     # One draw per space in a fixed order, so a space gets the same vectors
     # whether or not the other spaces are requested in this run.
@@ -408,7 +539,10 @@ def main() -> None:
             shutil.rmtree(dest)
         dest.mkdir(parents=True)
 
-        body = create_index(args.host, index, space, args.dim, args.compound, args.encoding, compression)
+        if args.remote:
+            index += "-remote"
+        successes_before = remote_build_successes(args.host) if args.remote else None
+        body = create_index(args.host, index, space, args.dim, args.compound, args.encoding, compression, args.remote)
         bulk_index(args.host, index, vectors, args.batches)
         segment = force_merge(args.host, index)
         pos_of_doc = doc_order(args.host, index, args.count)
@@ -418,6 +552,38 @@ def main() -> None:
         has_cfs = any(n.endswith(".cfs") for n in names)
         if has_cfs != args.compound:
             sys.exit(f"{index}: compound files {'present' if has_cfs else 'absent'} but --compound={args.compound}; files: {names}")
+        if args.remote:
+            # The builder's graph, not a local fallback: the CAGRA fourcc
+            # where the HNSW one would be.
+            native = next((n for n in names if ".faiss" in n), None)
+            if native is None:
+                shutil.rmtree(dest)
+                sys.exit(f"{index}: no native file in the segment: {names}")
+            data = (dest / native).read_bytes()
+            fourcc = b"IBHc" if args.encoding == "binary" else b"IHc2"
+            # The graph's fourcc follows the ID map's header: 33 bytes
+            # after a float ID map's fourcc (its metric type is 0 or 1, so
+            # no metric argument), 21 after a binary one's.
+            at = 4 + (21 if data[:4] == b"IBMp" else 33)
+            found = data[at : at + 4]
+            if found != fourcc:
+                # Not a fixture: the copy is removed, so a half-made one
+                # cannot be mistaken for a remote build later.
+                shutil.rmtree(dest)
+                sys.exit(
+                    f"{index}: {native} holds {found!r} where {fourcc.decode()} would be: the build fell back to the local one "
+                    "(the node's log says why; the builder's says whether its job failed)"
+                )
+            successes = remote_build_successes(args.host)
+            if successes is None or successes_before is None or successes <= successes_before:
+                sys.exit(f"{index}: k-NN's remote build success count did not rise ({successes_before} -> {successes})")
+            remote_record = {
+                **remote,
+                "native_graph": fourcc.decode(),
+                "index_settings": {k: v for k, v in body["settings"]["index"].items() if k.startswith("knn.remote")},
+                "build_success_count_before": successes_before,
+                "build_success_count_after": successes,
+            }
 
         # Row i is document i, which is also Faiss label i in the native file.
         if args.encoding == "binary":
@@ -450,6 +616,8 @@ def main() -> None:
         }
         if args.encoding.startswith("on-disk"):
             manifest["compression_level"] = args.compression or "32x"
+        if args.remote:
+            manifest["remote_build"] = remote_record
         if args.queries:
             simd_container = args.container if args.encoding == "on-disk-half-float" else None
             manifest["live_queries"] = record_queries(args.host, index, dest, args.dim, args.queries, pos_of_doc, args.modes, simd_container)

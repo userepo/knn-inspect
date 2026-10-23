@@ -437,6 +437,12 @@ def build() -> Cases:
         put(d, f["cagra.base_level_only"]["offset"], "<?", False)
         return d
 
+    def cagra_storage_untrained(d, f):
+        put(d, f["storage.is_trained"]["offset"], "<?", False)
+        return d
+
+    c.add("cagra-storage-untrained", SYNTHETIC_CAGRA, "a CAGRA graph's storage header says untrained; only the ID map's header is left so by the builder", "headers", "warning", cagra_storage_untrained)
+
     c.add("cagra-not-base-level-only", SYNTHETIC_CAGRA, "a CAGRA graph's base_level_only flag cleared, so Faiss searches it as HNSW from its entry point, which is -1 in a graph of 100 nodes (the headers check warns of the flag)", "entry_point", "failure", cagra_not_base_only)
 
     return c

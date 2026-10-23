@@ -411,6 +411,16 @@ whose results come from Lucene 10.5.1 itself.
   statistics and the live index's results in three of those modes
   (`results.jsonl`, `results-no-rescore.jsonl`,
   `results-oversample-30.jsonl`)
+- `fixtures/opensearch-3.9.0-remote/` - segments built by k-NN's remote
+  index build on a GPU (the builder image pinned by digest in
+  `tools/docker-compose.remote.yml`), 500 vectors of 64 dimensions each,
+  one per layout the builder writes: a float field (`float/l2/`, and
+  `float/cosinesimil/` of 2,000 vectors, since the GPU build of 500
+  inner-product vectors fails and falls back to a local one), a
+  `half_float` one (`half-float/l2/`), a `byte` one (`byte/l2/`), a
+  `binary` one (`binary/hamming/`), and an `on_disk` one whose native
+  file holds the CAGRA graph without its vectors (`on-disk/l2/`); the GPU
+  build is not deterministic, so these were built once and are kept
 - `*.stats.json` beside each synthetic fixture and `stats.json` beside
   each real one - the graph statistics Faiss Python computes from the
   same file (for a graph without its vectors, from a copy Faiss can

@@ -54,6 +54,11 @@ fn baselines() -> Vec<PathBuf> {
         "opensearch-3.9.0-binary/on-disk-16x",
         "opensearch-3.9.0-binary/on-disk-8x",
         "opensearch-3.9.0-binary/on-disk-half-float",
+        "opensearch-3.9.0-remote/float",
+        "opensearch-3.9.0-remote/half-float",
+        "opensearch-3.9.0-remote/byte",
+        "opensearch-3.9.0-remote/binary",
+        "opensearch-3.9.0-remote/on-disk",
     ] {
         for entry in fs::read_dir(fixtures().join(set)).unwrap() {
             out.push(entry.unwrap().path().join("stats.json"));
@@ -97,7 +102,7 @@ fn stats_match_faiss_python() {
         unreachable_seen += stats.layers.iter().map(|l| l.unreachable).sum::<usize>();
         seen += 1;
     }
-    assert_eq!(seen, 50, "23 synthetic and 27 real baselines");
+    assert_eq!(seen, 56, "23 synthetic and 33 real baselines");
     // l2-4000x64 has unreachable nodes on levels 0 and 1, and the build of
     // on-disk-16x/l2 one on level 1, so the search itself is compared, not
     // only the empty case. Every node of the CAGRA fixtures is listed by

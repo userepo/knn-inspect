@@ -111,7 +111,11 @@ pub enum Check {
     /// entry points at random, so a count of none fails (Faiss refuses
     /// every search); a flag k-NN's builder sets but the file has off
     /// warns (`base_level_only`, without which Faiss searches the graph
-    /// as HNSW, and `keep_max_size_level0`, which changes no search).
+    /// as HNSW, and, for a float field, `keep_max_size_level0`, which
+    /// changes no search and which the builder leaves off for a binary
+    /// field). The ID map header of such a graph says untrained in every
+    /// file the builder writes, which k-NN does not read, so that does
+    /// not warn there.
     Headers,
     /// `--space` matches the metric the file records. With `--space
     /// cosine`, byte storage is also reported, as a warning or, when the

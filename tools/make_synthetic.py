@@ -114,8 +114,9 @@ BINARY_CASES = [
 # dimension, metric, and the storage, `f32` (`IxF2` or `IxFI`), `fp16`
 # (`IxSQ` with `QT_fp16`), or `byte` (`IxSQ` with `QT_8bit_direct_signed`,
 # the vectors scaled, rounded, and clipped as the byte cases are). Remote
-# builds need a dimension of 64 or more, and the builder makes a graph of
-# degree 2M on level 0.
+# builds need a dimension of 64 or more. The builder asks for a graph of
+# degree 4m (so Faiss records M = 2m), lowered for a small segment; these
+# cases keep faiss-cpu's own M of 16, so 32 slots on level 0.
 CAGRA_CASES = [
     ("l2-1000x64-cagra", 1000, 64, "l2", "f32"),
     ("ip-100x64-cagra", 100, 64, "ip", "f32"),
