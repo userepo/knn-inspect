@@ -779,10 +779,18 @@ counts a node as unreachable when no other node lists it (its own list
 leads nowhere new), such a node being returned only when a search draws
 it as an entry; with the flag off it
 reads the graph as an HNSW graph, from its entry point, where `-1`
-reaches nothing. `scan` reads the files as it reads the local build's,
-except that for `IHc2` over `null` it skips the check of the field's
-`.vemq` and `.veq` against the graph (the float headers record no code
-size to hold the records to; step b). `recall` refuses the graph with a
+reaches nothing. `scan` reads the files as it reads the local build's
+and marks a CAGRA graph's text line `cagra` beside its layout (its JSON
+entry carries `graph`, `hnsw` or `cagra`, for every file): the `.vec` and `.si`
+cross-checks run over the storage and labels as for an HNSW graph, and
+for `IHc2` over `null` the field's `.vemq` and `.veq` are checked
+against the graph as a binary graph-only file's are, tied through the
+`.fnm`, or by shape without one, except that the float headers record no
+code size to hold the records to, so the field's shape, similarity, and
+records decide alone (by shape, sibling fields of the same shape at other
+bit widths are checked too, and the worst outcome reported, as for any
+graph-only file without a `.fnm`).
+`recall` refuses the graph with a
 verdict until a later release brings the search from random entry points
 (0.13.0 in the plan).
 

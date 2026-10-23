@@ -111,6 +111,9 @@ struct FileReport {
     error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     layout: Option<Vec<String>>,
+    /// `hnsw`, or `cagra` for the graph k-NN's remote index build writes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    graph: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     dimension: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -374,6 +377,7 @@ fn scan_file(path: &Path, options: &Options) -> FileReport {
                 size: None,
                 error: Some(format!("opening {}: {e}", shown(path))),
                 layout: None,
+                graph: None,
                 dimension: None,
                 count: None,
                 metric: None,
@@ -426,11 +430,6 @@ fn scan_file(path: &Path, options: &Options) -> FileReport {
         let index = &p.index;
         let quantized = if index.index.storage.is_some() {
             LuceneQuantized::skipped(HOLDS_ITS_VECTORS.to_owned())
-        } else if index.index.kind.cagra().is_some() {
-            // The float headers of k-NN's remote build record no code size
-            // to hold the field's records to; the cross-check of this
-            // layout comes with step b of M15.
-            LuceneQuantized::skipped(CAGRA_GRAPH_ONLY.to_owned())
         } else {
             lucene_quantized(path, Graph::of(index), options.space)
         };
@@ -463,6 +462,7 @@ fn scan_file(path: &Path, options: &Options) -> FileReport {
         size: Some(bytes.len()),
         error: None,
         layout: idx.map(|i| i.layout().iter().map(ToString::to_string).collect()),
+        graph: idx.map(|i| i.index.kind.name()),
         dimension: idx.map(|i| i.header.d),
         count: idx.map(|i| i.header.ntotal),
         metric: idx.map(|i| i.metric().name()),
@@ -595,13 +595,6 @@ fn lucene_footer(bytes: &[u8]) -> Result<(), String> {
 /// Why a graph without its vectors has none to look for in a `.vec`.
 const GRAPH_ONLY: &str = "the native file holds the graph only: k-NN keeps the field's quantized vectors in Lucene's .veq file, checked under lucene_quantized";
 
-/// Why the quantized vectors of a CAGRA graph without its vectors are not
-/// checked yet.
-const CAGRA_GRAPH_ONLY: &str = "the native file holds a CAGRA graph without its vectors (k-NN's remote index build): the check of the field's .vemq and .veq against it does not read this layout yet";
-
-/// Why such a graph has nothing to look for in a `.vec` either.
-const CAGRA_GRAPH_ONLY_VEC: &str = "the native file holds a CAGRA graph without its vectors (k-NN's remote index build): nothing to compare with a .vec, and the check against the field's .vemq and .veq does not read this layout yet";
-
 /// The bytes to look for in a `.vec`, how else the `.vec` may hold them,
 /// and the stored vectors' shape; or why there is nothing to look for.
 fn stored_vectors<'a>(
@@ -657,11 +650,7 @@ fn lucene_vectors(path: &Path, bytes: &[u8], parsed: &knn_format::Parsed<'_>) ->
     // Said first: whatever .vec lies beside it, or none, a graph without
     // its vectors has nothing to compare with one.
     let Some(all) = parsed.index.index.storage else {
-        return skipped(if parsed.index.index.kind.cagra().is_some() {
-            CAGRA_GRAPH_ONLY_VEC.to_owned()
-        } else {
-            GRAPH_ONLY.to_owned()
-        });
+        return skipped(GRAPH_ONLY.to_owned());
     };
     let candidates = match segment_files(path, "vec") {
         Ok(c) => c,
@@ -1443,6 +1432,30 @@ fn find_rounded(vec: &[u8], region: Range<usize>, codes: &[U16], format: CodeFor
 /// text output: that of "unsupported", the longest.
 const VERDICT_WIDTH: usize = 11;
 
+/// A file's layout and shape on one line, or why there is none.
+fn shape(r: &FileReport) -> String {
+    match (&r.layout, r.dimension, r.count, &r.metric) {
+        (Some(layout), Some(d), Some(n), Some(metric)) => {
+            // Binary storage's dimension counts bits; a graph without its
+            // vectors counts the field's components.
+            let binary = r.code_size.is_some() && layout.last().map(String::as_str) != Some("null");
+            let bits = if binary { " bits" } else { "" };
+            // A remote-built segment looks like a local one from the
+            // outside; the graph kind is what tells them apart.
+            let cagra = if r.graph == Some("cagra") {
+                "  cagra"
+            } else {
+                ""
+            };
+            format!("{}  d={d}{bits} n={n} {metric}{cagra}", layout.join(" > "))
+        }
+        _ if r.status == Verdict::Unsupported => {
+            "(a layout or quantizer type this tool does not read)".to_owned()
+        }
+        _ => "(did not parse)".to_owned(),
+    }
+}
+
 fn text(out: &Output) -> String {
     let mut s = String::new();
     writeln!(s, "{}: {} native file(s)", out.directory, out.summary.files)
@@ -1454,22 +1467,8 @@ fn text(out: &Output) -> String {
             Verdict::Unsupported => "unsupported",
             Verdict::Failed => "FAILED",
         };
-        let shape = match (&r.layout, r.dimension, r.count, &r.metric) {
-            (Some(layout), Some(d), Some(n), Some(metric)) => {
-                // Binary storage's dimension counts bits; a graph without
-                // its vectors counts the field's components.
-                let binary =
-                    r.code_size.is_some() && layout.last().map(String::as_str) != Some("null");
-                let bits = if binary { " bits" } else { "" };
-                format!("{}  d={d}{bits} n={n} {metric}", layout.join(" > "))
-            }
-            _ if r.status == Verdict::Unsupported => {
-                "(a layout or quantizer type this tool does not read)".to_owned()
-            }
-            _ => "(did not parse)".to_owned(),
-        };
         writeln!(s, "  {}", r.file).expect("writing to a String cannot fail");
-        writeln!(s, "    {verdict:<VERDICT_WIDTH$} {shape}")
+        writeln!(s, "    {verdict:<VERDICT_WIDTH$} {}", shape(r))
             .expect("writing to a String cannot fail");
         if let Some(e) = &r.error {
             writeln!(s, "    {:<VERDICT_WIDTH$} {e}", "error")

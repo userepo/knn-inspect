@@ -119,6 +119,7 @@ Each entry of `files`:
 | `size` | integer, nullable | Bytes; `null` when the file would not open |
 | `error` | string, optional | Why the file would not open; `failures`, `warnings`, and `checks` are then absent, and every cross-check is `skipped` |
 | `layout`, `dimension`, `count`, `metric` | optional | As for `info`; absent when the file did not parse |
+| `graph` | string, optional | As for `info`: `hnsw` or `cagra`; absent when the file did not parse (since 0.12.0) |
 | `code_size` | integer, optional | As for `info`, for binary storage (since 0.7.0) and a graph without its vectors (since 0.8.0) |
 | `status` | string | `clean`, `warnings`, or `failed`, counting the Lucene cross-checks (a `warning` from `lucene_quantized` makes a file `warnings` that is otherwise clean, since 0.9.0); or `unsupported` (since 0.7.0): a file whose footer verifies, in a layout or scalar quantizer type this tool does not read, which fails only the structure check. `verify` fails such a file; `scan` does not count it as failed, since nothing is known to be wrong with it |
 | `failures`, `warnings`, `checks` | optional | As for `verify` |
@@ -237,7 +238,8 @@ than a relative 1e-4, far beyond float rounding.
   `.si`'s), is `damaged`, before any other outcome, whether or not a
   field checked out. Either way the field must be one k-NN builds such a
   graph over: float32 vectors quantized to 1, 2, or 4 bits, records of
-  the graph's code size, and a similarity that fits the graph's metric
+  the graph's code size (where the graph records one; a remote build's
+  CAGRA graph does not, since 0.12.0), and a similarity that fits the graph's metric
   (`euclidean` for `l2`, an inner-product one otherwise) and is the one
   k-NN records for the `--space` given (the `.vemq`, unlike the graph,
   tells `cosinesimil` from `innerproduct`), or it is a `mismatch`, as is

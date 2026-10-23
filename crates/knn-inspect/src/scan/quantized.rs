@@ -956,14 +956,17 @@ fn unfit(field: &QuantizedField, graph: Graph, space: Option<Space>) -> Option<S
             encoding.name()
         ));
     }
+    // The binary graph k-NN's local build writes records the record size
+    // as its code size; the float CAGRA graph of its remote build (`IxMp` >
+    // `IHc2` > `null`) has no code size to hold the records to, so for it
+    // the shape, the similarity, and the records themselves decide.
     let record = encoding.record_size(field.dimension);
-    if graph.code_size.and_then(|c| u64::try_from(c).ok()) != Some(record) {
+    if let Some(code_size) = graph.code_size
+        && u64::try_from(code_size).ok() != Some(record)
+    {
         return Some(format!(
-            "{shape} has records of {record} bytes ({}), not the graph's code size of {}",
+            "{shape} has records of {record} bytes ({}), not the graph's code size of {code_size}",
             encoding.name(),
-            graph
-                .code_size
-                .map_or_else(|| "none".to_owned(), |c| c.to_string())
         ));
     }
     if !similarity_fits(field.similarity, graph.metric) {

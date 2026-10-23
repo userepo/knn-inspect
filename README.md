@@ -179,7 +179,8 @@ finite.
 
 `scan` finds every `.faiss` and `.faissc` file under a directory,
 subdirectories included, and runs `verify` on each, printing one summary
-line per file (layout, dimension, count, metric, verdict) and the checks
+line per file (layout, dimension, count, metric, verdict, and `cagra` for
+the graph of a remote index build) and the checks
 that failed or warned. For a file in a layout or scalar quantizer type
 this tool does not read, it prints the structure check's finding, which
 names it, as a note. Links to directories are not followed, so a link
@@ -213,7 +214,9 @@ given, with the similarity k-NN records for its space type (since
 0.11.0), and names the `.vemq` that holds the field's quantized vectors.
 That `.vemq` must record the field with the graph's dimension and vector
 count, as the `.fnm` describes it, quantized to 1, 2, or 4 bits into
-records of the graph's code size, with a similarity that fits the
+records of the graph's code size (where the graph records one: the
+CAGRA graph of a remote build does not, and its field is held to the
+rest), with a similarity that fits the
 graph's metric and names the `--space` given (the `.fnm` and `.vemq`,
 unlike the graph, tell `cosinesimil` from `innerproduct`); the `.veq`
 beside it must hold every record, each with the sum of its components

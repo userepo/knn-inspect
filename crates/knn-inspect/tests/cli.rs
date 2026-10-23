@@ -2869,14 +2869,30 @@ fn cagra_graphs_refuse_recall_and_scan_clean() {
         "{f}"
     );
     assert_eq!(f["metric"], "inner_product", "{f}");
+    assert_eq!(f["graph"], "cagra", "{f}");
     assert!(f.get("code_size").is_none(), "{f}");
+    // Alone in its directory: the graph's vectors are looked for in the
+    // segment's .vemq, of which there is none.
+    assert_eq!(f["lucene_vectors"]["status"], "skipped", "{f}");
+    assert!(
+        f["lucene_vectors"]["detail"]
+            .as_str()
+            .unwrap()
+            .starts_with("the native file holds the graph only"),
+        "{f}"
+    );
     assert_eq!(f["lucene_quantized"]["status"], "skipped", "{f}");
     assert!(
         f["lucene_quantized"]["detail"]
             .as_str()
             .unwrap()
-            .starts_with("the native file holds a CAGRA graph without its vectors"),
+            .starts_with("no .vemq file of segment _0 beside the native file"),
         "{f}"
+    );
+    let text = stdout(&run(&["scan", scratch.0.to_str().unwrap()]));
+    assert!(
+        text.contains("IxMp > IHc2 > null  d=64 n=100 inner_product  cagra\n"),
+        "{text}"
     );
     let o = run(&["info", null_path.to_str().unwrap()]);
     let text = stdout(&o);
@@ -2930,4 +2946,279 @@ fn bf16_under_a_cagra_graph_fails_the_structure_check() {
     let o = run(&["verify", bf16_path.to_str().unwrap()]);
     assert_eq!(o.status.code(), Some(1), "{}", stdout(&o));
     assert!(stdout(&o).contains("FAIL  structure"), "{}", stdout(&o));
+}
+
+// The `on_disk` fixture's graph without its vectors (IBMp, IBHf, null)
+// rewritten in the layout k-NN's remote build writes for the same field
+// (IxMp, IHc2, null): float headers of the same dimension, count, and
+// metric, the CAGRA fields as the builder sets them, the same graph with
+// its upper levels emptied and its entry point and max_level at -1 (its
+// level-0 lists keep the HNSW build's padding, where the GPU copy fills
+// them), the same labels, and a Lucene footer over the result, as k-NN
+// appends one whatever built the graph.
+fn remote_built_from(bytes: &[u8]) -> Vec<u8> {
+    let parsed = knn_format::parse(bytes).unwrap();
+    let idx = &parsed.index;
+    assert_eq!(idx.layout()[2].to_string(), "null");
+    let graph = &idx.index.graph;
+    let float_header = |h: &knn_format::faiss::IndexHeader| {
+        let mut out = Vec::new();
+        out.extend_from_slice(&h.d.to_le_bytes());
+        out.extend_from_slice(&h.ntotal.to_le_bytes());
+        out.extend_from_slice(&(1_i64 << 20).to_le_bytes());
+        out.extend_from_slice(&(1_i64 << 20).to_le_bytes());
+        out.push(1);
+        out.extend_from_slice(&h.metric_type.to_le_bytes());
+        out
+    };
+    let mut out = Vec::new();
+    out.extend_from_slice(b"IxMp");
+    out.extend_from_slice(&float_header(&idx.header));
+    out.extend_from_slice(b"IHc2");
+    out.extend_from_slice(&float_header(&idx.index.header));
+    // keep_max_size_level0, base_level_only, 32 entry points, Float32.
+    out.extend_from_slice(&[1, 1]);
+    out.extend_from_slice(&32_i32.to_le_bytes());
+    out.extend_from_slice(&0_i32.to_le_bytes());
+    // The graph block runs from the first table's count to the `null`,
+    // which sits right before the labels' count.
+    let probas_count = knn_format::view_offset(bytes, graph.assign_probas).unwrap() - 8;
+    let labels_at = knn_format::view_offset(bytes, idx.id_map).unwrap() - 8;
+    let null_at = labels_at - 4;
+    assert_eq!(&bytes[null_at..labels_at], b"null");
+    let mut block = bytes[probas_count..null_at].to_vec();
+    let neighbors_at = knn_format::view_offset(bytes, graph.neighbors).unwrap() - probas_count;
+    for node in 0..graph.node_count() {
+        for level in 1..graph.cum_nneighbor_per_level.len() - 1 {
+            let Some(slots) = graph.neighbors_of(node, level) else {
+                break;
+            };
+            let first = knn_format::view_offset(bytes, slots).unwrap() - probas_count;
+            for k in 0..slots.len() {
+                block[first + k * 4..first + k * 4 + 4].copy_from_slice(&(-1_i32).to_le_bytes());
+            }
+        }
+    }
+    assert!(neighbors_at < block.len());
+    // The block ends with five int32s (write_HNSW): entry_point,
+    // max_level, efConstruction, efSearch, upper_beam; the first two sit
+    // 20 bytes before its end. The original's entry point is the one read
+    // back, so the position is checked before it is overwritten.
+    let tail = block.len() - 20;
+    assert_eq!(
+        i32::from_le_bytes(block[tail..tail + 4].try_into().unwrap()),
+        graph.entry_point
+    );
+    block[tail..tail + 4].copy_from_slice(&(-1_i32).to_le_bytes());
+    block[tail + 4..tail + 8].copy_from_slice(&(-1_i32).to_le_bytes());
+    out.extend_from_slice(&block);
+    out.extend_from_slice(b"null");
+    // The labels, to the index's end (the footer follows in the original).
+    out.extend_from_slice(&bytes[labels_at..idx.end]);
+    with_footer(out)
+}
+
+// `payload` with a Lucene footer over it: magic, algorithm 0, and the
+// CRC32 the reader computes over everything before it, big-endian, as
+// CodecUtil writes them.
+fn with_footer(payload: Vec<u8>) -> Vec<u8> {
+    let mut out = payload;
+    out.extend_from_slice(&knn_format::envelope::FOOTER_MAGIC.to_be_bytes());
+    out.extend_from_slice(&0_i32.to_be_bytes());
+    out.extend_from_slice(&0_i64.to_be_bytes());
+    let footer = knn_format::parse(&out).unwrap().envelope.footer.unwrap();
+    let Err(knn_format::Error::ChecksumMismatch { computed, .. }) = footer.verify(&out) else {
+        panic!("a zero checksum never matches");
+    };
+    let len = out.len();
+    out[len - 8..].copy_from_slice(&i64::from(computed).to_be_bytes());
+    knn_format::parse(&out)
+        .unwrap()
+        .envelope
+        .footer
+        .unwrap()
+        .verify(&out)
+        .unwrap();
+    out
+}
+
+// A copy of the on_disk/l2 fixture's segment files with its native file
+// rewritten as a remote build's: the scratch directory, the native file's
+// path, and its bytes.
+fn remote_built_segment(name: &str) -> (Scratch, PathBuf, Vec<u8>) {
+    let source = fixtures().join("opensearch-3.9.0-binary/on-disk/l2");
+    let scratch = Scratch::new(name);
+    for entry in std::fs::read_dir(&source).unwrap() {
+        let p = entry.unwrap().path();
+        if p.extension()
+            .is_some_and(|e| e == "faiss" || e == "json" || e == "jsonl" || e == "f32")
+        {
+            continue;
+        }
+        std::fs::copy(&p, scratch.0.join(p.file_name().unwrap())).unwrap();
+    }
+    let original = std::fs::read(source.join("_2_165_vec.faiss")).unwrap();
+    let remote = remote_built_from(&original);
+    let native = scratch.0.join("_2_165_vec.faiss");
+    std::fs::write(&native, &remote).unwrap();
+    (scratch, native, remote)
+}
+
+#[test]
+fn scan_checks_a_remote_built_graph_against_the_fields_quantized_vectors() {
+    // A remote-built segment of an sq-multibit field keeps the same Lucene
+    // files as a local one; only the native file differs. Rewritten from
+    // the on_disk fixture, its graph is tied to field "vec" through the
+    // .fnm and held to the .vemq, .veq, and .vec as a local graph is,
+    // except for the code size, which its float headers do not record.
+    let (scratch, native, _) = remote_built_segment("remote-built");
+    let path = native.to_str().unwrap();
+
+    let o = run(&["info", "--json", path]);
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(
+        v["layout"],
+        serde_json::json!(["IxMp", "IHc2", "null"]),
+        "{v}"
+    );
+    assert_eq!(v["graph"], "cagra", "{v}");
+    assert_eq!(v["dimension"], 16, "{v}");
+    assert_eq!(v["count"], 500, "{v}");
+    assert_eq!(v["metric"], "l2", "{v}");
+    assert_eq!(v["hnsw"]["level_counts"], serde_json::json!([500]), "{v}");
+    assert!(v.get("code_size").is_none(), "{v}");
+
+    let o = run(&["verify", "--space", "l2", path]);
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+
+    let o = run(&[
+        "scan",
+        "--space",
+        "l2",
+        scratch.0.to_str().unwrap(),
+        "--json",
+    ]);
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    let f = &v["files"][0];
+    assert_eq!(f["status"], "clean", "{f}");
+    assert_eq!(f["graph"], "cagra", "{f}");
+    assert_eq!(f["lucene_docs"]["status"], "match", "{f}");
+    assert_eq!(f["lucene_vectors"]["status"], "skipped", "{f}");
+    let q = &f["lucene_quantized"];
+    assert_eq!(q["status"], "match", "{q}");
+    assert_eq!(q["field"], "vec", "{q}");
+    assert_eq!(q["bits"], 1, "{q}");
+    assert_eq!(q["similarity"], "euclidean", "{q}");
+    assert!(
+        q["file"]
+            .as_str()
+            .unwrap()
+            .ends_with("_2_Faiss1040ScalarQuantizedKnnVectorsFormat_0.vemq"),
+        "{q}"
+    );
+    let text = stdout(&run(&["scan", scratch.0.to_str().unwrap()]));
+    assert!(
+        text.contains("    clean       IxMp > IHc2 > null  d=16 n=500 l2  cagra\n"),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_remote_built_graph_is_held_to_its_field_as_a_local_one_is() {
+    // The same field under the wrong space, a graph of another shape than
+    // the field's, and a graph of another metric than the field's
+    // similarity are refused as for a local graph; recall still refuses
+    // the graph with the field's files all there.
+    let (scratch, native, remote) = remote_built_segment("remote-built-unfit");
+    let path = native.to_str().unwrap();
+    let quantized = |dir: &Path| {
+        let o = run(&["scan", dir.to_str().unwrap(), "--json"]);
+        let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+        v["files"][0]["lucene_quantized"].clone()
+    };
+    // Every mutation below is footered again, so that the file fails the
+    // cross-check alone, not its checksum.
+    let payload = remote[..remote.len() - 16].to_vec();
+    // Both headers say inner product where the .vemq records euclidean:
+    // the field is not one k-NN builds such a graph for. The graph's
+    // metric is the ID map's, 33 bytes in, and the graph header's follows
+    // its own fourcc and 29 bytes of header.
+    let mut ip = payload.clone();
+    ip[33..37].copy_from_slice(&0_i32.to_le_bytes());
+    ip[4 + 33 + 4 + 29..4 + 33 + 4 + 33].copy_from_slice(&0_i32.to_le_bytes());
+    std::fs::write(&native, with_footer(ip)).unwrap();
+    let q = quantized(&scratch.0);
+    assert_eq!(q["status"], "mismatch", "{q}");
+    assert!(
+        q["detail"].as_str().unwrap().contains(
+            "records the euclidean similarity, which k-NN does not build an inner_product graph for"
+        ),
+        "{q}"
+    );
+    // Without the .fnm, the field is found by its shape, and checks out.
+    std::fs::write(&native, &remote).unwrap();
+    let fnm = scratch.0.join("_2.fnm");
+    let fnm_bytes = std::fs::read(&fnm).unwrap();
+    std::fs::remove_file(&fnm).unwrap();
+    let q = quantized(&scratch.0);
+    assert_eq!(q["status"], "match", "{q}");
+    assert!(q.get("field").is_none(), "{q}");
+    assert!(
+        q["detail"]
+            .as_str()
+            .unwrap()
+            .contains("the field was matched by shape"),
+        "{q}"
+    );
+    std::fs::write(&fnm, &fnm_bytes).unwrap();
+    let o = run(&[
+        "scan",
+        "--space",
+        "innerproduct",
+        scratch.0.to_str().unwrap(),
+        "--json",
+    ]);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(
+        v["files"][0]["lucene_quantized"]["status"], "mismatch",
+        "{v}"
+    );
+    // A remote-built graph of another dimension than the field's.
+    let mut other = payload.clone();
+    other[4..8].copy_from_slice(&32_i32.to_le_bytes());
+    let hnsw = 4 + 33;
+    other[hnsw + 4..hnsw + 8].copy_from_slice(&32_i32.to_le_bytes());
+    std::fs::write(&native, with_footer(other)).unwrap();
+    let o = run(&["scan", scratch.0.to_str().unwrap(), "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    let f = &v["files"][0];
+    assert_eq!(f["checks"][1]["name"], "checksum", "{f}");
+    assert!(
+        f["checks"][1].get("skipped").is_none(),
+        "{f}: footer verified"
+    );
+    let q = &f["lucene_quantized"];
+    assert_eq!(q["status"], "mismatch", "{q}");
+    assert!(
+        q["detail"]
+            .as_str()
+            .unwrap()
+            .contains("holds 500 vectors of dimension 16, the graph 500 of dimension 32"),
+        "{q}"
+    );
+
+    // recall still refuses it, with the field's files all there.
+    std::fs::write(&native, &remote).unwrap();
+    let o = run(&["recall", path, "--sample", "5"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("a CAGRA graph (k-NN's remote index build)")
+    );
 }
