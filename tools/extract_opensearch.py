@@ -69,9 +69,13 @@ remotely. The GPU build of a small inner-product or cosine set can
 fail (cuVS refused 500 random vectors, where 2,000 built), and k-NN
 then falls back to a local build. The script checks that the native
 file holds a CAGRA graph (a build that fell back to the local one is
-refused, and its copied segment removed) and records the
-builder image and its digest in the manifest. The GPU build is not
-deterministic, so a remote fixture is built once and kept.
+refused) and records the builder image and its digest in the manifest.
+The GPU build is not deterministic, so a remote fixture is built once
+and kept.
+
+Every segment is built beside its directory and swapped in only once
+every check has passed, so a refused or failed build leaves the fixture
+already there as it was.
 
 Usage:
     docker compose -f tools/docker-compose.yml up -d
@@ -91,6 +95,10 @@ Usage:
 
     docker compose -f tools/docker-compose.remote.yml up -d
     python tools/extract_opensearch.py --remote --dim 64 --out fixtures/opensearch-3.9.0-remote/float --spaces l2
+    python tools/extract_opensearch.py --remote --dim 64 --count 2000 --out fixtures/opensearch-3.9.0-remote/float --spaces cosinesimil
+    python tools/extract_opensearch.py --remote --dim 64 --out fixtures/opensearch-3.9.0-remote/half-float --encoding half-float --spaces l2
+    python tools/extract_opensearch.py --remote --dim 64 --out fixtures/opensearch-3.9.0-remote/byte --encoding byte --spaces l2
+    python tools/extract_opensearch.py --remote --dim 64 --out fixtures/opensearch-3.9.0-remote/binary --encoding binary
     python tools/extract_opensearch.py --remote --dim 64 --out fixtures/opensearch-3.9.0-remote/on-disk --encoding on-disk --spaces l2
 """
 
@@ -534,96 +542,101 @@ def main() -> None:
         compression = None if args.compression == "32x" else args.compression
         if compression is not None:
             index += f"-{compression}"
-        dest = args.out / space
+        final = args.out / space
+        # Built beside the fixture and swapped in once every check has
+        # passed, so a refused or failed build leaves the fixture as it was.
+        dest = args.out / f".{space}.partial"
         if dest.exists():
             shutil.rmtree(dest)
         dest.mkdir(parents=True)
+        try:
+            if args.remote:
+                index += "-remote"
+            successes_before = remote_build_successes(args.host) if args.remote else None
+            body = create_index(args.host, index, space, args.dim, args.compound, args.encoding, compression, args.remote)
+            bulk_index(args.host, index, vectors, args.batches)
+            segment = force_merge(args.host, index)
+            pos_of_doc = doc_order(args.host, index, args.count)
+            uuid = index_uuid(args.host, index)
+            files = copy_shard(args.container, uuid, segment, dest)
+            names = [f["name"] for f in files]
+            has_cfs = any(n.endswith(".cfs") for n in names)
+            if has_cfs != args.compound:
+                sys.exit(f"{index}: compound files {'present' if has_cfs else 'absent'} but --compound={args.compound}; files: {names}")
+            if args.remote:
+                # The builder's graph, not a local fallback: the CAGRA fourcc
+                # where the HNSW one would be.
+                native = next((n for n in names if ".faiss" in n), None)
+                if native is None:
+                    sys.exit(f"{index}: no native file in the segment: {names}")
+                data = (dest / native).read_bytes()
+                fourcc = b"IBHc" if args.encoding == "binary" else b"IHc2"
+                # The graph's fourcc follows the ID map's header: 33 bytes
+                # after a float ID map's fourcc (its metric type is 0 or 1, so
+                # no metric argument), 21 after a binary one's.
+                at = 4 + (21 if data[:4] == b"IBMp" else 33)
+                found = data[at : at + 4]
+                if found != fourcc:
+                    sys.exit(
+                        f"{index}: {native} holds {found!r} where {fourcc.decode()} would be: the build fell back to the local one "
+                        "(the node's log says why; the builder's says whether its job failed)"
+                    )
+                successes = remote_build_successes(args.host)
+                if successes is None or successes_before is None or successes <= successes_before:
+                    sys.exit(f"{index}: k-NN's remote build success count did not rise ({successes_before} -> {successes})")
+                remote_record = {
+                    **remote,
+                    "native_graph": fourcc.decode(),
+                    "index_settings": {k: v for k, v in body["settings"]["index"].items() if k.startswith("knn.remote")},
+                    "build_success_count_before": successes_before,
+                    "build_success_count_after": successes,
+                }
 
-        if args.remote:
-            index += "-remote"
-        successes_before = remote_build_successes(args.host) if args.remote else None
-        body = create_index(args.host, index, space, args.dim, args.compound, args.encoding, compression, args.remote)
-        bulk_index(args.host, index, vectors, args.batches)
-        segment = force_merge(args.host, index)
-        pos_of_doc = doc_order(args.host, index, args.count)
-        uuid = index_uuid(args.host, index)
-        files = copy_shard(args.container, uuid, segment, dest)
-        names = [f["name"] for f in files]
-        has_cfs = any(n.endswith(".cfs") for n in names)
-        if has_cfs != args.compound:
-            sys.exit(f"{index}: compound files {'present' if has_cfs else 'absent'} but --compound={args.compound}; files: {names}")
-        if args.remote:
-            # The builder's graph, not a local fallback: the CAGRA fourcc
-            # where the HNSW one would be.
-            native = next((n for n in names if ".faiss" in n), None)
-            if native is None:
-                shutil.rmtree(dest)
-                sys.exit(f"{index}: no native file in the segment: {names}")
-            data = (dest / native).read_bytes()
-            fourcc = b"IBHc" if args.encoding == "binary" else b"IHc2"
-            # The graph's fourcc follows the ID map's header: 33 bytes
-            # after a float ID map's fourcc (its metric type is 0 or 1, so
-            # no metric argument), 21 after a binary one's.
-            at = 4 + (21 if data[:4] == b"IBMp" else 33)
-            found = data[at : at + 4]
-            if found != fourcc:
-                # Not a fixture: the copy is removed, so a half-made one
-                # cannot be mistaken for a remote build later.
-                shutil.rmtree(dest)
-                sys.exit(
-                    f"{index}: {native} holds {found!r} where {fourcc.decode()} would be: the build fell back to the local one "
-                    "(the node's log says why; the builder's says whether its job failed)"
-                )
-            successes = remote_build_successes(args.host)
-            if successes is None or successes_before is None or successes <= successes_before:
-                sys.exit(f"{index}: k-NN's remote build success count did not rise ({successes_before} -> {successes})")
-            remote_record = {
-                **remote,
-                "native_graph": fourcc.decode(),
-                "index_settings": {k: v for k, v in body["settings"]["index"].items() if k.startswith("knn.remote")},
-                "build_success_count_before": successes_before,
-                "build_success_count_after": successes,
+            # Row i is document i, which is also Faiss label i in the native file.
+            if args.encoding == "binary":
+                vectors_file = "vectors.u8"
+                vectors[pos_of_doc].view(np.uint8).tofile(dest / vectors_file)
+                vectors_note = f"{args.dim // 8} bytes of packed bits per row, as the binary field received them (most significant bit first), in doc-id order: row i is document i, the Faiss label i; pos_of_doc[i] is its insertion position and its _id"
+            else:
+                vectors_file = "vectors.f32"
+                vectors[pos_of_doc].astype(np.float32).tofile(dest / vectors_file)
+                vectors_note = "row-major little-endian float32 in doc-id order: row i is document i, the Faiss label i; pos_of_doc[i] is its insertion position and its _id"
+            if args.encoding == "byte":
+                vectors_note += "; every value is an integer in [-128, 127], as the byte field received it"
+            manifest = {
+                "opensearch_version": os_version,
+                "knn_plugin_version": knn_version,
+                "index": index,
+                "index_uuid": uuid,
+                "segment": segment,
+                "compound_files": args.compound,
+                "encoding": args.encoding,
+                "space_type": space,
+                "count": args.count,
+                "dimension": args.dim,
+                "seed": SEED,
+                "vectors_file": vectors_file,
+                "vectors_note": vectors_note,
+                "pos_of_doc": pos_of_doc,
+                "request": body,
+                "files": files,
             }
-
-        # Row i is document i, which is also Faiss label i in the native file.
-        if args.encoding == "binary":
-            vectors_file = "vectors.u8"
-            vectors[pos_of_doc].view(np.uint8).tofile(dest / vectors_file)
-            vectors_note = f"{args.dim // 8} bytes of packed bits per row, as the binary field received them (most significant bit first), in doc-id order: row i is document i, the Faiss label i; pos_of_doc[i] is its insertion position and its _id"
-        else:
-            vectors_file = "vectors.f32"
-            vectors[pos_of_doc].astype(np.float32).tofile(dest / vectors_file)
-            vectors_note = "row-major little-endian float32 in doc-id order: row i is document i, the Faiss label i; pos_of_doc[i] is its insertion position and its _id"
-        if args.encoding == "byte":
-            vectors_note += "; every value is an integer in [-128, 127], as the byte field received it"
-        manifest = {
-            "opensearch_version": os_version,
-            "knn_plugin_version": knn_version,
-            "index": index,
-            "index_uuid": uuid,
-            "segment": segment,
-            "compound_files": args.compound,
-            "encoding": args.encoding,
-            "space_type": space,
-            "count": args.count,
-            "dimension": args.dim,
-            "seed": SEED,
-            "vectors_file": vectors_file,
-            "vectors_note": vectors_note,
-            "pos_of_doc": pos_of_doc,
-            "request": body,
-            "files": files,
-        }
-        if args.encoding.startswith("on-disk"):
-            manifest["compression_level"] = args.compression or "32x"
-        if args.remote:
-            manifest["remote_build"] = remote_record
-        if args.queries:
-            simd_container = args.container if args.encoding == "on-disk-half-float" else None
-            manifest["live_queries"] = record_queries(args.host, index, dest, args.dim, args.queries, pos_of_doc, args.modes, simd_container)
-        with open(dest / "manifest.json", "w", encoding="utf-8", newline="\n") as f:
-            json.dump(manifest, f, indent=2)
-            f.write("\n")
+            if args.encoding.startswith("on-disk"):
+                manifest["compression_level"] = args.compression or "32x"
+            if args.remote:
+                manifest["remote_build"] = remote_record
+            if args.queries:
+                simd_container = args.container if args.encoding == "on-disk-half-float" else None
+                manifest["live_queries"] = record_queries(args.host, index, dest, args.dim, args.queries, pos_of_doc, args.modes, simd_container)
+            with open(dest / "manifest.json", "w", encoding="utf-8", newline="\n") as f:
+                json.dump(manifest, f, indent=2)
+                f.write("\n")
+        except BaseException:
+            shutil.rmtree(dest, ignore_errors=True)
+            raise
+        if final.exists():
+            shutil.rmtree(final)
+        dest.rename(final)
 
         native = [f for f in files if ".faiss" in f["name"]]
         native_desc = ", ".join(f"{f['name']} ({f['size']} B)" for f in native) or "NONE"

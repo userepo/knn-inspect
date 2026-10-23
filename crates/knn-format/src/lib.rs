@@ -18,8 +18,8 @@
 //! vectors k-NN keeps in Lucene's files instead (an `on_disk` field, or
 //! one whose `sq` encoder keeps 1, 2, or 4 bits). k-NN's remote index
 //! build writes the same layouts with a CAGRA graph in place of the HNSW
-//! one: `IHc2` (or Faiss's older `IHNc`) over any of the float storages,
-//! or over `null` for an `sq` encoder of 1, 2, or 4 bits, and `IBHc` over
+//! one: `IHc2` (or Faiss's older `IHNc`) over float32, fp16, or byte
+//! storage, or over `null` for an `sq` encoder of 1, 2, or 4 bits, and `IBHc` over
 //! `IBxF`. See `docs/format-notes.md` in the repository for the
 //! byte-level description.
 //!

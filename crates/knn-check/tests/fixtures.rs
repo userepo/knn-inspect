@@ -103,8 +103,8 @@ fn synthetic_fixtures_are_clean() {
         seen += 1;
     }
     assert_eq!(
-        seen, 23,
-        "five float, three fp16, three bf16, four byte, three binary, and five CAGRA synthetic fixtures"
+        seen, 24,
+        "five float, three fp16, three bf16, four byte, three binary, and six CAGRA synthetic fixtures"
     );
 }
 
@@ -183,12 +183,13 @@ fn cagra_findings_name_what_the_builder_writes() {
     );
 
     let report = verify("cagra-max-level-set.faiss");
+    assert_eq!(report.status, Status::Warnings, "{report:#?}");
     let levels = report.result(Check::Levels).unwrap();
     assert_eq!(levels.count, 1, "{levels:#?}");
     assert!(
         levels.findings[0]
             .message
-            .starts_with("max_level is 0; a search of this graph"),
+            .starts_with("max_level is 3; a search of this graph"),
         "{levels:#?}"
     );
 
@@ -238,30 +239,61 @@ fn cagra_findings_name_what_the_builder_writes() {
     );
     assert_eq!(headers.findings[0].offset, Some(hnsw + 4 + 33));
 
-    // Without base_level_only, the graph is an HNSW graph to Faiss: the
-    // flag warns, and the -1 entry point fails as any HNSW graph's would.
+    // Without base_level_only, k-NN's memory-optimized search still
+    // starts from random entry points, so only the flag warns: the -1
+    // entry point and max_level are what the builder writes.
     let report = verify("cagra-not-base-level-only.faiss");
-    assert_eq!(report.status, Status::Failed, "{report:#?}");
+    assert_eq!(report.status, Status::Warnings, "{report:#?}");
     let headers = report.result(Check::Headers).unwrap();
-    assert_eq!(headers.severity, Some(Severity::Warning), "{headers:#?}");
+    assert_eq!(headers.count, 1, "{headers:#?}");
     assert!(
         headers.findings[0]
             .message
             .starts_with("the graph's base_level_only flag is off"),
         "{headers:#?}"
     );
-    let entry = report.result(Check::EntryPoint).unwrap();
-    assert_eq!(
-        entry.findings[0].message,
-        "entry point -1 is not a node (count 100)"
-    );
+    assert_eq!(report.warnings, 1, "{report:#?}");
+}
+
+#[test]
+fn nothing_on_a_cagra_graphs_upper_levels_fails() {
+    let dir = fixtures().join("corrupted");
+    let read = |name: &str| fs::read(dir.join(name)).unwrap();
+
+    // A neighbor only on level 0, an id past the graph, and a self-loop
+    // listed twice, all on level 1: a search never reads it, so the
+    // levels check's warning is the one finding.
+    let bytes = read("cagra-upper-level-bad-neighbors.faiss");
+    let report = knn_check::verify(&bytes, &options(None));
+    assert_eq!(report.status, Status::Warnings, "{report:#?}");
+    assert_eq!(report.warnings, 1, "{report:#?}");
     let levels = report.result(Check::Levels).unwrap();
     assert!(
         levels.findings[0]
             .message
-            .starts_with("max_level is -1 but the highest node level implies"),
+            .contains("lists neighbors on level 1, which a search of this graph never reads"),
         "{levels:#?}"
     );
+    for check in [
+        Check::NeighborIds,
+        Check::NeighborLevels,
+        Check::SelfLoops,
+        Check::DuplicateNeighbors,
+    ] {
+        assert_eq!(report.result(check).unwrap().count, 0, "{check:?}");
+    }
+
+    // A max_level of 3 is never read either: one level is searched, and
+    // the statistics have one layer.
+    let bytes = read("cagra-max-level-set.faiss");
+    let parsed = knn_format::parse(&bytes).unwrap();
+    let index = &parsed.index.index;
+    assert_eq!(index.graph.max_level, 3);
+    assert!(index.graph.searched_levels() > 1);
+    assert_eq!(index.level_counts(), vec![100]);
+    let stats = knn_check::index_stats(index);
+    assert_eq!(stats.layers.len(), 1);
+    assert_eq!(stats.layers[0].nodes, 100);
 }
 
 #[test]

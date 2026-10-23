@@ -331,10 +331,11 @@ impl<'a> OnDiskField<'a> {
         flat: &FlatField,
         vec: &'a [u8],
     ) -> Result<Self> {
-        // k-NN searches a CAGRA graph of its base level from random entry
-        // points, not with the descent below, which would start from its
-        // -1 entry point and find nothing.
-        if index.index.base_level_only() {
+        // k-NN searches a CAGRA graph from random entry points on its base
+        // level, whatever its base_level_only flag says, not with the
+        // descent below, which would start from its -1 entry point and
+        // find nothing.
+        if index.index.random_entry_points() {
             return Err(Error::RandomEntryPoints);
         }
         if index.index.storage.is_some() {

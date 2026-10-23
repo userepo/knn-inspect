@@ -52,8 +52,11 @@ the vectors instead. A binary file reports `hamming`, the distance a
 binary index computes, and its dimension in bits. A graph without its
 vectors, as k-NN writes for an `on_disk` field, reports the metric it
 was built for (`l2` or `inner_product`, or `metric_n` for any other type
-`n`), its dimension in components, and the graph's code size: a
-quantized vector plus 16 bytes of correction factors.
+`n`), its dimension in components, and, under an `IBHf` graph, the
+graph's code size: a quantized vector plus 16 bytes of correction
+factors. The CAGRA graph of a remote build has float headers, which
+record no code size. For a CAGRA graph `info` also names the graph and
+prints the fields Faiss stores after its header.
 
 `verify` runs every structural check and prints one line per check.
 Failures: footer checksum, truncation, an unsupported layout or scalar
@@ -69,7 +72,8 @@ non-monotonic neighbor offsets, node levels that contradict the slot
 counts, an invalid entry point, neighbor ids out of range, a neighbor
 listed on a level it is not on, a vector array or ID map of the wrong
 size. Warnings: an unexpected Lucene header, a Faiss header that says
-the index is not trained, trained values in a scalar quantizer, a binary
+the index is not trained (except a CAGRA graph's ID map header, which
+the remote build always leaves so), trained values in a scalar quantizer, a binary
 storage header with a metric type k-NN never writes, header values k-NN
 writes for a graph without its vectors but never reads when they differ
 from what it writes (a graph metric type other than the ID map's, an ID
@@ -83,6 +87,16 @@ fields, and any other space is noted rather than failed: k-NN writes the
 same binary index for a float field with the binary encoder. A graph
 without its vectors is checked against the metric its ID map records,
 which k-NN reads, and its vector count, values, and norms are skipped.
+
+A CAGRA graph is held to what k-NN's search of it reads: level 0 alone,
+from nodes drawn at random. A count of zero random entry points fails,
+since Faiss then refuses every search. The entry point, `max_level`,
+and the upper levels are never read, so a value other than what the
+remote build writes there (-1, -1, and empty lists) warns and never
+fails, whatever the upper levels hold. So does a `base_level_only` flag
+that is off, and for a float graph a `keep_max_size_level0` flag that
+is off.
+
 Exit code 0 when clean, 1 on any failure, 2 on warnings only. Where a
 finding points at bytes or a node, it names the file offset and node, so
 it can be looked up in a hex dump.
@@ -92,7 +106,11 @@ the out-degree histogram, and the nodes no search can reach. A node's
 neighbor list ends at its first empty slot, as Faiss's search reads it.
 Reachability is a breadth-first search per level: the top level starts
 from the entry point, each lower level from every node reached above it,
-so no query can ever visit an unreachable node.
+so no query can ever visit an unreachable node. A CAGRA graph is
+searched on level 0 alone, from nodes drawn at random, so `stats`
+reports that level only. A node there is unreachable when no other
+node's neighbor list leads to it, and a search returns it only when it
+draws it as an entry point.
 Exit code 0 when the file parsed, 1 otherwise.
 
 `recall` measures recall@k against exact brute force over the file's own
@@ -130,7 +148,9 @@ the returned labels in rank order as a JSON array or `{"labels": [...]}`.
 Labels are the file's own (Lucene doc ids in a k-NN segment) unless
 `--ids` names a JSON array with node i's id at index i, one per vector,
 for results that carry some other id, such as a stored position field
-returned by a live query.
+returned by a live query. Scoring needs the brute force alone, not a
+search, so it works on a CAGRA graph too, whose own search `recall`
+does not run yet.
 
 A label matches when its vector is at least as close to the query as the
 k-th nearest, so a tie with the k-th neighbor counts; a label repeated
@@ -182,8 +202,9 @@ subdirectories included, and runs `verify` on each, printing one summary
 line per file (layout, dimension, count, metric, verdict, and `cagra` for
 the graph of a remote index build) and the checks
 that failed or warned. For a file in a layout or scalar quantizer type
-this tool does not read, it prints the structure check's finding, which
-names it, as a note. Links to directories are not followed, so a link
+this tool does not read, or bf16 storage under a CAGRA graph, which the
+remote build never writes and this tool refuses, it prints the structure
+check's finding, which names it, as a note. Links to directories are not followed, so a link
 back up the tree cannot loop; a link to a native file is scanned like
 the file. A subdirectory that cannot be read is listed as not scanned,
 and the rest of the tree still is.
@@ -252,7 +273,8 @@ as a newer Lucene may write, is skipped instead, as is a sound `.vemq`
 in such a format; a sound `.fnm` in one leaves the field matched by
 shape. `--space` applies to every file found; leave it out when the
 directory mixes space types. A sound file in a layout or scalar
-quantizer type this tool does not read is reported as `unsupported`
+quantizer type this tool does not read, or with bf16 storage under a
+CAGRA graph, is reported as `unsupported`
 rather than failed: `verify` alone fails it, but a scan of a whole index
 must not read it as corruption. Exit code 0 when every file is clean, 1
 if any failed (or would not open, a subdirectory could not be read, or
@@ -334,17 +356,18 @@ quantized vectors in Lucene's files; and the CAGRA graphs k-NN's remote
 index build writes in place of the HNSW ones (CAGRA, Cuda Anns
 GRAph-based, is the GPU-built graph index of NVIDIA's cuVS library;
 `IHc2` over float32, fp16, or byte storage or none, `IBHc` over binary
-storage), which Faiss searches on their base level alone, from random
+storage), which k-NN searches on their base level alone, from random
 entry points; with or
 without the Lucene footer. Every command reads all of them, except that
 `recall` on a graph without its vectors needs the segment's `.fnm` and
 the field's `.vemq`, `.veq`, `.vemf`, and `.vec` loose, not in a
-compound file, and `recall` refuses a CAGRA graph: its search from
-random entry points comes in a later release. Fixtures and format notes target
+compound file, and `recall` scores lists from elsewhere on a CAGRA graph
+but does not search it: its search from random entry points comes in a
+later release. Fixtures and format notes target
 OpenSearch 3.9.0.
 
 Not yet: other scalar-quantized storage, product quantization, IVF, and
-`recall` on CAGRA graphs. Files in
+`recall`'s own search of CAGRA graphs. Files in
 another layout or scalar quantizer type are refused rather than misread:
 `verify` fails them, and `scan` reports those whose footer verifies as
 `unsupported`. NMSLIB and Lucene-engine fields write no `.faiss` file,
@@ -383,8 +406,8 @@ whose results come from Lucene 10.5.1 itself.
 - `fixtures/synthetic-binary/` - three binary files, one of 8 bits whose
   1,000 vectors take only 251 values, so distances nearly all tie, each
   with an `.expected.json`
-- `fixtures/synthetic-cagra/` - five files in the layouts k-NN's remote
-  index build writes, two float32, one fp16, one byte, and one binary,
+- `fixtures/synthetic-cagra/` - files in the layouts k-NN's remote
+  index build writes, over float32, fp16, byte, and binary storage,
   each a CAGRA graph of its base level over 64-dimensional vectors, with
   an `.expected.json`; faiss-cpu builds the base level as an HNSW graph,
   then the file is cut to what the GPU copy leaves (see

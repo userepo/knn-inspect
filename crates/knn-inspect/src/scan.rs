@@ -65,7 +65,8 @@ struct Summary {
 }
 
 /// A file's verdict, or the directory's: [`Status`] plus a layout or
-/// scalar quantizer type this tool does not read.
+/// scalar quantizer type this tool does not read, or refuses where k-NN
+/// never writes it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum Verdict {
@@ -74,7 +75,8 @@ enum Verdict {
     /// Warnings only.
     Warnings,
     /// A sound file, its footer verifying, in a layout or scalar quantizer
-    /// type this tool does not read: nothing is known to be wrong with it.
+    /// type this tool does not read, or refuses where k-NN never writes it
+    /// (bf16 under a CAGRA graph): nothing is known to be wrong with it.
     Unsupported,
     /// At least one failure.
     Failed,
@@ -135,6 +137,10 @@ struct FileReport {
     /// For a graph without its vectors, the quantized vectors Lucene keeps
     /// for it.
     lucene_quantized: LuceneQuantized,
+    /// For an unsupported file, why: a quantizer type refused where k-NN
+    /// never writes it, rather than one this tool does not read.
+    #[serde(skip)]
+    refused: bool,
 }
 
 /// The vectors compared with the segment's Lucene flat-vector file.
@@ -368,33 +374,34 @@ fn is_native(path: &Path) -> bool {
         .is_some_and(|e| e == "faiss" || e == "faissc")
 }
 
+/// The report of a native file that could not be opened.
+fn unopened(path: &Path, e: &knn_format::Error) -> FileReport {
+    let why = || "the native file could not be opened".to_owned();
+    FileReport {
+        file: shown(path),
+        size: None,
+        error: Some(format!("opening {}: {e}", shown(path))),
+        layout: None,
+        graph: None,
+        dimension: None,
+        count: None,
+        metric: None,
+        code_size: None,
+        status: Verdict::Failed,
+        failures: None,
+        warnings: None,
+        checks: None,
+        lucene_vectors: LuceneVectors::skipped(why()),
+        lucene_docs: LuceneDocs::skipped(why()),
+        lucene_quantized: LuceneQuantized::skipped(why()),
+        refused: false,
+    }
+}
+
 fn scan_file(path: &Path, options: &Options) -> FileReport {
     let file = match NativeFile::open(path) {
         Ok(file) => file,
-        Err(e) => {
-            return FileReport {
-                file: shown(path),
-                size: None,
-                error: Some(format!("opening {}: {e}", shown(path))),
-                layout: None,
-                graph: None,
-                dimension: None,
-                count: None,
-                metric: None,
-                code_size: None,
-                status: Verdict::Failed,
-                failures: None,
-                warnings: None,
-                checks: None,
-                lucene_vectors: LuceneVectors::skipped(
-                    "the native file could not be opened".to_owned(),
-                ),
-                lucene_docs: LuceneDocs::skipped("the native file could not be opened".to_owned()),
-                lucene_quantized: LuceneQuantized::skipped(
-                    "the native file could not be opened".to_owned(),
-                ),
-            };
-        }
+        Err(e) => return unopened(path, &e),
     };
     let bytes = file.bytes();
     let report = knn_check::verify(bytes, options);
@@ -423,6 +430,8 @@ fn scan_file(path: &Path, options: &Options) -> FileReport {
         }
         _ => "the native file's layout is not supported",
     };
+    let refused =
+        unsupported && matches!(parsed, Err(knn_format::Error::UnexpectedQuantizer { .. }));
     let parsed = parsed.ok();
     let idx = parsed.as_ref().map(|p| &p.index);
 
@@ -474,6 +483,7 @@ fn scan_file(path: &Path, options: &Options) -> FileReport {
         lucene_vectors,
         lucene_docs,
         lucene_quantized,
+        refused,
     }
 }
 
@@ -1448,6 +1458,9 @@ fn shape(r: &FileReport) -> String {
                 ""
             };
             format!("{}  d={d}{bits} n={n} {metric}{cagra}", layout.join(" > "))
+        }
+        _ if r.status == Verdict::Unsupported && r.refused => {
+            "(a scalar quantizer type k-NN never writes under this graph, refused)".to_owned()
         }
         _ if r.status == Verdict::Unsupported => {
             "(a layout or quantizer type this tool does not read)".to_owned()

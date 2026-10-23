@@ -6,10 +6,11 @@
 //! or `IBMp` wrapping `IBHf` over `null`, a graph whose vectors k-NN keeps
 //! in Lucene's files, as it writes an `on_disk` field's. k-NN's remote
 //! index build writes a CAGRA graph in place of the HNSW one: `IHc2` (or
-//! Faiss's older `IHNc`) over any of the float storages or `null`, and
-//! `IBHc` over `IBxF`; each adds a few fields ([`CagraFields`]) before the
-//! same HNSW block, and Faiss searches it on its base level alone, from
-//! random entry points.
+//! Faiss's older `IHNc`) over float32, fp16, or byte storage or `null`,
+//! and `IBHc` over `IBxF`; each adds a few fields ([`CagraFields`]) before
+//! the same HNSW block, and k-NN searches it on its base level alone, from
+//! random entry points. bf16 storage under a CAGRA graph, which Faiss
+//! reads but the remote build never writes, is refused.
 //!
 //! Every array is a view into the file's bytes. Element types are the
 //! unaligned little-endian wrappers from `zerocopy`; call `.get()` on an
@@ -39,7 +40,7 @@ impl FourCc {
     /// `IndexHNSWSQ`.
     pub const HNSW_SQ: Self = Self(*b"IHNs");
     /// `IndexHNSWCagra`: the graph k-NN's remote index build writes, over
-    /// any float storage or none.
+    /// float32, fp16, or byte storage, or none.
     pub const HNSW_CAGRA: Self = Self(*b"IHc2");
     /// `IndexHNSWCagra` as Faiss wrote it before the numeric type was
     /// added. Faiss at `5616caa` still reads it; only k-NN's own test
@@ -325,9 +326,9 @@ impl<'a> HnswGraph<'a> {
     /// describes (one fewer than its entries), so a corrupt `max_level`
     /// cannot drive an allocation. 0 for an empty graph whose `max_level`
     /// is -1, as Faiss leaves one; an empty graph that records a
-    /// `max_level` has that many levels, all empty. A CAGRA graph with
-    /// `base_level_only` set is searched on level 0 whatever its
-    /// `max_level` says: see [`HnswIndex::level_counts`].
+    /// `max_level` has that many levels, all empty. k-NN searches a CAGRA
+    /// graph on level 0 whatever its `max_level` says: see
+    /// [`HnswIndex::level_counts`].
     #[must_use]
     pub fn searched_levels(&self) -> usize {
         let claimed = match usize::try_from(self.max_level) {
@@ -917,30 +918,34 @@ impl<'a> Storage<'a> {
 /// k-NN's remote index build makes such a graph on a GPU and copies it
 /// into the base level of an HNSW index (`GpuIndexCagra::copyTo`): level
 /// 0 holds the CAGRA graph, every node's upper-level slots stay empty,
-/// and the entry point and `max_level` stay -1. With `base_level_only`
-/// set, Faiss searches level 0 alone, starting from the nearest of
-/// `search_entry_points` nodes drawn at random for each query, so the
-/// entry point and `max_level` are never read.
+/// and the entry point and `max_level` stay -1. k-NN searches level 0
+/// alone, starting from the nearest of `search_entry_points` nodes drawn
+/// at random for each query, so the entry point and `max_level` are never
+/// read: its memory-optimized search does so for every CAGRA graph, and
+/// Faiss's own search when `base_level_only` is set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CagraFields {
     /// File offset of the first field, right after the index header.
     pub offset: usize,
     /// `keep_max_size_level0`: whether level 0's neighbor lists are kept
-    /// at their full size while building. The GPU copy sets it.
+    /// at their full size while building. The float copy sets it; the
+    /// binary copy leaves it off.
     pub keep_max_size_level0: bool,
-    /// `base_level_only`: whether the graph is searched on level 0 alone,
-    /// from random entry points. k-NN's remote build sets it; an index
-    /// with it set refuses to add vectors.
+    /// `base_level_only`: whether Faiss's own search reads level 0 alone,
+    /// from random entry points. Without it, Faiss starts from the entry
+    /// point, which the remote build leaves at -1, and finds nothing;
+    /// k-NN's memory-optimized search ignores it. k-NN's remote build
+    /// sets it; an index with it set refuses to add vectors.
     pub base_level_only: bool,
     /// `num_base_level_search_entrypoints`: how many nodes a search draws
-    /// at random to start from, when `base_level_only` is set. Faiss
-    /// refuses to search with none.
+    /// at random to start from. Faiss refuses to search with none.
     pub search_entry_points: i32,
     /// `numeric_type_` as stored, for `IHc2` only: the storage's numeric
     /// type as Faiss names it (0 `Float32`, 1 `Float16`, 2 `UInt8`, 3
-    /// `Int8`; see [`numeric_type_name`]). k-NN reads and discards it, and
-    /// the Faiss it builds leaves it uninitialized, so it describes
-    /// nothing and is shown, never checked.
+    /// `Int8`; see [`numeric_type_name`]). k-NN reads and discards it.
+    /// The builder's Faiss sets it from the storage, while the Faiss k-NN
+    /// builds leaves it uninitialized in the files it writes (k-NN's own
+    /// test files hold arbitrary values), so it is shown, never checked.
     pub numeric_type: Option<i32>,
 }
 
@@ -993,9 +998,9 @@ impl GraphKind {
 #[derive(Debug, Clone, Copy)]
 pub struct HnswIndex<'a> {
     /// `IHNf` over float32 storage, `IHNs` over fp16, bf16, or byte, or
-    /// `IBHf` over binary storage or none; or `IHc2` (or `IHNc`) over any
-    /// of the float storages or none, or `IBHc` over binary storage, for
-    /// a CAGRA graph.
+    /// `IBHf` over binary storage or none; or `IHc2` (or `IHNc`) over
+    /// float32, fp16, or byte storage or none, or `IBHc` over binary
+    /// storage, for a CAGRA graph.
     pub fourcc: FourCc,
     /// The HNSW index's own header.
     pub header: IndexHeader,
@@ -1013,23 +1018,24 @@ pub struct HnswIndex<'a> {
 }
 
 impl HnswIndex<'_> {
-    /// Whether Faiss searches the graph on level 0 alone, from random
-    /// entry points, never reading its entry point or `max_level`: a
-    /// CAGRA graph with `base_level_only` set, as k-NN's remote build
-    /// writes it. An HNSW graph, or a CAGRA one without the flag, is
-    /// searched from its entry point down its levels.
+    /// Whether k-NN searches the graph on level 0 alone, from random
+    /// entry points, never reading its entry point or `max_level`: every
+    /// CAGRA graph, which k-NN's memory-optimized search loads that way
+    /// whatever its `base_level_only` flag says. (Faiss's own search
+    /// honors the flag, and without it finds nothing from the -1 entry
+    /// point the remote build writes.) An HNSW graph is searched from its
+    /// entry point down its levels.
     #[must_use]
-    pub fn base_level_only(&self) -> bool {
-        self.kind.cagra().is_some_and(|c| c.base_level_only)
+    pub fn random_entry_points(&self) -> bool {
+        self.kind.cagra().is_some()
     }
 
     /// Nodes on each level a search of this index reads, level 0 first:
-    /// level 0 alone for a graph searched on its base level only
-    /// ([`Self::base_level_only`]), whatever its `max_level` says, else
-    /// [`HnswGraph::level_counts`].
+    /// level 0 alone for a CAGRA graph ([`Self::random_entry_points`]),
+    /// whatever its `max_level` says, else [`HnswGraph::level_counts`].
     #[must_use]
     pub fn level_counts(&self) -> Vec<usize> {
-        if !self.base_level_only() {
+        if !self.random_entry_points() {
             return self.graph.level_counts();
         }
         if self.graph.node_count() == 0 || self.graph.cum_nneighbor_per_level.len() < 2 {

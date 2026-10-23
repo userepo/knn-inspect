@@ -46,13 +46,13 @@ pub struct LayerStats {
     pub unreachable_nodes: Vec<usize>,
 }
 
-/// Computes the statistics of `index`'s graph as Faiss searches it:
-/// [`base_level_stats`] for a CAGRA graph with `base_level_only` set,
-/// which k-NN's remote index build writes, and [`graph_stats`] for any
-/// other, HNSW or CAGRA, searched from its entry point.
+/// Computes the statistics of `index`'s graph as k-NN searches it:
+/// [`base_level_stats`] for a CAGRA graph, which k-NN's remote index
+/// build writes, and [`graph_stats`] for an HNSW one, searched from its
+/// entry point.
 #[must_use]
 pub fn index_stats(index: &HnswIndex<'_>) -> GraphStats {
-    if index.base_level_only() {
+    if index.random_entry_points() {
         base_level_stats(&index.graph)
     } else {
         graph_stats(&index.graph)
@@ -81,8 +81,8 @@ pub fn graph_stats(graph: &HnswGraph<'_>) -> GraphStats {
     stats(graph, graph.searched_levels(), false)
 }
 
-/// Computes the statistics of `graph`'s level 0, searched as Faiss
-/// searches a CAGRA graph with `base_level_only` set: from random entry
+/// Computes the statistics of `graph`'s level 0, searched as k-NN
+/// searches a CAGRA graph: from random entry
 /// points, never reading the entry point, `max_level`, or the upper
 /// levels. Any node can be where a search starts, so a node is unreached
 /// when no other node on the level lists it (its own list leads nowhere

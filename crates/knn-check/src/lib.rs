@@ -110,8 +110,9 @@ pub enum Check {
     /// writes, the fields after its header too: a search draws its
     /// entry points at random, so a count of none fails (Faiss refuses
     /// every search); a flag k-NN's builder sets but the file has off
-    /// warns (`base_level_only`, without which Faiss searches the graph
-    /// as HNSW, and, for a float field, `keep_max_size_level0`, which
+    /// warns (`base_level_only`, without which Faiss's own search finds
+    /// nothing from the -1 entry point, though k-NN's memory-optimized
+    /// search ignores it, and, for a float field, `keep_max_size_level0`, which
     /// changes no search and which the builder leaves off for a binary
     /// field). The ID map header of such a graph says untrained in every
     /// file the builder writes, which k-NN does not read, so that does
@@ -129,13 +130,14 @@ pub enum Check {
     /// Neighbor offsets are monotonic and end at the neighbor array.
     Offsets,
     /// Node levels match the per-node slot counts and the level table,
-    /// and `max_level` is the highest node level. A CAGRA graph of its
-    /// base level is searched on level 0 alone: its `max_level`, never
-    /// read, warns when it is not the -1 k-NN's builder writes, and so
-    /// does a neighbor on an upper level, which the builder leaves empty.
+    /// and `max_level` is the highest node level. k-NN searches a CAGRA
+    /// graph on level 0 alone: its `max_level`, never read, warns when it
+    /// is not the -1 k-NN's builder writes, and so does a neighbor on an
+    /// upper level, which the builder leaves empty; nothing on an upper
+    /// level fails the neighbor checks.
     Levels,
-    /// The entry point exists and sits on the top level. A CAGRA graph of
-    /// its base level is searched from random entry points: its entry
+    /// The entry point exists and sits on the top level. k-NN searches a
+    /// CAGRA graph from random entry points: its entry
     /// point, never read, warns when it is not the -1 k-NN's builder
     /// writes.
     EntryPoint,

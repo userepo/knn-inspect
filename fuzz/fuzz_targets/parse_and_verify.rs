@@ -171,11 +171,11 @@ fuzz_target!(|data: &[u8]| {
         let _ = parsed.index.code_size();
         let _ = parsed.index.layout();
         let _ = parsed.index.index.kind.cagra();
-        let _ = parsed.index.index.base_level_only();
+        let _ = parsed.index.index.random_entry_points();
         // The search k-NN runs with Lucene's searcher, over any graph,
         // with or without its vectors: scores from the node ids, many of
         // them tied, for k below, at, and past the node count, with and
-        // without a visit limit. Over a CAGRA graph of its base level it
+        // without a visit limit. Over a CAGRA graph it
         // starts from the -1 entry point and finds nothing, as documented;
         // it must still not panic.
         let n = graph.node_count();
@@ -196,10 +196,10 @@ fuzz_target!(|data: &[u8]| {
         'storage: {
             let Some(storage) = &parsed.index.index.storage else {
                 // A graph without its vectors: nothing to search; a CAGRA
-                // graph of its base level is refused before that is seen.
+                // graph is refused before that is seen.
                 let mut searcher = knn_recall::Searcher::new(graph.node_count());
                 let searched = searcher.search(&parsed.index.index, &[0.0_f32][..], 3, 5);
-                if parsed.index.index.base_level_only() {
+                if parsed.index.index.random_entry_points() {
                     assert!(matches!(
                         searched,
                         Err(knn_recall::Error::RandomEntryPoints)
@@ -221,11 +221,11 @@ fuzz_target!(|data: &[u8]| {
             };
             if let Some(query) = query {
                 let mut searcher = knn_recall::Searcher::new(graph.node_count());
-                // A CAGRA graph of its base level is refused, not searched.
+                // A CAGRA graph is refused, not searched.
                 let searched = searcher.search(&parsed.index.index, query, 3, 5);
                 assert_eq!(
                     matches!(searched, Err(knn_recall::Error::RandomEntryPoints)),
-                    parsed.index.index.base_level_only()
+                    parsed.index.index.random_entry_points()
                 );
                 if let Ok(hits) = searched {
                     assert!(hits.len() <= 3);

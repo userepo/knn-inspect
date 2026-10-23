@@ -2800,14 +2800,60 @@ fn cagra_graphs_are_read_by_every_command_but_recall() {
 }
 
 #[test]
-fn cagra_graphs_refuse_recall_and_scan_clean() {
+fn recall_scores_results_on_a_remote_built_graph() {
+    // Lists of every label at k = the vector count hold the exact top k,
+    // whatever their order, so recall is 1 with storage and without:
+    // scoring needs brute force over the vectors, not the graph's search.
+    let root = fixtures().join("opensearch-3.9.0-remote");
+    let scratch = Scratch::new("cagra-results");
+    for set in ["float/l2", "on-disk/l2"] {
+        let dir = root.join(set);
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+        let count = usize::try_from(manifest["count"].as_u64().unwrap()).unwrap();
+        let dimension = usize::try_from(manifest["dimension"].as_u64().unwrap()).unwrap();
+        let vectors = std::fs::read(dir.join("vectors.f32")).unwrap();
+        let queries = scratch.0.join("queries.f32");
+        std::fs::write(&queries, &vectors[..3 * dimension * 4]).unwrap();
+        let labels: Vec<usize> = (0..count).collect();
+        let line = serde_json::to_string(&labels).unwrap();
+        let results = scratch.0.join("results.jsonl");
+        std::fs::write(&results, format!("{line}\n{line}\n{line}\n")).unwrap();
+        let native = dir.join("_2_165_vec.faiss");
+        let k = count.to_string();
+        let o = run(&[
+            "recall",
+            native.to_str().unwrap(),
+            "--queries",
+            queries.to_str().unwrap(),
+            "--results",
+            results.to_str().unwrap(),
+            "--k",
+            &k,
+            "--json",
+        ]);
+        assert_eq!(
+            o.status.code(),
+            Some(0),
+            "{set}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+        assert!(v.get("search").is_none(), "{set}: {v}");
+        assert_eq!(v["vectors"], count, "{set}: {v}");
+        assert_eq!(v["recall"], 1.0, "{set}: {v}");
+    }
+}
+
+#[test]
+fn cagra_graphs_refuse_recalls_own_search_and_scan_clean() {
     let dir = fixtures().join("synthetic-cagra");
     let file = dir.join("l2-100x64-fp16-cagra.faiss");
     let path = file.to_str().unwrap();
     let binary = dir.join("hamming-100x64-binary-cagra.faiss");
 
-    // recall: a verdict naming the release that searches it, exit 1,
-    // whatever the options.
+    // recall: the tool's own search is refused with a verdict, exit 1,
+    // whatever its options.
     let queries = fixtures().join("synthetic/l2-4000x64.queries.f32");
     for args in [
         vec!["recall", path, "--queries", queries.to_str().unwrap()],
@@ -2818,7 +2864,7 @@ fn cagra_graphs_refuse_recall_and_scan_clean() {
         assert_eq!(o.status.code(), Some(1), "{args:?}: {}", stdout(&o));
         let err = String::from_utf8_lossy(&o.stderr);
         assert!(
-            err.contains("a CAGRA graph (k-NN's remote index build), searched from random entry points on its base level; recall does not search it yet"),
+            err.contains("a CAGRA graph (k-NN's remote index build), searched from random entry points on its base level; recall does not run its own search on it yet, but scores lists from elsewhere given with --results"),
             "{args:?}: {err}"
         );
         assert!(stdout(&o).is_empty(), "{args:?}");
@@ -2829,9 +2875,13 @@ fn cagra_graphs_refuse_recall_and_scan_clean() {
     let o = run(&["scan", dir.to_str().unwrap(), "--json"]);
     assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
     let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    let files = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter(|e| e.as_ref().unwrap().path().extension() == Some("faiss".as_ref()))
+        .count();
     assert_eq!(
         v["summary"],
-        serde_json::json!({"files": 5, "clean": 5, "warnings": 0, "unsupported": 0, "failed": 0}),
+        serde_json::json!({"files": files, "clean": files, "warnings": 0, "unsupported": 0, "failed": 0}),
         "{v}"
     );
     let text = stdout(&run(&["scan", dir.to_str().unwrap()]));
@@ -2842,9 +2892,10 @@ fn cagra_graphs_refuse_recall_and_scan_clean() {
     );
 
     // A CAGRA graph without its vectors, as the remote build writes a
-    // float field whose sq encoder keeps 1, 2, or 4 bits: its float
-    // headers record no code size to hold a .veq's records to, so scan
-    // says so instead of judging the field, and the file stays clean.
+    // float field whose sq encoder keeps 1, 2, or 4 bits, alone in its
+    // directory: its float headers record no code size, and with no
+    // .vemq beside it scan skips the field's checks, so the file stays
+    // clean.
     let bytes = std::fs::read(dir.join("ip-100x64-cagra.faiss")).unwrap();
     let storage = bytes.windows(4).position(|w| w == b"IxFI").unwrap();
     let count_at = storage + 4 + 33;
@@ -2946,6 +2997,26 @@ fn bf16_under_a_cagra_graph_fails_the_structure_check() {
     let o = run(&["verify", bf16_path.to_str().unwrap()]);
     assert_eq!(o.status.code(), Some(1), "{}", stdout(&o));
     assert!(stdout(&o).contains("FAIL  structure"), "{}", stdout(&o));
+
+    // With a footer that verifies, the file is sound as far as anything
+    // says: unsupported, refused by choice rather than unreadable.
+    std::fs::write(&bf16_path, with_footer(bf16)).unwrap();
+    let o = run(&["scan", scratch.0.to_str().unwrap(), "--json"]);
+    assert_eq!(o.status.code(), Some(2), "{}", stdout(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    let f = &v["files"][0];
+    assert_eq!(f["status"], "unsupported", "{f}");
+    assert!(f.get("refused").is_none(), "{f}");
+    assert_eq!(
+        f["lucene_quantized"]["detail"],
+        "the native file's scalar quantizer type is not one k-NN writes under its graph",
+        "{f}"
+    );
+    let text = stdout(&run(&["scan", scratch.0.to_str().unwrap()]));
+    assert!(
+        text.contains("(a scalar quantizer type k-NN never writes under this graph, refused)"),
+        "{text}"
+    );
 }
 
 // The `on_disk` fixture's graph without its vectors (IBMp, IBHf, null)
@@ -3020,25 +3091,21 @@ fn remote_built_from(bytes: &[u8]) -> Vec<u8> {
 
 // `payload` with a Lucene footer over it: magic, algorithm 0, and the
 // CRC32 the reader computes over everything before it, big-endian, as
-// CodecUtil writes them.
+// CodecUtil writes them. The footer alone is read, so the payload need
+// not be one this tool parses.
 fn with_footer(payload: Vec<u8>) -> Vec<u8> {
+    use knn_format::envelope::Footer;
     let mut out = payload;
     out.extend_from_slice(&knn_format::envelope::FOOTER_MAGIC.to_be_bytes());
     out.extend_from_slice(&0_i32.to_be_bytes());
     out.extend_from_slice(&0_i64.to_be_bytes());
-    let footer = knn_format::parse(&out).unwrap().envelope.footer.unwrap();
+    let footer = Footer::parse(&out).unwrap().unwrap();
     let Err(knn_format::Error::ChecksumMismatch { computed, .. }) = footer.verify(&out) else {
         panic!("a zero checksum never matches");
     };
     let len = out.len();
     out[len - 8..].copy_from_slice(&i64::from(computed).to_be_bytes());
-    knn_format::parse(&out)
-        .unwrap()
-        .envelope
-        .footer
-        .unwrap()
-        .verify(&out)
-        .unwrap();
+    Footer::parse(&out).unwrap().unwrap().verify(&out).unwrap();
     out
 }
 

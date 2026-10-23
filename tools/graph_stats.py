@@ -11,9 +11,10 @@ a level ends at its first -1 slot. Reachability is a breadth-first search
 per level, top level first: the top level starts from the entry point,
 each lower level from every node reached on the level above (any of them
 can be where a search descends), and the search follows only neighbors
-that exist and are on that level. A CAGRA graph with `base_level_only`
-set, as k-NN's remote build writes one, is searched on level 0 alone
-from nodes drawn at random, so any node can be where a search starts: a
+that exist and are on that level. A CAGRA graph, as k-NN's remote build
+writes one, is searched by k-NN on level 0 alone from nodes drawn at
+random (its memory-optimized search does so whatever the graph's
+`base_level_only` flag says), so any node can be where a search starts: a
 node is unreached there when no other node on the level lists it, and
 level 0 is its only level, whatever its max_level says.
 For any other graph the levels are those an HNSW search reads: max_level
@@ -113,8 +114,8 @@ def load_graph(path: pathlib.Path) -> dict:
         "cum": faiss.vector_to_array(graph.cum_nneighbor_per_level),
         "entry_point": int(graph.entry_point),
         "max_level": int(graph.max_level),
-        # Only a CAGRA index (IndexHNSWCagra, IndexBinaryHNSWCagra) has the flag.
-        "base_level_only": bool(getattr(inner, "base_level_only", False)),
+        # k-NN searches every CAGRA graph from random entry points.
+        "cagra": isinstance(inner, (faiss.IndexHNSWCagra, faiss.IndexBinaryHNSWCagra)),
     }
 
 
@@ -127,7 +128,7 @@ def graph_stats(path: pathlib.Path) -> dict:
     entry = graph["entry_point"]
     max_level = graph["max_level"]
     n = len(levels)
-    random_entry = graph["base_level_only"]
+    random_entry = graph["cagra"]
     # As HnswGraph::searched_levels and HnswIndex::level_counts count them:
     # an empty graph that records a max_level still has that many levels.
     searched = (1 if n else 0) if random_entry else max(max_level + 1, 1 if n else 0)
@@ -237,6 +238,9 @@ def main() -> None:
             m
             for real in REAL_SETS
             for m in (args.fixtures / real).glob("*/*/manifest.json")
+            # Not a build the extraction tool left beside a fixture: the
+            # glob's `*` matches dot-prefixed names too.
+            if not any(p.startswith(".") for p in m.parent.relative_to(args.fixtures).parts)
         ):
             files = json.loads(manifest.read_text(encoding="utf-8"))["files"]
             native = next(f["name"] for f in files if f["name"].endswith((".faiss", ".faissc")))

@@ -115,8 +115,8 @@ fn cases() -> Vec<(PathBuf, Expected)> {
     cases.sort_by(|a, b| a.0.cmp(&b.0));
     assert_eq!(
         cases.len(),
-        5,
-        "two float32, one fp16, one byte, and one binary CAGRA fixture"
+        6,
+        "three float32, one fp16, one byte, and one binary CAGRA fixture"
     );
     cases
 }
@@ -159,7 +159,7 @@ fn synthetic_fixtures_match_faiss_python() {
             "{name}"
         );
         assert_eq!(cagra.base_level_only, e.cagra.base_level_only, "{name}");
-        assert!(idx.index.base_level_only(), "{name}");
+        assert!(idx.index.random_entry_points(), "{name}");
         assert_eq!(
             cagra.search_entry_points, e.cagra.num_base_level_search_entrypoints,
             "{name}"
@@ -355,7 +355,7 @@ fn a_graph_without_its_vectors_keeps_the_rest_of_the_file() {
         [FourCc::ID_MAP, FourCc::HNSW_CAGRA, FourCc::NULL]
     );
     assert_eq!(idx.index.kind, full.index.index.kind);
-    assert!(idx.index.base_level_only());
+    assert!(idx.index.random_entry_points());
     // The graph and the labels are read as they are with the storage.
     let (a, b) = (&full.index.index.graph, &idx.index.graph);
     assert_eq!(a.levels.as_bytes(), b.levels.as_bytes());
@@ -570,7 +570,7 @@ fn an_hnsw_graph_is_not_a_cagra_one() {
     assert_eq!(parsed.index.index.kind, GraphKind::Hnsw);
     assert_eq!(parsed.index.index.kind.name(), "hnsw");
     assert!(parsed.index.index.kind.cagra().is_none());
-    assert!(!parsed.index.index.base_level_only());
+    assert!(!parsed.index.index.random_entry_points());
     // An HNSW graph of nodes is searched on max_level + 1 levels.
     let g = &parsed.index.index.graph;
     assert_eq!(

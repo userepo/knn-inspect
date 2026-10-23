@@ -149,11 +149,12 @@ pub fn run(args: &RecallArgs) -> anyhow::Result<ExitCode> {
         .parse()
         .with_context(|| format!("parsing {}", path.display()))?;
     let index = &parsed.index;
-    // A verdict, not a search: Faiss searches such a graph from random
-    // entry points, which this tool does not reproduce yet.
-    if index.index.base_level_only() {
+    // A verdict, not a search: k-NN searches such a graph from random
+    // entry points, which this tool does not reproduce yet. Lists from
+    // elsewhere are still scored, against brute force over the vectors.
+    if index.index.random_entry_points() && args.results.is_none() {
         bail!(
-            "{}: a CAGRA graph (k-NN's remote index build), searched from random entry points on its base level; recall does not search it yet, while info, verify, stats, and scan read it",
+            "{}: a CAGRA graph (k-NN's remote index build), searched from random entry points on its base level; recall does not run its own search on it yet, but scores lists from elsewhere given with --results, and info, verify, stats, and scan read it",
             path.display()
         );
     }

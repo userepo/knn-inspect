@@ -472,7 +472,7 @@
   {
     "file": "cagra-max-level-set.faiss",
     "source": "fixtures/synthetic-cagra/ip-100x64-cagra.faiss",
-    "mutation": "a CAGRA graph's max_level set to 0, which no search reads; the builder writes -1",
+    "mutation": "a CAGRA graph's max_level set to 3, which no search reads (it still searches level 0 alone); the builder writes -1",
     "space": null,
     "expect": {
       "check": "levels",
@@ -487,6 +487,26 @@
     "expect": {
       "check": "levels",
       "severity": "warning"
+    }
+  },
+  {
+    "file": "cagra-upper-level-bad-neighbors.faiss",
+    "source": "fixtures/synthetic-cagra/ip-100x64-cagra.faiss",
+    "mutation": "a CAGRA graph's node given, on level 1, a neighbor only on level 0, an id past the graph, and itself twice; no search reads level 1, so only the levels check warns",
+    "space": null,
+    "expect": {
+      "check": "levels",
+      "severity": "warning"
+    }
+  },
+  {
+    "file": "cagra-level0-bad-neighbor.faiss",
+    "source": "fixtures/synthetic-cagra/ip-100x64-cagra.faiss",
+    "mutation": "a CAGRA graph's node 0 given, on level 0, a neighbor id past the graph; every search reads level 0, so the id fails as an HNSW graph's would",
+    "space": null,
+    "expect": {
+      "check": "neighbor_ids",
+      "severity": "failure"
     }
   },
   {
@@ -522,11 +542,11 @@
   {
     "file": "cagra-not-base-level-only.faiss",
     "source": "fixtures/synthetic-cagra/ip-100x64-cagra.faiss",
-    "mutation": "a CAGRA graph's base_level_only flag cleared, so Faiss searches it as HNSW from its entry point, which is -1 in a graph of 100 nodes (the headers check warns of the flag)",
+    "mutation": "a CAGRA graph's base_level_only flag cleared: k-NN's memory-optimized search still starts from random entry points, Faiss's own from the -1 entry point, finding nothing",
     "space": null,
     "expect": {
-      "check": "entry_point",
-      "severity": "failure"
+      "check": "headers",
+      "severity": "warning"
     }
   }
 ]

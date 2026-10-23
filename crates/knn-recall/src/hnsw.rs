@@ -91,7 +91,7 @@ impl Searcher {
         let query = query.into();
         // Said before the storage: a graph of this kind is not searched
         // here with or without its vectors.
-        if index.base_level_only() {
+        if index.random_entry_points() {
             return Err(Error::RandomEntryPoints);
         }
         let storage = index.storage.as_ref().ok_or(Error::NoVectors)?;
@@ -271,7 +271,7 @@ pub fn search_all(
     if k == 0 {
         return Err(Error::ZeroK);
     }
-    if index.base_level_only() {
+    if index.random_entry_points() {
         return Err(Error::RandomEntryPoints);
     }
     let storage = index.storage.as_ref().ok_or(Error::NoVectors)?;

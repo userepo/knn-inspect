@@ -564,7 +564,7 @@ fn a_cagra_graph_is_refused_not_searched() {
         let bytes = fs::read(fixtures().join(format!("synthetic-cagra/{name}.faiss"))).unwrap();
         let parsed = knn_format::parse(&bytes).unwrap();
         let index = &parsed.index.index;
-        assert!(index.base_level_only(), "{name}");
+        assert!(index.random_entry_points(), "{name}");
         let mut s = Searcher::new(index.graph.node_count());
         let query = [0.0_f32; 64];
         assert!(

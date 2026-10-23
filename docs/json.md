@@ -20,17 +20,17 @@ map's values, which k-NN sets to Lucene doc ids.
 | `payload.offset`, `payload.length` | integer | Where the Faiss payload lies |
 | `payload.trailing_bytes` | integer | Bytes between the end of the index and the footer; 0 in a well-formed file |
 | `layout` | array of strings | The Faiss fourccs, outermost first: `IxMp`, then `IHNf` and `IxF2` or `IxFI` (float32 storage), or `IHNs` and `IxSQ` (fp16, bf16, or byte storage); or `IBMp`, `IBHf`, and `IBxF` (binary storage, since 0.7.0); or `IBMp`, `IBHf`, and `null` (a graph without its vectors, as k-NN writes an `on_disk` field's, since 0.8.0). For the CAGRA graph k-NN's remote index build writes (since 0.12.0): `IxMp`, `IHc2` (or Faiss's older `IHNc`), and `IxF2`, `IxFI`, `IxSQ`, or `null`; or `IBMp`, `IBHc`, and `IBxF` |
-| `graph` | string | `hnsw`, or `cagra` for the graph k-NN's remote index build writes (CAGRA, Cuda Anns GRAph-based: the GPU-built graph index of NVIDIA's cuVS library), which Faiss searches on its base level alone, from random entry points. Since 0.12.0 |
-| `cagra` | object, optional | For a CAGRA graph, the fields after its header: `keep_max_size_level0` and `base_level_only` (booleans; k-NN's remote build sets both), `search_entry_points` (nodes a search draws at random to start from), and `numeric_type` (integer, optional: as stored under `IHc2`, absent under `IHNc` and `IBHc`; Faiss's `NumericType`, 0 `Float32`, 1 `Float16`, 2 `UInt8`, 3 `Int8`, which k-NN discards). Since 0.12.0 |
+| `graph` | string | `hnsw`, or `cagra` for the graph k-NN's remote index build writes (CAGRA, Cuda Anns GRAph-based: the GPU-built graph index of NVIDIA's cuVS library), which k-NN searches on its base level alone, from random entry points. Since 0.12.0 |
+| `cagra` | object, optional | For a CAGRA graph, the fields after its header: `keep_max_size_level0` and `base_level_only` (booleans; k-NN's remote build sets `base_level_only`, which only Faiss's own search reads, and sets `keep_max_size_level0` for a float graph only), `search_entry_points` (nodes a search draws at random to start from), and `numeric_type` (integer, optional: as stored under `IHc2`, absent under `IHNc` and `IBHc`; Faiss's `NumericType`, 0 `Float32`, 1 `Float16`, 2 `UInt8`, 3 `Int8`, which k-NN discards). Since 0.12.0 |
 | `dimension` | integer | Vector dimension; bits for binary storage, components for a graph without its vectors |
 | `count` | integer | Vector count from the ID map's header |
 | `metric` | string | `l2` or `inner_product` as the file records it; a cosine field reads `inner_product`. `hamming` for binary storage, which computes Hamming distance whatever metric type its headers record (since 0.7.0). A graph without its vectors reads `l2` or `inner_product`, the metric k-NN built it for, as its ID map's header records it and k-NN reads it (since 0.8.0). Any other metric type `n` reads `metric_n` |
-| `code_size` | integer, optional | For binary storage, the bytes per vector the ID map's header records: the dimension / 8 in a well-formed file. Since 0.7.0. For a graph without its vectors, the bytes per vector the graph's header records: a quantized vector plus 16 bytes of correction factors (since 0.8.0) |
+| `code_size` | integer, optional | For binary storage, the bytes per vector the ID map's header records: the dimension / 8 in a well-formed file. Since 0.7.0. For a graph without its vectors under `IBHf`, the bytes per vector the graph's header records: a quantized vector plus 16 bytes of correction factors (since 0.8.0); absent under `IHc2`, whose float headers record none (since 0.12.0) |
 | `quantizer` | object, optional | For scalar-quantized storage, the quantizer as stored: `qtype` (4, 7, or 8), `name` (`QT_fp16`, `QT_bf16`, or `QT_8bit_direct_signed`), `dimension`, `code_size` (bytes per vector: twice the dimension for fp16 and bf16, the dimension for byte), `trained` (number of trained values; none of the three formats uses any). Since 0.4.0; bf16 since 0.5.0; byte since 0.6.0 |
 | `hnsw.m` | integer, nullable | Neighbor slots per node on the upper levels; `null` if the level table is too short to say |
 | `hnsw.ef_construction`, `hnsw.ef_search` | integer | As stored |
 | `hnsw.max_level`, `hnsw.entry_point` | integer | As stored; `-1` for an empty graph, and for a CAGRA graph, whose search never reads them |
-| `hnsw.level_counts` | array of integers | Nodes on each level a search reads, level 0 first: `max_level + 1` levels, or level 0 alone for a CAGRA graph with `base_level_only` set, whatever its `max_level` says |
+| `hnsw.level_counts` | array of integers | Nodes on each level a search reads, level 0 first: `max_level + 1` levels, or level 0 alone for a graph of nodes whose `max_level` is negative (which 0.12.0 changed: the array was empty for such a graph before); level 0 alone for a CAGRA graph, whatever its `max_level` says (since 0.12.0) |
 | `hnsw.neighbor_slots` | integer | Length of the neighbor array |
 | `ids.len` | integer | Labels in the ID map |
 | `ids.first`, `ids.last` | integer, nullable | First and last label; `null` when there are none |
@@ -62,7 +62,7 @@ Each entry of `checks`:
 | `file` | string | The path as given |
 | `nodes` | integer | Nodes in the graph |
 | `entry_point`, `max_level` | integer | As stored; `-1` for a CAGRA graph, whose search never reads them |
-| `layers` | array | One entry per level a search reads, level 0 first (see below): `max_level + 1` levels, or level 0 alone for a CAGRA graph with `base_level_only` set, whatever its `max_level` says |
+| `layers` | array | One entry per level a search reads, level 0 first (see below): `max_level + 1` levels, or level 0 alone for a graph of nodes whose `max_level` is negative (which 0.12.0 changed: the array was empty for such a graph before); level 0 alone for a CAGRA graph, whatever its `max_level` says (since 0.12.0) |
 
 Each entry of `layers`:
 
@@ -74,7 +74,7 @@ Each entry of `layers`:
 | `edges` | integer | Neighbors listed, summed over the level's nodes; a list ends at its first empty slot |
 | `degree_min`, `degree_max` | integer, nullable | Out-degree range; `null` on an empty level |
 | `degree_histogram` | array of integers | Entry `k` is the number of nodes with `k` neighbors |
-| `unreachable` | integer | Nodes on this level no search can reach. For a graph searched from random entry points (a CAGRA graph with `base_level_only` set), the nodes no other node's neighbor list leads to, which a search returns only when it draws them as an entry (since 0.12.0) |
+| `unreachable` | integer | Nodes on this level no search can reach. For a graph searched from random entry points (a CAGRA graph), the nodes no other node's neighbor list leads to, which a search returns only when it draws them as an entry (since 0.12.0) |
 | `unreachable_nodes` | array of integers | Those nodes, in id order |
 
 ## `recall`
@@ -120,8 +120,8 @@ Each entry of `files`:
 | `error` | string, optional | Why the file would not open; `failures`, `warnings`, and `checks` are then absent, and every cross-check is `skipped` |
 | `layout`, `dimension`, `count`, `metric` | optional | As for `info`; absent when the file did not parse |
 | `graph` | string, optional | As for `info`: `hnsw` or `cagra`; absent when the file did not parse (since 0.12.0) |
-| `code_size` | integer, optional | As for `info`, for binary storage (since 0.7.0) and a graph without its vectors (since 0.8.0) |
-| `status` | string | `clean`, `warnings`, or `failed`, counting the Lucene cross-checks (a `warning` from `lucene_quantized` makes a file `warnings` that is otherwise clean, since 0.9.0); or `unsupported` (since 0.7.0): a file whose footer verifies, in a layout or scalar quantizer type this tool does not read, which fails only the structure check. `verify` fails such a file; `scan` does not count it as failed, since nothing is known to be wrong with it |
+| `code_size` | integer, optional | As for `info`, for binary storage (since 0.7.0) and a graph without its vectors under `IBHf` (since 0.8.0) |
+| `status` | string | `clean`, `warnings`, or `failed`, counting the Lucene cross-checks (a `warning` from `lucene_quantized` makes a file `warnings` that is otherwise clean, since 0.9.0); or `unsupported` (since 0.7.0): a file whose footer verifies, in a layout or scalar quantizer type this tool does not read, or, since 0.12.0, with bf16 storage under a CAGRA graph, which the remote build never writes and this tool refuses; such a file fails only the structure check. `verify` fails such a file; `scan` does not count it as failed, since nothing is known to be wrong with it |
 | `failures`, `warnings`, `checks` | optional | As for `verify` |
 | `lucene_vectors.status` | string | `match`, `mismatch`, `damaged`, or `skipped` (`damaged` since 0.3.0) |
 | `lucene_vectors.file` | string, optional | The segment's `.vec` file the vectors were found in, or the first one looked in |

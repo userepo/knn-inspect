@@ -720,7 +720,7 @@ HNSW block (`read_index` and `read_index_binary` at `5616caa`):
 | Field | Type | Notes |
 |---|---|---|
 | `keep_max_size_level0` | bool, 1 byte | level 0 lists kept at full size while building; `GpuIndexCagra::copyTo` sets it, the binary copy leaves it off |
-| `base_level_only` | bool, 1 byte | searched on level 0 alone, from random entry points; the builder sets it, and an index with it set refuses `add` |
+| `base_level_only` | bool, 1 byte | Faiss's own search reads level 0 alone, from random entry points; k-NN's memory-optimized search does so whatever the flag says; the builder sets it, and an index with it set refuses `add` |
 | `num_base_level_search_entrypoints` | int32 | nodes a search draws at random to start from; 32 in every file the builder's image wrote (its Faiss 1.14.3 default); faiss-cpu 1.15.1 defaults to 256 for `IndexHNSWCagra` and 32 for `IndexBinaryHNSWCagra` |
 | `numeric_type_` | int32, `IHc2` only | Faiss's `NumericType`: 0 `Float32`, 1 `Float16`, 2 `UInt8`, 3 `Int8` |
 
@@ -729,9 +729,12 @@ it and sets `Float32`, and only k-NN's own test files hold it (the
 builder's Faiss writes `IHc2`). `IBHc` stores no numeric type. k-NN's
 loader (`FaissHNSWCagraIndex` and `FaissHNSWCagraBinaryIndex`) reads the
 two flags and the count, reads and discards the numeric type, and loads
-the graph and storage as an HNSW index's; the Faiss at `5616caa` writes
-`numeric_type_` uninitialized. So the numeric type describes nothing
-that is checked here: `info` shows it, `verify` never reads it.
+the graph and storage as an HNSW index's. The builder's Faiss sets the
+numeric type from the storage (`GpuIndexCagra::copyTo` calls
+`set_numeric_type`), and every remote-built fixture holds its storage's
+type; k-NN's own test files, written by a Faiss that left it
+uninitialized, hold arbitrary values. Since k-NN discards it, nothing
+here checks it: `info` shows it, `verify` never reads it.
 
 What the GPU copy leaves (`GpuIndexCagra::copyTo` in the builder's
 Faiss, and the probe of its image recorded under M15 of the plan): the
@@ -757,7 +760,11 @@ throws "Could not find a valid entrypoint" when no node is drawn, so a
 count of 0 refuses every search. Nothing reads the entry point,
 `max_level`, or the upper levels. k-NN's memory-optimized searcher
 (`FaissMemoryOptimizedSearcher`) draws its entry points with
-`ThreadLocalRandom`. Either way two runs of one query can return
+`ThreadLocalRandom`, and loads every CAGRA graph that way
+(`FaissCagraHNSW`, its entry point -1 and one level), whatever
+`base_level_only` says. Faiss's own search honors the flag: without it,
+`HNSW::search` starts from the entry point and returns nothing from the
+`-1` the copy leaves. Either way two runs of one query can return
 different lists, so no live result list is a bit-for-bit oracle for a
 CAGRA graph; faiss-cpu 1.15.1 seeds the draw per query
 (`SplitMix64RandomGenerator(i)`), which makes its own runs repeatable.
@@ -765,29 +772,26 @@ CAGRA graph; faiss-cpu 1.15.1 seeds the draw per query
 So, since 0.12.0: the parser reads all five layouts and `IHNc`, and
 refuses bf16 codes under a CAGRA graph, which the remote build never
 writes (`IxSQ` with `QT_bf16` is read under `IHNs` only). `info`
-reports `graph: cagra`, the fields, and the levels a search reads: with
-`base_level_only` set, level 0 alone, whatever `max_level` says
-(`level_counts` has one entry; `max_level` and the entry point are shown
-as the `-1` they are). `verify` holds the graph to what the
-builder writes and what Faiss reads: a count of 0 random entry points
-fails; `base_level_only` off, or `keep_max_size_level0` off in a float
-graph, warns (without
-the former, Faiss searches the graph as HNSW, and the HNSW rules then
-apply, so the `-1` entry point fails as any HNSW graph's would); an
-entry point or `max_level` other than `-1`, or a neighbor on an upper
-level, warns, since no search reads them; every other check runs as for
-HNSW, the vector checks over the storage, or skipped over `null`. For
+reports `graph: cagra`, the fields, and the levels k-NN's search reads:
+level 0 alone, whatever `max_level` says (`level_counts` has one entry;
+`max_level` and the entry point are shown as the `-1` they are). The
+tool follows k-NN's memory-optimized search, which reads every CAGRA
+graph so. `verify` holds the graph to what the builder writes and what
+that search reads: a count of 0 random entry points fails;
+`base_level_only` off, or `keep_max_size_level0` off in a float graph,
+warns (without the former, Faiss's own search finds nothing); an entry
+point or `max_level` other than `-1`, or a neighbor on an upper level,
+warns, since no search reads them, and nothing on an upper level fails
+the neighbor checks; every other check runs as for HNSW, the vector
+checks over the storage, or skipped over `null`. For
 the `null` layout both headers are float headers, read as any float
 layout's: the metric type is the ID map's, and the graph header's must
-agree. `stats` follows the flag too: with `base_level_only` set it
-reports level 0 alone and, since a search can start from any node,
-counts a node as unreachable when no other node lists it (its own list
-leads nowhere new), such a node being returned only when a search draws
-it as an entry; with the flag off it
-reads the graph as an HNSW graph, from its entry point, where `-1`
-reaches nothing. `scan` reads the files as it reads the local build's
+agree. `stats` reports level 0 alone and, since a search can start
+from any node, counts a node as unreachable when no other node lists it
+(its own list leads nowhere new), such a node being returned only when
+a search draws it as an entry. `scan` reads the files as it reads the local build's
 and marks a CAGRA graph's text line `cagra` beside its layout (its JSON
-entry carries `graph`, `hnsw` or `cagra`, for every file): the `.vec` and `.si`
+entry carries `graph`, `hnsw` or `cagra`, for every file that parses): the `.vec` and `.si`
 cross-checks run over the storage and labels as for an HNSW graph, and
 for `IHc2` over `null` the field's `.vemq` and `.veq` are checked
 against the graph as a binary graph-only file's are, tied through the
@@ -796,14 +800,16 @@ code size to hold the records to, so the field's shape, similarity, and
 records decide alone (by shape, sibling fields of the same shape at other
 bit widths are checked too, and the worst outcome reported, as for any
 graph-only file without a `.fnm`).
-`recall` refuses the graph with a
-verdict until a later release brings the search from random entry points
-(0.13.0 in the plan).
+`recall` scores result lists from elsewhere (`--results`) against brute
+force over the vectors, the `.vec`'s for `null`, as for any graph, but
+refuses its own search with a verdict until a later release brings the
+search from random entry points.
 
 ### Synthetic CAGRA fixtures
 
-`tools/make_synthetic.py` writes five to `fixtures/synthetic-cagra/`:
-`l2-1000x64-cagra` (`IxF2`), `ip-100x64-cagra` (`IxFI`, unit vectors),
+`tools/make_synthetic.py` writes these to `fixtures/synthetic-cagra/`:
+`l2-1000x64-cagra` and `l2-100x64-cagra` (`IxF2`, the latter small
+enough to seed the fuzzer), `ip-100x64-cagra` (`IxFI`, unit vectors),
 `l2-100x64-fp16-cagra` and `l2-100x64-byte-cagra` (`IxSQ`), and
 `hamming-100x64-binary-cagra` (`IBMp` > `IBHc` > `IBxF`), each with an
 `.expected.json` and a `.stats.json`. They mirror the layout, not the
@@ -813,7 +819,9 @@ HNSW graph, with `keep_max_size_level0` filling level 0 (every list of
 the 100-vector files is full; the 1,000-vector file's hold 27 to 32,
 where the GPU copy's hold exactly 2M), then cut to what the GPU copy
 leaves: upper-level lists emptied, entry point and `max_level` set to
-`-1`, `base_level_only` set, 32 entry points. The
+`-1`, `base_level_only` set, 32 entry points, and `keep_max_size_level0`
+left set in a float file and cleared in the binary one, as the two
+copies leave it. The
 fp16 case takes its storage from the `IndexHNSWCagra` constructor's
 `Float16`, as the copy does; the byte case is built over float32 and its
 storage swapped for `QT_8bit_direct_signed` with numeric type `Int8`,
@@ -856,9 +864,7 @@ other fixtures), faiss-cpu 1.15.1's `IndexBinaryHNSWCagra::search`
 returns empty rows for most queries (every label `-1`, every distance
 `INT_MIN`), where its AVX2 path returns full rows from the same file; the
 float search is right on both. The generator therefore checks only that
-the binary search runs. A live CAGRA fixture, built by the builder's own
-image, is step c of M15; its build is not deterministic, so it is built
-once and kept.
+the binary search runs.
 
 ### Real remote-built files from OpenSearch 3.9.0
 

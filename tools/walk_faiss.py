@@ -161,7 +161,7 @@ class Walker:
         an int32, which k-NN reads and discards.
         """
         keep = self._take("<?", "cagra.keep_max_size_level0", "level 0 lists kept at full size while building")
-        base_only = self._take("<?", "cagra.base_level_only", "searched on level 0 alone, from random entry points")
+        base_only = self._take("<?", "cagra.base_level_only", "Faiss's own search reads level 0 alone, from random entry points")
         entrypoints = self._take("<i", "cagra.num_base_level_search_entrypoints", "random entry points drawn per search")
         fields = {"keep_max_size_level0": keep, "base_level_only": base_only, "num_base_level_search_entrypoints": entrypoints}
         if with_numeric_type:
@@ -181,9 +181,14 @@ class Walker:
         out["hnsw"]["ef_search"] = self._take("<i", "hnsw.efSearch")
         self._take("<i", "hnsw.upper_beam", "deprecated, always written as 1")
         levels = struct.unpack_from(f"<{nlevels_vec}i", self.data, levels_start)
-        # The levels a search reads: max_level + 1, or level 0 alone for a
-        # graph of nodes whose max_level is -1, as a CAGRA graph's is.
-        searched = max(out["hnsw"]["max_level"] + 1, 1 if nlevels_vec else 0)
+        # The levels a search reads: level 0 alone for a CAGRA graph,
+        # which k-NN searches there whatever its max_level says; else
+        # max_level + 1, or level 0 alone for a graph of nodes whose
+        # max_level is negative.
+        if "cagra" in out:
+            searched = 1 if nlevels_vec else 0
+        else:
+            searched = max(out["hnsw"]["max_level"] + 1, 1 if nlevels_vec else 0)
         out["hnsw"]["level_counts"] = [sum(1 for v in levels if v > i) for i in range(searched)]
 
     def storage(self, out: dict, hnsw_tag: str) -> None:

@@ -778,7 +778,7 @@ fn a_cagra_graph_is_refused_before_its_field_is_read() {
     graph_only.extend_from_slice(&bytes[count_at + 8 + floats * 4..]);
     let parsed = knn_format::parse(&graph_only).unwrap();
     assert!(parsed.index.index.storage.is_none());
-    assert!(parsed.index.index.base_level_only());
+    assert!(parsed.index.index.random_entry_points());
     assert!(matches!(
         OnDiskField::new(
             &parsed.index,

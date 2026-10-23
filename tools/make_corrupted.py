@@ -403,10 +403,10 @@ def build() -> Cases:
     c.add("cagra-entry-point-set", SYNTHETIC_CAGRA, "a CAGRA graph's entry point set to 0, which no search reads; the builder writes -1", "entry_point", "warning", cagra_entry_point)
 
     def cagra_max_level(d, f):
-        put(d, f["hnsw.max_level"]["offset"], "<i", 0)
+        put(d, f["hnsw.max_level"]["offset"], "<i", 3)
         return d
 
-    c.add("cagra-max-level-set", SYNTHETIC_CAGRA, "a CAGRA graph's max_level set to 0, which no search reads; the builder writes -1", "levels", "warning", cagra_max_level)
+    c.add("cagra-max-level-set", SYNTHETIC_CAGRA, "a CAGRA graph's max_level set to 3, which no search reads (it still searches level 0 alone); the builder writes -1", "levels", "warning", cagra_max_level)
 
     def cagra_upper_neighbor(d, f):
         o = f["hnsw.levels.data"]["offset"]
@@ -420,6 +420,31 @@ def build() -> Cases:
         return d
 
     c.add("cagra-upper-level-neighbor", SYNTHETIC_CAGRA, "a CAGRA graph's node given a neighbor on level 1, which no search reads; the builder leaves the upper levels empty", "levels", "warning", cagra_upper_neighbor)
+
+    def cagra_upper_bad_neighbors(d, f):
+        o = f["hnsw.levels.data"]["offset"]
+        n = f["hnsw.levels.len"]["value"]
+        levels = struct.unpack_from(f"<{n}i", d, o)
+        node = next(i for i, l in enumerate(levels) if l >= 2)
+        base_only = next(i for i, l in enumerate(levels) if l == 1)
+        (start,) = struct.unpack_from("<Q", d, f["hnsw.offsets.data"]["offset"] + node * 8)
+        (cum1,) = struct.unpack_from("<i", d, f["hnsw.cum_nneighbor_per_level.data"]["offset"] + 4)
+        at = f["hnsw.neighbors.data"]["offset"] + (start + cum1) * 4
+        # A node on level 0 only, then an id past the graph, then the node
+        # itself, twice: each would fail or warn on a level a search reads.
+        for k, v in enumerate([base_only, n + 7, node, node]):
+            put(d, at + k * 4, "<i", v)
+        return d
+
+    c.add("cagra-upper-level-bad-neighbors", SYNTHETIC_CAGRA, "a CAGRA graph's node given, on level 1, a neighbor only on level 0, an id past the graph, and itself twice; no search reads level 1, so only the levels check warns", "levels", "warning", cagra_upper_bad_neighbors)
+
+    def cagra_level0_bad_neighbor(d, f):
+        # Node 0's first level-0 slot: every search reads level 0, so an
+        # id past the graph fails there as it would in an HNSW graph.
+        put(d, f["hnsw.neighbors.data"]["offset"], "<i", f["hnsw.levels.len"]["value"])
+        return d
+
+    c.add("cagra-level0-bad-neighbor", SYNTHETIC_CAGRA, "a CAGRA graph's node 0 given, on level 0, a neighbor id past the graph; every search reads level 0, so the id fails as an HNSW graph's would", "neighbor_ids", "failure", cagra_level0_bad_neighbor)
 
     def cagra_no_entry_points(d, f):
         put(d, f["cagra.num_base_level_search_entrypoints"]["offset"], "<i", 0)
@@ -443,7 +468,7 @@ def build() -> Cases:
 
     c.add("cagra-storage-untrained", SYNTHETIC_CAGRA, "a CAGRA graph's storage header says untrained; only the ID map's header is left so by the builder", "headers", "warning", cagra_storage_untrained)
 
-    c.add("cagra-not-base-level-only", SYNTHETIC_CAGRA, "a CAGRA graph's base_level_only flag cleared, so Faiss searches it as HNSW from its entry point, which is -1 in a graph of 100 nodes (the headers check warns of the flag)", "entry_point", "failure", cagra_not_base_only)
+    c.add("cagra-not-base-level-only", SYNTHETIC_CAGRA, "a CAGRA graph's base_level_only flag cleared: k-NN's memory-optimized search still starts from random entry points, Faiss's own from the -1 entry point, finding nothing", "headers", "warning", cagra_not_base_only)
 
     return c
 

@@ -25,8 +25,9 @@ takes. A binary case draws a component per bit and keeps its sign.
 A CAGRA case mirrors the layout the remote build writes, not its graph:
 faiss-cpu builds a CAGRA index's base level as an HNSW graph (there is
 no GPU here), and the case is then cut to what `GpuIndexCagra::copyTo`
-leaves: `base_level_only` set, the entry point and `max_level` -1, every
-upper-level slot empty, and the random per-node levels kept.
+leaves: `base_level_only` set, `keep_max_size_level0` set for a float
+graph and left off for a binary one, the entry point and `max_level` -1,
+every upper-level slot empty, and the random per-node levels kept.
 
 Faiss is pinned to one thread so the graph is reproducible run to run.
 
@@ -119,6 +120,8 @@ BINARY_CASES = [
 # cases keep faiss-cpu's own M of 16, so 32 slots on level 0.
 CAGRA_CASES = [
     ("l2-1000x64-cagra", 1000, 64, "l2", "f32"),
+    # Small enough for the fuzzer's seeds, which skip the larger file.
+    ("l2-100x64-cagra", 100, 64, "l2", "f32"),
     ("ip-100x64-cagra", 100, 64, "ip", "f32"),
     ("l2-100x64-fp16-cagra", 100, 64, "l2", "fp16"),
     ("l2-100x64-byte-cagra", 100, 64, "l2", "byte"),
@@ -166,7 +169,7 @@ def level_counts(levels: np.ndarray, max_level: int) -> list[int]:
     return [int((levels > i).sum()) for i in range(searched)]
 
 
-def cut_to_base_level(index) -> None:
+def cut_to_base_level(index, binary: bool = False) -> None:
     """Leaves `index`'s HNSW graph as `GpuIndexCagra::copyTo` leaves one.
 
     The copy fills level 0 from the CAGRA graph and nothing else: every
@@ -174,7 +177,10 @@ def cut_to_base_level(index) -> None:
     upper-level slots stay -1, and the entry point and `max_level` stay at
     the -1 of a reset graph, since a search of the base level alone never
     reads them. The HNSW graph faiss-cpu built here stands in for the
-    CAGRA one: its upper-level lists are emptied, the rest is kept.
+    CAGRA one: its upper-level lists are emptied, the rest is kept. The
+    float copy sets `keep_max_size_level0`; the binary one (`binary`)
+    leaves the index's default, off, as every binary file the builder
+    writes shows.
     """
     graph = index.hnsw
     offsets = faiss.vector_to_array(graph.offsets)
@@ -187,7 +193,7 @@ def cut_to_base_level(index) -> None:
     graph.entry_point = -1
     graph.max_level = -1
     index.base_level_only = True
-    index.keep_max_size_level0 = True
+    index.keep_max_size_level0 = not binary
     index.num_base_level_search_entrypoints = CAGRA_ENTRY_POINTS
 
 
@@ -703,7 +709,7 @@ def build_cagra_binary(name: str, count: int, dim: int, out: pathlib.Path) -> di
     index = faiss.IndexBinaryIDMap(hnsw)
     labels = np.arange(count, dtype=np.int64) + LABEL_OFFSET
     index.add_with_ids(codes, labels)
-    cut_to_base_level(hnsw)
+    cut_to_base_level(hnsw, binary=True)
 
     path = out / f"{name}.faiss"
     faiss.write_index_binary(index, str(path))

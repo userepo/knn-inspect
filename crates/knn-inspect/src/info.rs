@@ -252,7 +252,7 @@ fn print_text(r: &Report) {
             );
         } else {
             println!(
-                "  graph           CAGRA (k-NN's remote index build) with base_level_only off: searched as HNSW, from its entry point; {} random entry points stored, unused",
+                "  graph           CAGRA (k-NN's remote index build) with base_level_only off: k-NN's memory-optimized search draws {} random entry points per search, Faiss's own starts from the entry point",
                 c.search_entry_points
             );
         }

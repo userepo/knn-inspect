@@ -102,7 +102,7 @@ fn stats_match_faiss_python() {
         unreachable_seen += stats.layers.iter().map(|l| l.unreachable).sum::<usize>();
         seen += 1;
     }
-    assert_eq!(seen, 56, "23 synthetic and 33 real baselines");
+    assert_eq!(seen, 57, "24 synthetic and 33 real baselines");
     // l2-4000x64 has unreachable nodes on levels 0 and 1, and the build of
     // on-disk-16x/l2 one on level 1, so the search itself is compared, not
     // only the empty case. Every node of the CAGRA fixtures is listed by
@@ -168,7 +168,7 @@ fn a_node_no_list_leads_to_is_unreached_from_random_entries() {
     assert_ne!(cut, bytes, "node 5 was listed");
     let parsed = knn_format::parse(&cut).unwrap();
     let index = &parsed.index.index;
-    assert!(index.base_level_only());
+    assert!(index.random_entry_points());
     let stats = index_stats(index);
     assert_eq!(stats.layers.len(), 1);
     assert_eq!(stats.layers[0].unreachable_nodes, vec![5]);
@@ -176,16 +176,17 @@ fn a_node_no_list_leads_to_is_unreached_from_random_entries() {
     // end at the first -1 now, so a few are shorter.
     assert_eq!(stats.layers[0].degree_max, Some(32));
     assert!(stats.layers[0].edges < 3200);
-    // The flag off, the same bytes are an HNSW graph without an entry
-    // point, and nothing is reached.
+    // The flag off, k-NN's memory-optimized search still draws random
+    // entry points on level 0, so the statistics are the same.
     let flag = parsed.index.index.kind.cagra().unwrap().offset + 1;
     let mut off = cut.clone();
     off[flag] = 0;
     let parsed = knn_format::parse(&off).unwrap();
-    assert!(!parsed.index.index.base_level_only());
+    assert!(!parsed.index.index.kind.cagra().unwrap().base_level_only);
+    assert!(parsed.index.index.random_entry_points());
     let stats = index_stats(&parsed.index.index);
     assert_eq!(stats.layers.len(), 1);
-    assert_eq!(stats.layers[0].unreachable, 100);
+    assert_eq!(stats.layers[0].unreachable_nodes, vec![5]);
     // The level arrays are untouched by either splice.
     let levels = |g: &HnswGraph<'_>| g.levels.iter().map(|l| l.get()).collect::<Vec<i32>>();
     assert_eq!(levels(&parsed.index.index.graph), levels(graph));
