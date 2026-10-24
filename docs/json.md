@@ -74,7 +74,7 @@ Each entry of `layers`:
 | `edges` | integer | Neighbors listed, summed over the level's nodes; a list ends at its first empty slot |
 | `degree_min`, `degree_max` | integer, nullable | Out-degree range; `null` on an empty level |
 | `degree_histogram` | array of integers | Entry `k` is the number of nodes with `k` neighbors |
-| `unreachable` | integer | Nodes on this level no search can reach. For a graph searched from random entry points (a CAGRA graph), the nodes no other node's neighbor list leads to, which a search returns only when it draws them as an entry (since 0.12.0) |
+| `unreachable` | integer | Nodes on this level no search can reach. For a graph searched from random entry points (a CAGRA graph), the nodes no other node's neighbor list leads to, which a search returns only when it starts there: when it draws the node as an entry and, over the file's own vectors, the node is also the nearest of its draws (since 0.12.0) |
 | `unreachable_nodes` | array of integers | Those nodes, in id order |
 
 ## `recall`
@@ -86,7 +86,7 @@ Each entry of `layers`:
 | `sample` | object, optional | For `--sample`: `count` and `seed` |
 | `results_file` | string, optional | The `--results` file |
 | `ids_file` | string, optional | The `--ids` file |
-| `search` | object, optional | For the tool's own search: `ef_search` used and `search_ms`; for a graph without its vectors (since 0.10.0), the index's `ef_search` and also `beam` (the graph search's), `rescore` (whether the first pass was rescored against the field's vectors in the `.vec`), and, when it was, `first_pass_k` (the first pass's results rescored) |
+| `search` | object, optional | For the tool's own search: `ef_search` used and `search_ms`; for a graph without its vectors (since 0.10.0), the index's `ef_search` and also `beam` (the graph search's), `rescore` (whether the first pass was rescored against the field's vectors in the `.vec`), and, when it was, `first_pass_k` (the first pass's results rescored); for a CAGRA graph (since 0.13.0), also `entry_points` (random entry points drawn per query: `--entry-points`, or the file's count, capped at the vector count for a graph without its vectors and at 65,536 draws for one with them; for a graph without its vectors, unused when `beam` reaches `vectors`, where every vector is scored, and every node, in order, when it equals `vectors`) and `seed` (of the draws: `--seed`, or 1; no longer used in either of those cases) |
 | `dimension`, `vectors` | integer | Of the file; for binary storage, `dimension` is the bits of the code size, which the queries must have (since 0.7.0); for a graph without its vectors, of the field's vectors in the `.vec`, float32, or fp16 for a `half_float` field (since 0.10.0; fp16 since 0.11.0) |
 | `metric` | string | As for `info` |
 | `ground_truth_ms` | integer | Time of the brute-force pass |

@@ -9,8 +9,12 @@
 //! When `k` reaches the number of vectors, k-NN scores them all in batches
 //! of 64 instead of searching the graph. Otherwise the search descends
 //! greedily through the upper levels, then searches level 0 best first
-//! with an unbounded candidate queue, collecting the `k` best. Three
-//! details set it apart from Faiss's search (see the `hnsw` module):
+//! with an unbounded candidate queue, collecting the `k` best. Over a
+//! CAGRA graph there is no descent: k-NN hands Lucene's
+//! `SeededHnswGraphSearcher` random nodes, and every one is scored,
+//! collected, and queued to start level 0 (the caller draws them; see
+//! [`search`]). Three details set the level-0 search apart from Faiss's
+//! (see the `hnsw` module):
 //!
 //! - `FaissHnswGraph` reports Faiss's `max_level` as the number of levels,
 //!   where Faiss's levels run 0 to `max_level`, so the descent starts one
@@ -76,11 +80,15 @@ pub struct TopDocs {
 /// `ord_to_doc` the doc id an ordinal maps to, which results are reported
 /// and tied by.
 ///
-/// The search starts from the graph's entry point, as k-NN's does over an
-/// HNSW graph. A CAGRA graph stores -1 there and k-NN searches it from
-/// random entry points instead, so over such a graph
-/// this search finds nothing unless `k` reaches `vectors`;
-/// [`OnDiskField::new`](crate::on_disk::OnDiskField::new) refuses it.
+/// With `seeds` `None` the search starts from the graph's entry point, as
+/// k-NN's does over an HNSW graph. With `Some`, the seed nodes enter the
+/// level-0 search directly and the descent is skipped (Lucene's
+/// `SeededHnswGraphSearcher`), as k-NN seeds its search of a CAGRA graph,
+/// whose stored entry point is -1, with random nodes; no seeds find
+/// nothing, as k-NN's search over a count of 0 does. The caller draws the
+/// seeds within the graph, without repeats, as k-NN's
+/// `RandomEntryPointsKnnSearchStrategy` does
+/// ([`OnDiskField`](crate::on_disk::OnDiskField) ports its draw).
 ///
 /// # Errors
 ///
@@ -91,6 +99,7 @@ pub fn search<S, D>(
     vectors: usize,
     k: usize,
     visit_limit: u64,
+    seeds: Option<&[usize]>,
     mut score: S,
     ord_to_doc: D,
 ) -> Result<TopDocs>
@@ -110,7 +119,7 @@ where
             visited: vec![false; graph.node_count()],
             candidates: BinaryHeap::new(),
         };
-        searcher.search(&mut collector, &mut score, &ord_to_doc)?;
+        searcher.search(seeds, &mut collector, &mut score, &ord_to_doc)?;
     } else {
         exhaustive(vectors, &mut collector, &mut score, &ord_to_doc)?;
     }
@@ -197,15 +206,26 @@ struct Searcher<'g, 'a> {
 }
 
 impl Searcher<'_, '_> {
-    /// `AbstractHnswGraphSearcher.search`.
+    /// `AbstractHnswGraphSearcher.search`; with seeds,
+    /// `SeededHnswGraphSearcher`, whose `findBestEntryPoint` is the seeds.
     fn search(
         &mut self,
+        seeds: Option<&[usize]>,
         collector: &mut Collector,
         score: &mut impl FnMut(usize) -> Option<f32>,
         ord_to_doc: &impl Fn(usize) -> i32,
     ) -> Result<()> {
-        if let Some(ep) = self.find_best_entry_point(collector, score)? {
-            self.search_level_0(ep, collector, score, ord_to_doc)?;
+        match seeds {
+            Some(eps) => {
+                if !eps.is_empty() {
+                    self.search_level_0(eps, collector, score, ord_to_doc)?;
+                }
+            }
+            None => {
+                if let Some(ep) = self.find_best_entry_point(collector, score)? {
+                    self.search_level_0(&[ep], collector, score, ord_to_doc)?;
+                }
+            }
         }
         Ok(())
     }
@@ -285,10 +305,10 @@ impl Searcher<'_, '_> {
         Ok((!collector.early_terminated()).then_some(current))
     }
 
-    /// `searchLevel` on level 0 from the entry point `ep`.
+    /// `searchLevel` on level 0 from the entry points `eps`.
     fn search_level_0(
         &mut self,
-        ep: usize,
+        eps: &[usize],
         collector: &mut Collector,
         score: &mut impl FnMut(usize) -> Option<f32>,
         ord_to_doc: &impl Fn(usize) -> i32,
@@ -298,9 +318,9 @@ impl Searcher<'_, '_> {
             return Ok(());
         }
         // scoreEntryPoints.
-        let (scores, _) = bulk_score(&[ep], score)?;
-        collector.inc_visited(1);
-        for &s in &scores {
+        let (scores, _) = bulk_score(eps, score)?;
+        collector.inc_visited(eps.len());
+        for (&ep, &s) in eps.iter().zip(&scores) {
             if let Some(seen) = self.visited.get_mut(ep) {
                 *seen = true;
             }

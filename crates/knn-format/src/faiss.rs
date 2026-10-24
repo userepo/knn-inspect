@@ -919,10 +919,11 @@ impl<'a> Storage<'a> {
 /// into the base level of an HNSW index (`GpuIndexCagra::copyTo`): level
 /// 0 holds the CAGRA graph, every node's upper-level slots stay empty,
 /// and the entry point and `max_level` stay -1. k-NN searches level 0
-/// alone, starting from the nearest of `search_entry_points` nodes drawn
-/// at random for each query, so the entry point and `max_level` are never
-/// read: its memory-optimized search does so for every CAGRA graph, and
-/// Faiss's own search when `base_level_only` is set.
+/// alone, from `search_entry_points` nodes drawn at random for each
+/// query, so the entry point and `max_level` are never read: its
+/// memory-optimized search seeds level 0 with all the drawn nodes, for
+/// every CAGRA graph, and Faiss's own search, when `base_level_only` is
+/// set, starts from the nearest of them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CagraFields {
     /// File offset of the first field, right after the index header.

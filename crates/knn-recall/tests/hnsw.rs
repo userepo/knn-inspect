@@ -19,7 +19,7 @@ use knn_format::faiss::{
 };
 use knn_format::{F32, F64, I32, U64};
 use knn_recall::{
-    Error, Labels, Queries, Query, Searcher, ground_truth, result_labels, score, search_all,
+    Draw, Error, Labels, Queries, Query, Searcher, ground_truth, result_labels, score, search_all,
 };
 use serde::Deserialize;
 
@@ -118,10 +118,10 @@ fn own_search_matches_faiss() {
             b.file
         );
 
-        let hits = search_all(&index.index, &queries, b.k, b.ef_search).unwrap();
+        let hits = search_all(&index.index, &queries, b.k, b.ef_search, Draw::default()).unwrap();
         // Deterministic across runs and thread schedules.
         assert_eq!(
-            search_all(&index.index, &queries, b.k, b.ef_search).unwrap(),
+            search_all(&index.index, &queries, b.k, b.ef_search, Draw::default()).unwrap(),
             hits
         );
         let own: Vec<Vec<i64>> = hits.iter().map(|h| result_labels(index, h, b.k)).collect();
@@ -300,7 +300,7 @@ impl Built {
 
 fn nodes(b: &Built, query: &[f32], k: usize, ef: usize) -> Vec<usize> {
     Searcher::new(b.levels.len())
-        .search(&b.index(), query, k, ef)
+        .search(&b.index(), query, k, ef, Draw::default())
         .unwrap()
         .into_iter()
         .map(|h| h.node)
@@ -402,7 +402,9 @@ fn unreachable_nodes_leave_short_lists() {
     );
     assert_eq!(nodes(&b, &[0.0], 3, 16), vec![0, 1]);
     let index = b.index();
-    let hits = Searcher::new(3).search(&index, &[0.0], 3, 16).unwrap();
+    let hits = Searcher::new(3)
+        .search(&index, &[0.0], 3, 16, Draw::default())
+        .unwrap();
     let parsed = knn_format::faiss::IdMapIndex {
         fourcc: FourCc::ID_MAP,
         header: index.header,
@@ -446,7 +448,7 @@ fn inner_product_returns_the_largest_first() {
         0,
     );
     let hits = Searcher::new(4)
-        .search(&b.index(), &[1.0, 0.0], 4, 16)
+        .search(&b.index(), &[1.0, 0.0], 4, 16, Draw::default())
         .unwrap();
     let got: Vec<(usize, f32)> = hits.iter().map(|h| (h.node, h.distance)).collect();
     assert_eq!(got, vec![(0, 1.0), (3, 0.5), (1, 0.0), (2, -1.0)]);
@@ -469,7 +471,9 @@ fn malformed_graphs_yield_results_or_nothing() {
     );
     let mut index = b.index();
     index.graph.max_level = i32::MAX;
-    let hits = Searcher::new(2).search(&index, &[1.0], 2, 16).unwrap();
+    let hits = Searcher::new(2)
+        .search(&index, &[1.0], 2, 16, Draw::default())
+        .unwrap();
     assert_eq!(hits.iter().map(|h| h.node).collect::<Vec<_>>(), vec![1, 0]);
 
     // Neighbor ids past the node count are skipped.
@@ -500,11 +504,11 @@ fn search_checks_its_inputs() {
     let b = Built::l2(&[2], &[(&[0.0], &[&[1]]), (&[1.0], &[&[0]])], 0);
     let mut s = Searcher::new(2);
     assert!(matches!(
-        s.search(&b.index(), &[0.0], 0, 16),
+        s.search(&b.index(), &[0.0], 0, 16, Draw::default()),
         Err(Error::ZeroK)
     ));
     assert!(matches!(
-        s.search(&b.index(), &[0.0, 0.0], 1, 16),
+        s.search(&b.index(), &[0.0, 0.0], 1, 16, Draw::default()),
         Err(Error::DimensionMismatch {
             file: 1,
             queries: 2
@@ -512,15 +516,20 @@ fn search_checks_its_inputs() {
     ));
     let other = Built::new(&[2], 7, &[(&[0.0], &[&[1]]), (&[1.0], &[&[0]])], 0);
     assert!(matches!(
-        s.search(&other.index(), &[0.0], 1, 16),
+        s.search(&other.index(), &[0.0], 1, 16, Draw::default()),
         Err(Error::Metric { metric_type: 7 })
     ));
     let queries = Queries::from_rows(1, vec![0.0, 1.0]).unwrap();
     assert!(matches!(
-        search_all(&b.index(), &queries, 0, 16),
+        search_all(&b.index(), &queries, 0, 16, Draw::default()),
         Err(Error::ZeroK)
     ));
-    assert_eq!(search_all(&b.index(), &queries, 1, 16).unwrap().len(), 2);
+    assert_eq!(
+        search_all(&b.index(), &queries, 1, 16, Draw::default())
+            .unwrap()
+            .len(),
+        2
+    );
 }
 
 #[test]
@@ -534,28 +543,31 @@ fn a_graph_without_its_vectors_has_nothing_to_search() {
     let mut s = Searcher::new(index.graph.node_count());
     let query = [0.0_f32; 16];
     assert!(matches!(
-        s.search(index, &query, 10, 16),
+        s.search(index, &query, 10, 16, Draw::default()),
         Err(Error::NoVectors)
     ));
     let queries = Queries::from_rows(16, query.to_vec()).unwrap();
     assert!(matches!(
-        search_all(index, &queries, 10, 16),
+        search_all(index, &queries, 10, 16, Draw::default()),
         Err(Error::NoVectors)
     ));
     // k is still checked first.
-    assert!(matches!(s.search(index, &query, 0, 16), Err(Error::ZeroK)));
     assert!(matches!(
-        search_all(index, &queries, 0, 16),
+        s.search(index, &query, 0, 16, Draw::default()),
+        Err(Error::ZeroK)
+    ));
+    assert!(matches!(
+        search_all(index, &queries, 0, 16, Draw::default()),
         Err(Error::ZeroK)
     ));
 }
 
 #[test]
-fn a_cagra_graph_is_refused_not_searched() {
-    // k-NN's remote build writes a CAGRA graph of its base level, which
-    // Faiss searches from random entry points; the HNSW descent from the
-    // entry point has nothing to start from (-1), so the search is
-    // refused with a reason, over every storage.
+fn a_cagra_graph_is_searched_from_random_entries() {
+    // k-NN's remote build writes a CAGRA graph of its base level with no
+    // entry point: the search enters at the nearest of the draw's random
+    // nodes instead of the descent, over every storage, and one seed
+    // gives the same lists on every run.
     for name in [
         "ip-100x64-cagra",
         "l2-100x64-fp16-cagra",
@@ -566,43 +578,123 @@ fn a_cagra_graph_is_refused_not_searched() {
         let index = &parsed.index.index;
         assert!(index.random_entry_points(), "{name}");
         let mut s = Searcher::new(index.graph.node_count());
-        let query = [0.0_f32; 64];
-        assert!(
-            matches!(
-                s.search(index, &query, 10, 16),
-                Err(Error::RandomEntryPoints)
-            ),
+        let query = [0.25_f32; 64];
+        let hits = s.search(index, &query, 10, 16, Draw::default()).unwrap();
+        assert_eq!(hits.len(), 10, "{name}");
+        // Nearest first: ascending L2 distances, or descending inner
+        // products, where larger is nearer.
+        let sorted = if name.starts_with("ip-") {
+            hits.windows(2).all(|w| w[0].distance >= w[1].distance)
+        } else {
+            hits.windows(2).all(|w| w[0].distance <= w[1].distance)
+        };
+        assert!(sorted, "{name}");
+        assert_eq!(
+            hits,
+            s.search(index, &query, 10, 16, Draw::default()).unwrap(),
             "{name}"
         );
-        let queries = Queries::from_rows(64, query.to_vec()).unwrap();
-        assert!(
-            matches!(
-                search_all(index, &queries, 10, 16),
-                Err(Error::RandomEntryPoints)
-            ),
+        // search_all seeds query i with `seed + i`, so a row's list can
+        // be reproduced alone.
+        let other = [0.5_f32; 64];
+        let queries = Queries::from_rows(64, [query.to_vec(), other.to_vec()].concat()).unwrap();
+        let all = search_all(index, &queries, 10, 16, Draw::default()).unwrap();
+        assert_eq!(all[0], hits, "{name}");
+        assert_eq!(
+            all[1],
+            s.search(index, &other, 10, 16, Draw::default().for_row(1))
+                .unwrap(),
             "{name}"
         );
         // k is still checked first.
-        assert!(matches!(s.search(index, &query, 0, 16), Err(Error::ZeroK)));
+        assert!(matches!(
+            s.search(index, &query, 0, 16, Draw::default()),
+            Err(Error::ZeroK)
+        ));
     }
+    // A binary graph runs the same search over Hamming distances.
     let bytes =
         fs::read(fixtures().join("synthetic-cagra/hamming-100x64-binary-cagra.faiss")).unwrap();
     let parsed = knn_format::parse(&bytes).unwrap();
     let index = &parsed.index.index;
     let mut s = Searcher::new(index.graph.node_count());
-    assert!(matches!(
-        s.search(index, Query::Bits(&[0_u8; 8]), 10, 16),
-        Err(Error::RandomEntryPoints)
-    ));
-    // The brute force over the file's vectors does not care which graph
-    // sits above them.
-    let Some(storage) = &index.storage else {
-        panic!("binary storage");
+    let hits = s
+        .search(index, Query::Bits(&[0_u8; 8]), 10, 16, Draw::default())
+        .unwrap();
+    assert_eq!(hits.len(), 10);
+    assert!(hits.windows(2).all(|w| w[0].distance <= w[1].distance));
+}
+
+#[test]
+fn the_seed_steers_a_cagra_graphs_entry_draw() {
+    // Golden values pin the draw stream: a search that ignored the seed
+    // or the count (one draw at ef 1 reaches only the entry's own
+    // neighborhood), or a changed stream, fails here. The two seeds draw
+    // different entries, so the lists differ.
+    let bytes = fs::read(fixtures().join("synthetic-cagra/l2-100x64-cagra.faiss")).unwrap();
+    let parsed = knn_format::parse(&bytes).unwrap();
+    let index = &parsed.index.index;
+    let mut s = Searcher::new(index.graph.node_count());
+    let query = [0.25_f32; 64];
+    let mut nodes_of = |seed: u64| -> Vec<usize> {
+        let draw = Draw {
+            seed,
+            count: Some(1),
+        };
+        let hits = s.search(index, &query, 10, 1, draw).unwrap();
+        hits.iter().map(|h| h.node).collect()
     };
-    let queries = Queries::from_bits(&[0_u8; 8], 64).unwrap();
+    assert_eq!(nodes_of(1), [71, 69, 22, 11, 33, 39, 34, 81, 97, 16]);
+    assert_eq!(nodes_of(2), [71, 69, 22, 11, 33, 39, 34, 81, 97, 2]);
+}
+
+#[test]
+fn a_huge_entry_count_is_capped() {
+    // Uncapped, usize::MAX draws would never finish; capped at
+    // MAX_ENTRY_DRAWS, the search returns, and a count past the cap draws
+    // what the cap does.
+    let bytes = fs::read(fixtures().join("synthetic-cagra/l2-100x64-cagra.faiss")).unwrap();
+    let parsed = knn_format::parse(&bytes).unwrap();
+    let index = &parsed.index.index;
+    let mut s = Searcher::new(index.graph.node_count());
+    let query = [0.25_f32; 64];
+    let at = |count| Draw {
+        seed: 5,
+        count: Some(count),
+    };
+    let huge = s.search(index, &query, 10, 16, at(usize::MAX)).unwrap();
+    let capped = s
+        .search(index, &query, 10, 16, at(knn_recall::MAX_ENTRY_DRAWS))
+        .unwrap();
+    assert_eq!(huge, capped);
+    assert_eq!(huge.len(), 10);
+}
+
+#[test]
+fn a_full_exploration_of_a_cagra_graph_finds_the_exact_neighbors() {
+    // With ef_search at the node count, the level-0 search explores every
+    // node its entry leads to, so for these 20 queries, from this one
+    // drawn entry, the lists equal brute force: the assertion shows their
+    // neighbors are reachable from it (the fixture's zero unreachable
+    // count is necessary for that, not sufficient).
+    let bytes = fs::read(fixtures().join("synthetic-cagra/l2-100x64-cagra.faiss")).unwrap();
+    let parsed = knn_format::parse(&bytes).unwrap();
+    let index = &parsed.index.index;
+    let storage = index.storage.as_ref().unwrap();
+    let (queries, _) = knn_recall::sample_queries(storage, 20, 11).unwrap();
+    let draw = Draw {
+        seed: 42,
+        count: Some(1),
+    };
+    let hits = search_all(index, &queries, 10, 100, draw).unwrap();
+    let lists: Vec<Vec<i64>> = hits
+        .iter()
+        .map(|h| result_labels(&parsed.index, h, 10))
+        .collect();
+    let labels = Labels::from_id_map(parsed.index.id_map).unwrap();
     let truth = ground_truth(storage, &queries, 10).unwrap();
-    assert_eq!(truth.len(), 1);
-    assert_eq!(truth.k(), 10);
+    let scored = score(storage, &labels, &queries, &truth, &lists).unwrap();
+    assert_eq!(scored.recall, 1.0);
 }
 
 #[test]
@@ -702,7 +794,9 @@ fn binary_samples_are_the_stored_bits() {
         // tied with another copy of the same bits.
         let mut searcher = Searcher::new(parsed.index.index.graph.node_count());
         let row = binary.row(rows[0]).unwrap();
-        let hits = searcher.search(&parsed.index.index, row, 5, 64).unwrap();
+        let hits = searcher
+            .search(&parsed.index.index, row, 5, 64, Draw::default())
+            .unwrap();
         assert_eq!(hits[0].distance.to_bits(), 0.0_f32.to_bits(), "{file}");
         // Each hit's distance is the bits in which its codes differ from
         // the query's, nearest first.
@@ -722,7 +816,7 @@ fn binary_samples_are_the_stored_bits() {
         }
         // Searching with float32 queries is refused, not guessed at.
         assert!(matches!(
-            searcher.search(&parsed.index.index, &[0.0_f32; 8], 5, 64),
+            searcher.search(&parsed.index.index, &[0.0_f32; 8], 5, 64, Draw::default()),
             Err(Error::QueryKind {
                 file: "binary",
                 queries: "float32"

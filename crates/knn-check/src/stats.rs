@@ -86,7 +86,9 @@ pub fn graph_stats(graph: &HnswGraph<'_>) -> GraphStats {
 /// points, never reading the entry point, `max_level`, or the upper
 /// levels. Any node can be where a search starts, so a node is unreached
 /// when no other node on the level lists it (its own list leads nowhere
-/// new), and a search returns it only when it draws it as an entry. The
+/// new), and a search returns it only when it starts there: when it
+/// draws the node as an entry and, over the file's own vectors, the
+/// node is also the nearest of its draws. The
 /// one layer is level 0; the entry point and `max_level` are reported as
 /// stored.
 #[must_use]

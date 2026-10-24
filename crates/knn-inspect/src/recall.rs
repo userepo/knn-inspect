@@ -15,7 +15,7 @@ use knn_format::flat_vectors::{FlatField, FlatVectorsMeta};
 use knn_format::quantized_vectors::{DataFile, QuantizedVectors};
 use knn_recall::on_disk::{DEFAULT_EF_SEARCH, OnDiskField, Plan, Rescore, field_vectors};
 use knn_recall::quantizer::Similarity;
-use knn_recall::{Labels, Queries, Recall};
+use knn_recall::{Draw, Labels, Queries, Recall};
 use serde::Serialize;
 
 use crate::scan::quantized::{
@@ -38,13 +38,19 @@ pub struct RecallArgs {
     /// cannot have used them.
     #[arg(long, conflicts_with = "results")]
     pub sample: Option<usize>,
-    /// Seed for --sample; 1 when absent.
-    // Both rules are needed: clap waives a required argument that
-    // conflicts with one given, so `requires` alone would let
-    // `--queries --seed` pass; the conflict blocks that, and `requires`
-    // makes a stray --seed name --sample as what is missing.
-    #[arg(long, requires = "sample", conflicts_with = "queries")]
+    /// Seed for --sample and for the random entry points of a CAGRA
+    /// graph's own search; 1 when absent.
+    // With --queries, the seed has a use only when the graph draws entry
+    // points, which clap cannot see: run() checks it against the file.
+    #[arg(long, conflicts_with = "results")]
     pub seed: Option<u64>,
+    /// For a CAGRA graph's own search: random entry points drawn per
+    /// query, instead of the file's count; a file with its vectors draws
+    /// at most 65,536 times. For a graph without its vectors, a count at
+    /// least the vector count seeds the search with every node, in order,
+    /// so the seed no longer matters.
+    #[arg(long, conflicts_with = "results", value_parser = clap::value_parser!(u64).range(1..))]
+    pub entry_points: Option<u64>,
     /// Result lists to score instead of searching: one per query, in query
     /// order, as a JSON array of labels per line or `{"labels": [...]}`.
     #[arg(long)]
@@ -110,6 +116,12 @@ struct Sample {
 #[derive(Serialize)]
 struct OwnSearch {
     ef_search: usize,
+    /// For a CAGRA graph: random entry points drawn per query.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    entry_points: Option<usize>,
+    /// For a CAGRA graph: the seed of the entry draws.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seed: Option<u64>,
     /// For a graph without its vectors: the graph search's beam.
     #[serde(skip_serializing_if = "Option::is_none")]
     beam: Option<usize>,
@@ -149,14 +161,21 @@ pub fn run(args: &RecallArgs) -> anyhow::Result<ExitCode> {
         .parse()
         .with_context(|| format!("parsing {}", path.display()))?;
     let index = &parsed.index;
-    // A verdict, not a search: k-NN searches such a graph from random
-    // entry points, which this tool does not reproduce yet. Lists from
-    // elsewhere are still scored, against brute force over the vectors.
-    if index.index.random_entry_points() && args.results.is_none() {
-        bail!(
-            "{}: a CAGRA graph (k-NN's remote index build), searched from random entry points on its base level; recall does not run its own search on it yet, but scores lists from elsewhere given with --results, and info, verify, stats, and scan read it",
-            path.display()
-        );
+    // Clap cannot see the graph kind, so the arguments that steer the
+    // random entry draws are checked against the file here.
+    if !index.index.random_entry_points() {
+        if args.entry_points.is_some() {
+            bail!(
+                "{}: --entry-points applies to a CAGRA graph's own search; this graph is searched from its entry point",
+                path.display()
+            );
+        }
+        if args.seed.is_some() && args.sample.is_none() {
+            bail!(
+                "{}: --seed without --sample applies to a CAGRA graph's own search; this graph is searched from its entry point",
+                path.display()
+            );
+        }
     }
     let Some(storage) = index.index.storage.as_ref() else {
         return run_on_disk(args, index);
@@ -262,12 +281,22 @@ fn run_on_disk(args: &RecallArgs, index: &IdMapIndex<'_>) -> anyhow::Result<Exit
             usize::try_from(ef).unwrap_or(usize::MAX)
         });
         let plan: Plan = on_disk.plan(args.k, ef_search, rescore)?;
+        let draw = draw_of(args);
         let started = Instant::now();
-        let results = on_disk.search_all(&queries, &plan)?;
+        let results = on_disk.search_all(&queries, &plan, draw)?;
+        let cagra = index.index.kind.cagra();
         (
             results,
             Some(OwnSearch {
                 ef_search,
+                // The seeds each query got: k-NN caps the count at the
+                // vector count, past which every node is one.
+                entry_points: cagra.map(|c| {
+                    draw.count
+                        .unwrap_or_else(|| usize::try_from(c.search_entry_points).unwrap_or(0))
+                        .min(storage.row_count())
+                }),
+                seed: cagra.map(|_| draw.seed),
                 beam: Some(plan.beam),
                 rescore: Some(plan.first_pass_k.is_some()),
                 first_pass_k: plan.first_pass_k,
@@ -413,6 +442,17 @@ fn load_queries(
     Ok((queries, Some(Sample { count, seed })))
 }
 
+/// The entry draw of a CAGRA graph's own search, from --seed and
+/// --entry-points.
+fn draw_of(args: &RecallArgs) -> Draw {
+    Draw {
+        seed: args.seed.unwrap_or(1),
+        count: args
+            .entry_points
+            .map(|e| usize::try_from(e).unwrap_or(usize::MAX)),
+    }
+}
+
 /// The result lists to score: read from `--results`, or produced by the
 /// tool's own search.
 fn results_for(
@@ -427,17 +467,26 @@ fn results_for(
         || usize::try_from(index.index.graph.ef_search).unwrap_or(0),
         |ef| usize::try_from(ef).unwrap_or(usize::MAX),
     );
+    let draw = draw_of(args);
     let started = Instant::now();
-    let hits = knn_recall::search_all(&index.index, queries, args.k, ef_search)?;
+    let hits = knn_recall::search_all(&index.index, queries, args.k, ef_search, draw)?;
     let search_ms = started.elapsed().as_millis();
     let results = hits
         .iter()
         .map(|h| knn_recall::result_labels(index, h, args.k))
         .collect();
+    let cagra = index.index.kind.cagra();
     Ok((
         results,
         Some(OwnSearch {
             ef_search,
+            // The draws each query got: the search cuts a corrupt count.
+            entry_points: cagra.map(|c| {
+                draw.count
+                    .unwrap_or_else(|| usize::try_from(c.search_entry_points).unwrap_or(0))
+                    .min(knn_recall::MAX_ENTRY_DRAWS)
+            }),
+            seed: cagra.map(|_| draw.seed),
             beam: None,
             rescore: None,
             first_pass_k: None,
@@ -534,23 +583,49 @@ fn text(out: &Output<'_>) -> String {
                 |ids| format!("from {ids}")
             )
         ),
-        (None, Some(search)) => match search.beam {
-            Some(beam) => writeln!(
-                s,
-                "  results         own search as k-NN runs it, beam {beam} (ef_search {}), {}, {} ms",
-                search.ef_search,
-                search.first_pass_k.map_or_else(
-                    || "no rescoring".to_owned(),
-                    |f| format!("first {f} rescored against the .vec")
+        (None, Some(search)) => {
+            // For a CAGRA graph: where each query's search started. A
+            // graph without its vectors scores every vector once the beam
+            // reaches the vector count, reading no entry points, and is
+            // seeded with every node once the count reaches it, where the
+            // seed no longer matters.
+            let entries = search.entry_points.map_or_else(String::new, |e| {
+                let graph_only = search.beam.is_some();
+                if graph_only && search.beam.is_some_and(|b| b >= out.vectors) {
+                    ", every vector scored (the beam reaches the vector count), no entry points".to_owned()
+                } else if graph_only && e >= out.vectors {
+                    ", every node as an entry point".to_owned()
+                } else {
+                    let plural = if e == 1 { "" } else { "s" };
+                    format!(
+                        ", {e} random entry point{plural} per query (seed {})",
+                        search.seed.unwrap_or(1)
+                    )
+                }
+            });
+            match search.beam {
+                Some(beam) => writeln!(
+                    s,
+                    "  results         own search as k-NN runs it, beam {beam} (ef_search {}){entries}, {}, {} ms",
+                    search.ef_search,
+                    search.first_pass_k.map_or_else(
+                        || "no rescoring".to_owned(),
+                        |f| format!("first {f} rescored against the .vec")
+                    ),
+                    search.search_ms
                 ),
-                search.search_ms
-            ),
-            None => writeln!(
-                s,
-                "  results         own HNSW search, efSearch {}, {} ms",
-                search.ef_search, search.search_ms
-            ),
-        },
+                None if entries.is_empty() => writeln!(
+                    s,
+                    "  results         own HNSW search, efSearch {}, {} ms",
+                    search.ef_search, search.search_ms
+                ),
+                None => writeln!(
+                    s,
+                    "  results         own search of the CAGRA graph, efSearch {}{entries}, {} ms",
+                    search.ef_search, search.search_ms
+                ),
+            }
+        }
         (None, None) => writeln!(s, "  results         {} lists", r.queries),
     }
     .expect("writing to a String cannot fail");

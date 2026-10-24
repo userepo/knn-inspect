@@ -119,6 +119,7 @@ fn searches_are_k_nns_own() {
                     n,
                     k,
                     NO_LIMIT,
+                    None,
                     |node| row.get(node).copied(),
                     |ord| case.docs[ord],
                 )
@@ -226,6 +227,7 @@ fn run(b: &Built, n: usize, k: usize, limit: u64, scores: &[f32]) -> TopDocs {
         n,
         k,
         limit,
+        None,
         |node| scores.get(node).copied(),
         |ord| i32::try_from(ord).unwrap(),
     )
@@ -376,6 +378,7 @@ fn a_node_without_a_score_is_an_error() {
         5,
         2,
         NO_LIMIT,
+        None,
         // Rising scores lead the search to node 3.
         |node| (node != 3).then(|| LINE_SCORES[node]),
         |ord| i32::try_from(ord).unwrap(),

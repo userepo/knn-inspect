@@ -561,18 +561,59 @@ fn recall_rejects_contradictory_options() {
     assert_eq!(o.status.code(), Some(2));
     let o = run(&["recall", file_s, "--sample", "3", "--results", results_s]);
     assert_eq!(o.status.code(), Some(2));
-    let o = run(&["recall", file_s, "--queries", queries_s, "--seed", "5"]);
+    // --seed alone still lacks queries; with --results it conflicts.
+    let o = run(&["recall", file_s, "--seed", "5"]);
     assert_eq!(o.status.code(), Some(2));
-    // A stray --seed names --sample as the missing argument.
-    for extra in [
-        &["--seed", "5"][..],
-        &["--seed", "5", "--results", results_s][..],
-    ] {
-        let o = run(&[&["recall", file_s][..], extra].concat());
-        assert_eq!(o.status.code(), Some(2));
-        let err = String::from_utf8_lossy(&o.stderr);
-        assert!(err.contains("--sample"), "{err}");
-    }
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(err.contains("--queries"), "{err}");
+    let o = run(&["recall", file_s, "--seed", "5", "--results", results_s]);
+    assert_eq!(o.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(err.contains("--results"), "{err}");
+    // --seed with --queries, and --entry-points at all, steer the random
+    // entry draws of a CAGRA graph's own search; this graph has an entry
+    // point, so they are refused against the file, exit 1.
+    let o = run(&["recall", file_s, "--queries", queries_s, "--seed", "5"]);
+    assert_eq!(o.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        err.contains("--seed without --sample applies to a CAGRA graph's own search"),
+        "{err}"
+    );
+    let o = run(&[
+        "recall",
+        file_s,
+        "--queries",
+        queries_s,
+        "--entry-points",
+        "4",
+    ]);
+    assert_eq!(o.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        err.contains("--entry-points applies to a CAGRA graph's own search"),
+        "{err}"
+    );
+    // 0 entry points would find nothing, and --results conflicts: both
+    // are clap's errors.
+    let o = run(&[
+        "recall",
+        file_s,
+        "--queries",
+        queries_s,
+        "--entry-points",
+        "0",
+    ]);
+    assert_eq!(o.status.code(), Some(2));
+    let o = run(&[
+        "recall",
+        file_s,
+        "--entry-points",
+        "4",
+        "--results",
+        results_s,
+    ]);
+    assert_eq!(o.status.code(), Some(2));
     // efSearch 0 would stop the search after one step; it is never meant.
     let o = run(&["recall", file_s, "--queries", queries_s, "--ef-search", "0"]);
     assert_eq!(o.status.code(), Some(2));
@@ -2713,11 +2754,11 @@ fn recall_reads_a_binary_files_rows_by_its_code_size() {
 }
 
 #[test]
-fn cagra_graphs_are_read_by_every_command_but_recall() {
+fn cagra_graphs_are_read_by_info_verify_and_stats() {
     // k-NN's remote index build writes a CAGRA graph of its base level:
-    // info names it, verify holds it to what the builder writes, stats
-    // reports its one level, scan sees it, and recall refuses it with a
-    // reason, since Faiss searches it from random entry points.
+    // info names it, verify holds it to what the builder writes, and
+    // stats reports its one level; scan and recall have their own tests
+    // below.
     let dir = fixtures().join("synthetic-cagra");
     let file = dir.join("l2-100x64-fp16-cagra.faiss");
     let path = file.to_str().unwrap();
@@ -2846,29 +2887,114 @@ fn recall_scores_results_on_a_remote_built_graph() {
 }
 
 #[test]
-fn cagra_graphs_refuse_recalls_own_search_and_scan_clean() {
+fn cagra_graphs_run_recalls_own_search() {
     let dir = fixtures().join("synthetic-cagra");
     let file = dir.join("l2-100x64-fp16-cagra.faiss");
     let path = file.to_str().unwrap();
     let binary = dir.join("hamming-100x64-binary-cagra.faiss");
 
-    // recall: the tool's own search is refused with a verdict, exit 1,
-    // whatever its options.
+    // The tool's own search enters at the nearest of seeded random
+    // draws, the file's 32 per query; the report names the draw.
+    let o = run(&["recall", path, "--sample", "5", "--json"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["search"]["entry_points"], 32, "{v}");
+    assert_eq!(v["search"]["seed"], 1, "{v}");
+    assert_eq!(v["search"]["ef_search"], 16, "{v}");
+    let text = stdout(&run(&["recall", path, "--sample", "5"]));
+    assert!(
+        text.contains(
+            "results         own search of the CAGRA graph, efSearch 16, 32 random entry points per query (seed 1)"
+        ),
+        "{text}"
+    );
+    // --queries now takes --seed and --entry-points on such a graph; the
+    // override is reported.
     let queries = fixtures().join("synthetic/l2-4000x64.queries.f32");
-    for args in [
-        vec!["recall", path, "--queries", queries.to_str().unwrap()],
-        vec!["recall", path, "--sample", "5", "--json"],
-        vec!["recall", binary.to_str().unwrap(), "--sample", "5"],
-    ] {
-        let o = run(&args);
-        assert_eq!(o.status.code(), Some(1), "{args:?}: {}", stdout(&o));
-        let err = String::from_utf8_lossy(&o.stderr);
-        assert!(
-            err.contains("a CAGRA graph (k-NN's remote index build), searched from random entry points on its base level; recall does not run its own search on it yet, but scores lists from elsewhere given with --results"),
-            "{args:?}: {err}"
+    let o = run(&[
+        "recall",
+        path,
+        "--queries",
+        queries.to_str().unwrap(),
+        "--seed",
+        "4",
+        "--entry-points",
+        "8",
+        "--json",
+    ]);
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["search"]["entry_points"], 8, "{v}");
+    assert_eq!(v["search"]["seed"], 4, "{v}");
+    // A binary graph runs the same search over Hamming distances.
+    let o = run(&["recall", binary.to_str().unwrap(), "--sample", "5"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+}
+
+#[test]
+fn cagra_entry_draws_are_capped_and_reported_as_run() {
+    // Over the file's own vectors the draws stop at 65,536 per query, an
+    // override past that included, and the report names the draws made.
+    let file = fixtures().join("synthetic-cagra/l2-100x64-cagra.faiss");
+    let path = file.to_str().unwrap();
+    let recall = |extra: &[&str]| {
+        let o = run(&[&["recall", path, "--sample", "3", "--k", "5"][..], extra].concat());
+        assert_eq!(
+            o.status.code(),
+            Some(0),
+            "{extra:?}: {}",
+            String::from_utf8_lossy(&o.stderr)
         );
-        assert!(stdout(&o).is_empty(), "{args:?}");
-    }
+        stdout(&o)
+    };
+    let v: serde_json::Value =
+        serde_json::from_str(&recall(&["--entry-points", "100000", "--json"])).unwrap();
+    assert_eq!(v["search"]["entry_points"], 65_536, "{v}");
+    let v: serde_json::Value = serde_json::from_str(&recall(&[
+        "--entry-points",
+        "18446744073709551615",
+        "--json",
+    ]))
+    .unwrap();
+    assert_eq!(v["search"]["entry_points"], 65_536, "{v}");
+    let text = recall(&["--entry-points", "1"]);
+    assert!(
+        text.contains(", 1 random entry point per query (seed 1), "),
+        "{text}"
+    );
+
+    // A graph without its vectors: a count at the vector count seeds
+    // every node, and a beam at the vector count scores every vector,
+    // reading no entry points; the text says so.
+    let on_disk = fixtures().join("opensearch-3.9.0-remote/on-disk/l2/_2_165_vec.faiss");
+    let on_disk = on_disk.to_str().unwrap();
+    let text = |extra: &[&str]| {
+        let o = run(&[&["recall", on_disk, "--sample", "3"][..], extra].concat());
+        assert_eq!(
+            o.status.code(),
+            Some(0),
+            "{extra:?}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        stdout(&o)
+    };
+    let t = text(&["--entry-points", "10000"]);
+    assert!(t.contains(", every node as an entry point, "), "{t}");
+    let t = text(&["--k", "500"]);
+    assert!(
+        t.contains(", every vector scored (the beam reaches the vector count), no entry points, "),
+        "{t}"
+    );
+    let t = text(&[]);
+    assert!(
+        t.contains(", 32 random entry points per query (seed 1), "),
+        "{t}"
+    );
+}
+
+#[test]
+fn cagra_graphs_scan_clean() {
+    let dir = fixtures().join("synthetic-cagra");
 
     // scan: every file of the directory is a clean bare file with no
     // .vec beside it.
@@ -2956,6 +3082,102 @@ fn cagra_graphs_refuse_recalls_own_search_and_scan_clean() {
         text.contains("  storage         none: k-NN keeps the field's quantized vectors in Lucene's .veq file\n"),
         "{text}"
     );
+}
+
+#[test]
+fn a_full_exploration_of_cagra_graphs_equals_brute_force() {
+    // The deterministic bound of the search's validation: with a search
+    // wide enough to explore every node its entries lead to, the tool's
+    // lists equal brute force. Recall 1.0 here is itself the evidence
+    // that these queries' neighbors are reachable from the drawn entries;
+    // stats' zero unreachable nodes is a necessary sign of that, not a
+    // guarantee, since internally pointed-to components could still be
+    // disconnected. A fixed seed also gives the same report on every run.
+    // A graph with its vectors is searched with --ef-search past the
+    // vector count. A graph without them would score every vector once
+    // its beam reached the vector count, never reading the entries, so
+    // its beam stays one below it (--ef-search n - 1), and --oversample 30
+    // keeps 300 first-pass results for the exact rescoring to decide.
+    let mut files: Vec<(std::path::PathBuf, Option<usize>)> =
+        std::fs::read_dir(fixtures().join("synthetic-cagra"))
+            .unwrap()
+            .filter_map(|e| {
+                let p = e.unwrap().path();
+                (p.extension() == Some("faiss".as_ref())).then_some((p, None))
+            })
+            .collect();
+    // Every remote fixture set, so a new one is swept without a test
+    // edit (a dot-prefixed directory is a build the extraction tool left,
+    // not a set); the graph-only sets are the on-disk engines.
+    let visible = |e: &std::fs::DirEntry| {
+        e.file_type().unwrap().is_dir() && !e.file_name().to_string_lossy().starts_with('.')
+    };
+    let remote = fixtures().join("opensearch-3.9.0-remote");
+    for engine in std::fs::read_dir(&remote).unwrap() {
+        let engine = engine.unwrap();
+        if !visible(&engine) {
+            continue;
+        }
+        let on_disk = engine.file_name().to_string_lossy().starts_with("on-disk");
+        for space in std::fs::read_dir(engine.path()).unwrap() {
+            let space = space.unwrap();
+            if !visible(&space) {
+                continue;
+            }
+            let vectors = on_disk.then(|| {
+                let manifest: serde_json::Value = serde_json::from_slice(
+                    &std::fs::read(space.path().join("manifest.json")).unwrap(),
+                )
+                .unwrap();
+                usize::try_from(manifest["count"].as_u64().unwrap()).unwrap()
+            });
+            files.push((space.path().join("_2_165_vec.faiss"), vectors));
+        }
+    }
+    assert!(files.len() >= 12, "{files:?}");
+    for (file, graph_only) in files {
+        let path = file.to_str().unwrap().to_owned();
+        let ef = graph_only.map_or_else(|| "1000000".to_owned(), |n| (n - 1).to_string());
+        let mut args = vec![
+            "recall",
+            path.as_str(),
+            "--sample",
+            "20",
+            "--seed",
+            "3",
+            "--k",
+            "10",
+            "--ef-search",
+            ef.as_str(),
+            "--json",
+        ];
+        if graph_only.is_some() {
+            args.extend(["--oversample", "30"]);
+        }
+        let strip = |o: &std::process::Output| {
+            let mut v: serde_json::Value = serde_json::from_str(&stdout(o)).unwrap();
+            v.as_object_mut().unwrap().remove("ground_truth_ms");
+            v["search"].as_object_mut().unwrap().remove("search_ms");
+            v
+        };
+        let first = run(&args);
+        assert_eq!(
+            first.status.code(),
+            Some(0),
+            "{path}: {}",
+            String::from_utf8_lossy(&first.stderr)
+        );
+        let a = strip(&first);
+        assert_eq!(a["recall"], 1.0, "{path}: {a}");
+        if let Some(n) = graph_only {
+            // The graph search ran: the beam is below the vector count.
+            assert!(
+                a["search"]["beam"].as_u64().unwrap() < u64::try_from(n).unwrap(),
+                "{path}: {a}"
+            );
+        }
+        assert_eq!(a, strip(&run(&args)), "{path}");
+    }
 }
 
 #[test]
@@ -3201,8 +3423,8 @@ fn scan_checks_a_remote_built_graph_against_the_fields_quantized_vectors() {
 fn a_remote_built_graph_is_held_to_its_field_as_a_local_one_is() {
     // The same field under the wrong space, a graph of another shape than
     // the field's, and a graph of another metric than the field's
-    // similarity are refused as for a local graph; recall still refuses
-    // the graph with the field's files all there.
+    // similarity are refused as for a local graph; recall searches the
+    // restored graph with the field's files all there.
     let (scratch, native, remote) = remote_built_segment("remote-built-unfit");
     let path = native.to_str().unwrap();
     let quantized = |dir: &Path| {
@@ -3281,13 +3503,19 @@ fn a_remote_built_graph_is_held_to_its_field_as_a_local_one_is() {
         "{q}"
     );
 
-    // recall still refuses it, with the field's files all there.
+    // Restored, the field is searched from seeded random entry points,
+    // as k-NN's memory-optimized search runs it.
     std::fs::write(&native, &remote).unwrap();
-    let o = run(&["recall", path, "--sample", "5"]);
-    assert_eq!(o.status.code(), Some(1));
-    assert!(
-        String::from_utf8_lossy(&o.stderr).contains("a CAGRA graph (k-NN's remote index build)")
+    let o = run(&["recall", path, "--sample", "5", "--json"]);
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
     );
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert!(v["search"]["entry_points"].is_u64(), "{v}");
+    assert!(v["search"]["beam"].is_u64(), "{v}");
 }
 
 #[test]
@@ -3334,14 +3562,14 @@ fn scan_reads_the_segments_the_remote_build_wrote() {
         );
         assert!(text.contains(&format!(" n={count} ")), "{set}: {text}");
         assert!(text.contains("  cagra\n"), "{set}: {text}");
-        // recall refuses every one of them.
+        // recall's own search runs on every one of them.
         let native = dir.join("_2_165_vec.faiss");
         let o = run(&["recall", native.to_str().unwrap(), "--sample", "5"]);
-        assert_eq!(o.status.code(), Some(1), "{set}");
-        assert!(
+        assert_eq!(
+            o.status.code(),
+            Some(0),
+            "{set}: {}",
             String::from_utf8_lossy(&o.stderr)
-                .contains("a CAGRA graph (k-NN's remote index build)"),
-            "{set}"
         );
     }
     // The on_disk field's records are the ones checked.

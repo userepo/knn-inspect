@@ -24,7 +24,7 @@ use knn_recall::on_disk::{
 };
 use knn_recall::quantized_scorer::QuantizedScorer;
 use knn_recall::quantizer::Similarity;
-use knn_recall::{Error, Queries};
+use knn_recall::{Draw, Error, Queries};
 
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/opensearch-3.9.0-binary")
@@ -175,11 +175,15 @@ fn without_rescoring_the_first_pass_is_the_result() {
                 records.len(),
                 100,
                 u64::from(i32::MAX.unsigned_abs()),
+                None,
                 |node| records.record(node).and_then(|r| scorer.score_record(&r)),
                 |ord| i32::try_from(parsed.index.id_map[ord].get()).unwrap(),
             )
             .unwrap();
-            assert_eq!(f.search(q, &plan).unwrap(), first.hits[..10]);
+            assert_eq!(
+                f.search(q, &plan, Draw::default()).unwrap(),
+                first.hits[..10]
+            );
         }
     });
 }
@@ -202,7 +206,7 @@ fn rescored_results_are_the_exact_best_of_the_first_pass() {
                 let knn_recall::Query::Floats(q) = q else {
                     panic!("float queries");
                 };
-                let hits = f.search(q, &rescored).unwrap();
+                let hits = f.search(q, &rescored, Draw::default()).unwrap();
                 assert_eq!(hits.len(), 10, "{fixture}");
                 // Best first, ties by doc.
                 for pair in hits.windows(2) {
@@ -213,7 +217,12 @@ fn rescored_results_are_the_exact_best_of_the_first_pass() {
                     );
                 }
                 // Every result is among the first pass's 100.
-                let pool: Vec<i32> = f.search(q, &first).unwrap().iter().map(|h| h.doc).collect();
+                let pool: Vec<i32> = f
+                    .search(q, &first, Draw::default())
+                    .unwrap()
+                    .iter()
+                    .map(|h| h.doc)
+                    .collect();
                 assert!(hits.iter().all(|h| pool.contains(&h.doc)), "{fixture}");
             }
         });
@@ -225,14 +234,14 @@ fn search_all_lists_labels_per_query() {
     with_field("on-disk/l2", |f| {
         let plan = f.plan(5, DEFAULT_EF_SEARCH, Rescore::Default).unwrap();
         let qs = queries(f, 4);
-        let lists = f.search_all(&qs, &plan).unwrap();
+        let lists = f.search_all(&qs, &plan, Draw::default()).unwrap();
         assert_eq!(lists.len(), 4);
         for (list, q) in lists.iter().zip(qs.rows()) {
             let knn_recall::Query::Floats(q) = q else {
                 panic!("float queries");
             };
             let hits: Vec<i64> = f
-                .search(q, &plan)
+                .search(q, &plan, Draw::default())
                 .unwrap()
                 .iter()
                 .map(|h| i64::from(h.doc))
@@ -244,7 +253,7 @@ fn search_all_lists_labels_per_query() {
         let knn_recall::Query::Floats(first) = first else {
             panic!("float queries");
         };
-        let top = f.search(first, &plan).unwrap()[0];
+        let top = f.search(first, &plan, Draw::default()).unwrap()[0];
         assert_eq!(top.score, 1.0, "a distance of 0");
     });
 }
@@ -255,11 +264,11 @@ fn queries_k_nn_refuses_are_refused() {
     with_field("on-disk/cosinesimil", |f| {
         let plan = f.plan(10, DEFAULT_EF_SEARCH, Rescore::Default).unwrap();
         assert!(matches!(
-            f.search(&[0.0; 16], &plan),
+            f.search(&[0.0; 16], &plan, Draw::default()),
             Err(Error::ZeroNormQuery)
         ));
         assert!(matches!(
-            f.search(&[1.0; 15], &plan),
+            f.search(&[1.0; 15], &plan, Draw::default()),
             Err(Error::DimensionMismatch {
                 file: 16,
                 queries: 15
@@ -408,13 +417,13 @@ fn docs_and_nodes_are_told_apart() {
                 usize::try_from(if reversed { last - doc } else { doc }).unwrap()
             };
             let mut ours: Vec<(usize, u32)> = turned
-                .search(q, &plan)
+                .search(q, &plan, Draw::default())
                 .unwrap()
                 .iter()
                 .map(|h| (node_of(h.doc, true), h.score.to_bits()))
                 .collect();
             let mut theirs: Vec<(usize, u32)> = straight
-                .search(q, &plan)
+                .search(q, &plan, Draw::default())
                 .unwrap()
                 .iter()
                 .map(|h| (node_of(h.doc, false), h.score.to_bits()))
@@ -530,7 +539,7 @@ fn searches_return_what_the_live_index_returned() {
                     let knn_recall::Query::Floats(q) = q else {
                         panic!("float queries");
                     };
-                    let ours = f.search(q, &plan).unwrap();
+                    let ours = f.search(q, &plan, Draw::default()).unwrap();
                     let labels: Vec<i64> = ours.iter().map(|h| i64::from(h.doc)).collect();
                     let scores: Vec<u32> = ours.iter().map(|h| h.score.to_bits()).collect();
                     let live_scores: Vec<u32> = theirs.scores.iter().map(|s| s.to_bits()).collect();
@@ -632,7 +641,7 @@ fn a_half_float_fields_vectors_are_its_fp16_ones() {
                 if f.similarity() == Similarity::Cosine {
                     knn_recall::quantizer::l2normalize(&mut normalized).unwrap();
                 }
-                for hit in f.search(q, &plan).unwrap() {
+                for hit in f.search(q, &plan, Draw::default()).unwrap() {
                     let node = usize::try_from(hit.doc).unwrap();
                     let row = &storage.halves()[node * 16..(node + 1) * 16];
                     assert_eq!(
@@ -724,7 +733,7 @@ fn a_failed_query_is_named_by_its_row() {
         rows.extend([0.25; 16]);
         let bytes: Vec<u8> = rows.iter().flat_map(|x| x.to_le_bytes()).collect();
         let queries = Queries::from_bytes(&bytes, 16).unwrap();
-        match f.search_all(&queries, &plan) {
+        match f.search_all(&queries, &plan, Draw::default()) {
             Err(Error::AtQuery { row, cause }) => {
                 assert_eq!(row, 1);
                 assert!(matches!(*cause, Error::ZeroNormQuery));
@@ -741,31 +750,89 @@ fn a_failed_query_is_named_by_its_row() {
         let bytes: Vec<u8> = rows.iter().flat_map(|x| x.to_le_bytes()).collect();
         let queries = Queries::from_bytes(&bytes, 16).unwrap();
         for _ in 0..3 {
-            match f.search_all(&queries, &plan) {
+            match f.search_all(&queries, &plan, Draw::default()) {
                 Err(Error::AtQuery { row, .. }) => assert_eq!(row, 150),
                 other => panic!("{other:?}"),
             }
         }
         // A query whose norm float32 cannot hold normalizes to zeros.
         assert!(matches!(
-            f.search(&[3e38; 16], &plan),
+            f.search(&[3e38; 16], &plan, Draw::default()),
             Err(Error::ZeroNormQuery)
         ));
     });
 }
 
 #[test]
-fn a_cagra_graph_is_refused_before_its_field_is_read() {
+fn a_cagra_graphs_field_is_searched_from_random_seeds() {
     // k-NN's remote build writes a float field's sq-multibit graph as
-    // IxMp > IHc2 > null, which k-NN searches from random entry points:
-    // the descent from the entry point below would start from -1 and find
-    // nothing, so the field is refused before any of its parts is held to
-    // the graph, whatever shape they have.
-    let files = Files::of("on-disk/l2");
-    let meta = QuantizedVectorsMeta::parse(&files.vemq).unwrap();
-    let data = DataFile::parse(&files.veq).unwrap();
-    let records = QuantizedVectors::open(&files.veq, &data, &meta.fields[0]).unwrap();
-    let flat = FlatVectorsMeta::parse(&files.vemf).unwrap();
+    // IxMp > IHc2 > null, searched from random entry points: the field's
+    // search is seeded with the draw's nodes instead of the descent, one
+    // seed gives the same lists on every run, and row `i` of a batch is
+    // seeded by `seed + i`, so its list can be reproduced alone.
+    with_field("../opensearch-3.9.0-remote/on-disk/l2", |f| {
+        let plan = f.plan(10, DEFAULT_EF_SEARCH, Rescore::Default).unwrap();
+        let qs = queries(f, 8);
+        let lists = f.search_all(&qs, &plan, Draw::default()).unwrap();
+        assert_eq!(lists.len(), 8);
+        assert!(lists.iter().all(|l| l.len() == 10));
+        assert_eq!(lists, f.search_all(&qs, &plan, Draw::default()).unwrap());
+        let (row, q) = qs.rows().enumerate().nth(3).unwrap();
+        let knn_recall::Query::Floats(q) = q else {
+            panic!("float queries");
+        };
+        let alone: Vec<i64> = f
+            .search(q, &plan, Draw::default().for_row(row))
+            .unwrap()
+            .iter()
+            .map(|h| i64::from(h.doc))
+            .collect();
+        assert_eq!(lists[3], alone);
+        // A count at the vector count seeds the search with every node,
+        // in order, making it the same whatever the seed.
+        let every = |seed| Draw {
+            seed,
+            count: Some(usize::MAX),
+        };
+        assert_eq!(
+            f.search_all(&qs, &plan, every(9)).unwrap(),
+            f.search_all(&qs, &plan, every(1)).unwrap()
+        );
+    });
+}
+
+#[test]
+fn the_seed_steers_a_cagra_fields_entry_draw() {
+    // Golden values pin the draw stream: a search that ignored the seed
+    // or the count (one seed node at a beam of 1 reaches only its own
+    // neighborhood), or a changed stream, fails here. The two seeds draw
+    // different nodes, so the docs differ.
+    with_field("../opensearch-3.9.0-remote/on-disk/l2", |f| {
+        let plan = f.plan(1, 1, Rescore::Off).unwrap();
+        let qs = queries(f, 1);
+        let knn_recall::Query::Floats(q) = qs.rows().next().unwrap() else {
+            panic!("float queries");
+        };
+        let doc_of = |seed: u64| {
+            let draw = Draw {
+                seed,
+                count: Some(1),
+            };
+            let hits = f.search(q, &plan, draw).unwrap();
+            assert_eq!(hits.len(), 1, "seed {seed}");
+            hits[0].doc
+        };
+        assert_eq!(doc_of(1), 80);
+        assert_eq!(doc_of(2), 487);
+    });
+}
+
+#[test]
+fn an_unseeded_search_of_a_cagra_graph_finds_nothing() {
+    // Without seeds, Lucene's searcher starts from the stored entry
+    // point, which a CAGRA graph leaves at -1, and finds nothing for a k
+    // below the vector count; k-NN always seeds such a graph's search,
+    // and a seed node starts it.
     let bytes = fs::read(fixtures().join("../synthetic-cagra/ip-100x64-cagra.faiss")).unwrap();
     let storage = bytes.windows(4).position(|w| w == b"IxFI").unwrap();
     let count_at = storage + 4 + 33;
@@ -779,28 +846,28 @@ fn a_cagra_graph_is_refused_before_its_field_is_read() {
     let parsed = knn_format::parse(&graph_only).unwrap();
     assert!(parsed.index.index.storage.is_none());
     assert!(parsed.index.index.random_entry_points());
-    assert!(matches!(
-        OnDiskField::new(
-            &parsed.index,
-            &meta.fields[0],
-            records,
-            &flat.fields[0],
-            &files.vec
-        ),
-        Err(Error::RandomEntryPoints)
-    ));
-    // Lucene's searcher over the same graph starts from its -1 entry point
-    // and finds nothing for a k below the vector count.
     let graph = &parsed.index.index.graph;
-    let found = lucene_search::search(
-        graph,
-        100,
-        10,
-        u64::MAX,
-        |_| Some(1.0),
-        |ord| i32::try_from(ord).unwrap(),
-    )
-    .unwrap();
+    let search = |seeds: Option<&[usize]>| {
+        lucene_search::search(
+            graph,
+            100,
+            10,
+            u64::MAX,
+            seeds,
+            |_| Some(1.0),
+            |ord| i32::try_from(ord).unwrap(),
+        )
+        .unwrap()
+    };
+    let found = search(None);
+    assert_eq!(found.hits, Vec::new());
+    assert_eq!(found.visited, 0);
+    // Seeded at one node, the search starts there; no seeds also find
+    // nothing, as k-NN's search over an entry-point count of 0 does.
+    let found = search(Some(&[5]));
+    assert!(found.hits.iter().any(|h| h.doc == 5));
+    assert!(found.visited >= 1);
+    let found = search(Some(&[]));
     assert_eq!(found.hits, Vec::new());
     assert_eq!(found.visited, 0);
 }

@@ -21,6 +21,19 @@
 //! Without rescoring, the beam is `max(k, ef_search)` and the first `k`
 //! results are kept. k-NN accepts a `k` up to [`MAX_K`].
 //!
+//! A CAGRA graph's search is seeded instead of descending from the stored
+//! entry point, which is -1: k-NN's `RandomEntryPointsKnnSearchStrategy`
+//! draws the file's count of distinct nodes at random
+//! (`RobustUniqueRandomIterator`), or hands over every node, in order,
+//! when the count reaches the vector count, and the seeds start level 0
+//! (see [`crate::lucene_search`]). The draw here comes from a [`Draw`]'s
+//! seed, where k-NN's comes from `ThreadLocalRandom`, so its lists differ
+//! run to run and this port's are reproducible; a count of 0 or less
+//! seeds nothing and finds nothing (k-NN's search finds nothing for 0
+//! and refuses a negative count outright, which only a corrupt file
+//! holds). Everything after the seeds, the
+//! rescoring included, runs as over an HNSW graph.
+//!
 //! A float32 field's exact scores are Lucene's
 //! (`VectorSimilarityFunction.compare`):
 //! `1 / (1 + d^2)` for Euclidean, the dot product scaled as
@@ -74,7 +87,7 @@ use crate::lucene_search::{self, ScoredDoc};
 use crate::quantized_scorer::QuantizedScorer;
 use crate::quantizer::{Similarity, int_f32, java_max_f32, l2normalize};
 use crate::vector_util::{bulk_sum, dot_product, faiss_sum};
-use crate::{Error, Labels, Queries, Query, Result};
+use crate::{Draw, Error, Labels, Queries, Query, Result, draw_distinct};
 
 /// k-NN's default `index.knn.algo_param.ef_search`, for indexes created by
 /// 2.12 or later that do not set it.
@@ -318,12 +331,10 @@ impl<'a> OnDiskField<'a> {
     ///
     /// # Errors
     ///
-    /// Returns an error when the graph is a CAGRA graph of its base level,
-    /// which k-NN searches from random entry points, not as below; when
-    /// the field holds no vectors or not in an encoding k-NN writes, its
-    /// similarity is not Lucene's, its labels repeat or are not doc ids,
-    /// the parts disagree on the dimension or the vector count; or as
-    /// [`field_vectors`] does.
+    /// Returns an error when the field holds no vectors or not in an
+    /// encoding k-NN writes, its similarity is not Lucene's, its labels
+    /// repeat or are not doc ids, the parts disagree on the dimension or
+    /// the vector count; or as [`field_vectors`] does.
     pub fn new(
         index: &'a IdMapIndex<'a>,
         field: &'a QuantizedField,
@@ -331,13 +342,6 @@ impl<'a> OnDiskField<'a> {
         flat: &FlatField,
         vec: &'a [u8],
     ) -> Result<Self> {
-        // k-NN searches a CAGRA graph from random entry points on its base
-        // level, whatever its base_level_only flag says, not with the
-        // descent below, which would start from its -1 entry point and
-        // find nothing.
-        if index.index.random_entry_points() {
-            return Err(Error::RandomEntryPoints);
-        }
         if index.index.storage.is_some() {
             return Err(Error::HasVectors);
         }
@@ -430,14 +434,16 @@ impl<'a> OnDiskField<'a> {
 
     /// The field's results for `query`, best first, as k-NN finds them
     /// under `plan`: doc ids, the labels of the ID map, with their scores,
-    /// exact ones when rescored.
+    /// exact ones when rescored. A CAGRA graph's search is seeded with
+    /// `draw`'s random nodes (see the module notes); an HNSW graph never
+    /// reads `draw`.
     ///
     /// # Errors
     ///
     /// Returns an error when the query has another dimension, a cosine
     /// query has a norm of 0, or the search reaches a node without a
     /// record.
-    pub fn search(&self, query: &[f32], plan: &Plan) -> Result<Vec<ScoredDoc>> {
+    pub fn search(&self, query: &[f32], plan: &Plan, draw: Draw) -> Result<Vec<ScoredDoc>> {
         let d = self.raw.header().d;
         if usize::try_from(d).ok() != Some(query.len()) {
             return Err(Error::DimensionMismatch {
@@ -468,6 +474,7 @@ impl<'a> OnDiskField<'a> {
             self.records.len(),
             plan.beam,
             u64::from(i32::MAX.unsigned_abs()),
+            self.entry_seeds(draw).as_deref(),
             |node| {
                 self.records
                     .record(node)
@@ -484,14 +491,16 @@ impl<'a> OnDiskField<'a> {
         self.rescore(kept, &q, plan.k)
     }
 
-    /// Every query's result list, as labels, best first.
+    /// Every query's result list, as labels, best first. On a CAGRA
+    /// graph, query `i`'s search is seeded by [`Draw::for_row`]`(i)`, so
+    /// [`Self::search`] with that draw reproduces its list alone.
     ///
     /// # Errors
     ///
     /// When the queries are bits, and otherwise as [`Self::search`], for
     /// the first query that failed, by its row ([`Error::AtQuery`]),
     /// however the queries ran in parallel.
-    pub fn search_all(&self, queries: &Queries, plan: &Plan) -> Result<Vec<Vec<i64>>> {
+    pub fn search_all(&self, queries: &Queries, plan: &Plan, draw: Draw) -> Result<Vec<Vec<i64>>> {
         let lists: Vec<Result<Vec<i64>>> = queries
             .rows()
             .enumerate()
@@ -499,7 +508,7 @@ impl<'a> OnDiskField<'a> {
             .into_par_iter()
             .map(|(row, q)| match q {
                 Query::Floats(q) => Ok(self
-                    .search(q, plan)
+                    .search(q, plan, draw.for_row(row))
                     .map_err(|e| Error::AtQuery {
                         row,
                         cause: Box::new(e),
@@ -515,6 +524,28 @@ impl<'a> OnDiskField<'a> {
             .collect();
         // In row order, so the error is the first row's.
         lists.into_iter().collect()
+    }
+
+    /// The level-0 seeds of a CAGRA graph's search, `None` over an HNSW
+    /// graph: `draw.count` or the file's entry-point count of distinct
+    /// nodes, drawn by `draw.seed`, or every node, in order, when the
+    /// count reaches the vector count, as k-NN's
+    /// `RandomEntryPointsKnnSearchStrategy` populates them (see the
+    /// module notes). A count of 0 or less seeds nothing (see the module
+    /// notes for the k-NN behavior each case ports or diverges from).
+    /// The draws run on the seed's entry stream, separated from the
+    /// query sampling's ([`Draw::seed`]).
+    fn entry_seeds(&self, draw: Draw) -> Option<Vec<usize>> {
+        let cagra = self.index.index.kind.cagra()?;
+        let n = self.records.len();
+        let count = draw
+            .count
+            .unwrap_or_else(|| usize::try_from(cagra.search_entry_points).unwrap_or(0));
+        Some(if count >= n {
+            (0..n).collect()
+        } else {
+            draw_distinct(n, count, draw.entry_state())
+        })
     }
 
     /// The doc id of node `ord`: its label, which [`Self::new`] checked is

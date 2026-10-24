@@ -175,38 +175,40 @@ fuzz_target!(|data: &[u8]| {
         // The search k-NN runs with Lucene's searcher, over any graph,
         // with or without its vectors: scores from the node ids, many of
         // them tied, for k below, at, and past the node count, with and
-        // without a visit limit. Over a CAGRA graph it
-        // starts from the -1 entry point and finds nothing, as documented;
-        // it must still not panic.
+        // without a visit limit, unseeded and seeded (over a CAGRA graph,
+        // unseeded, it starts from the -1 entry point and finds nothing,
+        // as documented). It must not panic over any graph.
         let n = graph.node_count();
+        let seed_nodes = [0, n / 2, n.saturating_sub(1)];
         for k in [1, 3, n, n + 2] {
             for limit in [u64::from(i32::MAX.unsigned_abs()), 4] {
-                let found = knn_recall::lucene_search::search(
-                    graph,
-                    n,
-                    k,
-                    limit,
-                    |node| Some(f32::from(u8::try_from(node % 7).unwrap_or(0))),
-                    |ord| i32::try_from(ord).unwrap_or(i32::MAX),
-                )
-                .expect("every node scores");
-                assert!(found.hits.len() <= k);
+                for seeds in [None, Some(&seed_nodes[..n.min(3)])] {
+                    let found = knn_recall::lucene_search::search(
+                        graph,
+                        n,
+                        k,
+                        limit,
+                        seeds,
+                        |node| Some(f32::from(u8::try_from(node % 7).unwrap_or(0))),
+                        |ord| i32::try_from(ord).unwrap_or(i32::MAX),
+                    )
+                    .expect("every node scores");
+                    assert!(found.hits.len() <= k);
+                }
             }
         }
         'storage: {
             let Some(storage) = &parsed.index.index.storage else {
-                // A graph without its vectors: nothing to search; a CAGRA
-                // graph is refused before that is seen.
+                // A graph without its vectors: nothing to search.
                 let mut searcher = knn_recall::Searcher::new(graph.node_count());
-                let searched = searcher.search(&parsed.index.index, &[0.0_f32][..], 3, 5);
-                if parsed.index.index.random_entry_points() {
-                    assert!(matches!(
-                        searched,
-                        Err(knn_recall::Error::RandomEntryPoints)
-                    ));
-                } else {
-                    assert!(matches!(searched, Err(knn_recall::Error::NoVectors)));
-                }
+                let searched = searcher.search(
+                    &parsed.index.index,
+                    &[0.0_f32][..],
+                    3,
+                    5,
+                    knn_recall::Draw::default(),
+                );
+                assert!(matches!(searched, Err(knn_recall::Error::NoVectors)));
                 break 'storage;
             };
             // The HNSW search over an arbitrary graph and any storage,
@@ -221,18 +223,25 @@ fuzz_target!(|data: &[u8]| {
             };
             if let Some(query) = query {
                 let mut searcher = knn_recall::Searcher::new(graph.node_count());
-                // A CAGRA graph is refused, not searched.
-                let searched = searcher.search(&parsed.index.index, query, 3, 5);
-                assert_eq!(
-                    matches!(searched, Err(knn_recall::Error::RandomEntryPoints)),
-                    parsed.index.index.random_entry_points()
-                );
-                if let Ok(hits) = searched {
-                    assert!(hits.len() <= 3);
-                    // Padded to k, or to the node count when the graph is
-                    // smaller: no list can hold more.
-                    let labels = knn_recall::result_labels(&parsed.index, &hits, 3);
-                    assert_eq!(labels.len(), 3.min(graph.node_count()));
+                // A CAGRA graph is entered at random drawn nodes, an HNSW
+                // graph at its entry point; both must take any graph.
+                // `None` reads the fuzzed file's own entry-point count,
+                // which the search caps, so a huge count stays a search.
+                for count in [None, Some(4)] {
+                    let searched = searcher.search(
+                        &parsed.index.index,
+                        query,
+                        3,
+                        5,
+                        knn_recall::Draw { seed: 7, count },
+                    );
+                    if let Ok(hits) = searched {
+                        assert!(hits.len() <= 3);
+                        // Padded to k, or to the node count when the graph
+                        // is smaller: no list can hold more.
+                        let labels = knn_recall::result_labels(&parsed.index, &hits, 3);
+                        assert_eq!(labels.len(), 3.min(graph.node_count()));
+                    }
                 }
             }
             let _ = storage.row_count();

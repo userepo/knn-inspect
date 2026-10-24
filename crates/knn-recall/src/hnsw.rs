@@ -25,6 +25,26 @@
 //! over Hamming distances, which Faiss computes as float32 and orders with
 //! the L2 max-heaps in both versions.
 //!
+//! A CAGRA graph stores no entry point, and k-NN's JNI search runs
+//! Faiss's `IndexHNSWCagra::search` (`IndexBinaryHNSWCagra::search` for a
+//! binary one) over it: the file's count of nodes drawn uniformly at
+//! random, with replacement, the nearest of them the one entry pushed
+//! into the level-0 search above, which then runs unchanged
+//! (`search_level_0` with one probe). This crate draws with its own
+//! seeded generator, from a [`Draw`], where Faiss seeds `mt19937` from
+//! `std::random_device`; the draws differ, so lists agree with a Faiss
+//! run only statistically, while two runs here with one seed agree
+//! exactly. A tie between draws keeps the first, as Faiss's strict `<`
+//! does, and a drawn node without a distance (no stored vector, or NaN)
+//! is skipped, where Faiss, which cannot lack one, would throw only if
+//! every draw failed. Two further deliberate divergences: the draws are
+//! capped at [`MAX_ENTRY_DRAWS`](crate::MAX_ENTRY_DRAWS), where Faiss
+//! loops a corrupt count to its end; and every CAGRA graph is entered
+//! this way, as the rest of this tool reads such graphs, where Faiss
+//! honors `base_level_only` and, with it off (a file no build writes,
+//! which `verify` warns on), descends from the stored entry point
+//! instead, finding nothing from the remote build's -1.
+//!
 //! Where Faiss would read out of bounds on a malformed graph (a neighbor
 //! id past the node count, a node without a stored vector), the entry is
 //! skipped. Distances are this crate's float32 sums, so a neighbor pair a
@@ -36,7 +56,7 @@ use std::collections::BinaryHeap;
 use knn_format::faiss::{HnswGraph, HnswIndex, IdMapIndex};
 use rayon::prelude::*;
 
-use crate::{Distance, Error, Queries, Query, Result, Vectors, check_query, checked_vectors};
+use crate::{Distance, Draw, Error, Queries, Query, Result, Vectors, check_query, checked_vectors};
 
 /// One result of a search.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -69,12 +89,13 @@ impl Searcher {
     /// first, fewer when the search reaches fewer. The candidate queue
     /// holds `max(ef_search, k)` entries, but the search stops by
     /// `ef_search`, so with `ef_search` below `k` it can end with fewer
-    /// than `k` results, as Faiss's does.
+    /// than `k` results, as Faiss's does. A CAGRA graph is entered at the
+    /// nearest of `draw`'s random nodes (see the module notes); an HNSW
+    /// graph never reads `draw`.
     ///
     /// # Errors
     ///
     /// Returns an error when `k` is 0, the file holds no vectors, its
-    /// graph is a CAGRA graph searched from random entry points, its
     /// dimension, code size, or metric is unusable, or `query` has another
     /// dimension or is of the other kind: float32 for binary storage, or
     /// bits for any other.
@@ -84,16 +105,12 @@ impl Searcher {
         query: impl Into<Query<'q>>,
         k: usize,
         ef_search: usize,
+        draw: Draw,
     ) -> Result<Vec<Hit>> {
         if k == 0 {
             return Err(Error::ZeroK);
         }
         let query = query.into();
-        // Said before the storage: a graph of this kind is not searched
-        // here with or without its vectors.
-        if index.random_entry_points() {
-            return Err(Error::RandomEntryPoints);
-        }
         let storage = index.storage.as_ref().ok_or(Error::NoVectors)?;
         let vectors = Vectors::of(storage)?;
         check_query(&vectors, query.kind(), query.dimension())?;
@@ -105,40 +122,73 @@ impl Searcher {
         }
         let dist_to = |node: usize| vectors.distance(distance, node, query);
 
-        // Greedy descent: on each upper level, move to the closest
-        // neighbor until none is closer.
-        let Some(mut nearest) = usize::try_from(graph.entry_point)
-            .ok()
-            .filter(|&e| e < graph.node_count())
-        else {
-            return Ok(Vec::new());
-        };
-        let Some(mut d_nearest) = dist_to(nearest) else {
-            return Ok(Vec::new());
-        };
-        // Levels come from `max_level`, capped by the levels the per-level
-        // table describes, so a corrupt `max_level` cannot make the
-        // descent spin through billions of empty levels.
-        let described = graph.cum_nneighbor_per_level.len().saturating_sub(1);
-        let top = usize::try_from(graph.max_level)
-            .unwrap_or(0)
-            .min(described.saturating_sub(1));
-        for level in (1..=top).rev() {
-            loop {
-                let prev = nearest;
-                for v in neighbor_list(graph, prev, level) {
-                    if let Some(dv) = dist_to(v)
-                        && dv < d_nearest
-                    {
-                        nearest = v;
-                        d_nearest = dv;
-                    }
-                }
-                if nearest == prev {
-                    break;
+        let (nearest, d_nearest) = if let Some(cagra) = index.kind.cagra() {
+            // `IndexHNSWCagra::search`: the nearest of the file's count of
+            // nodes drawn with replacement, the first drawn winning a tie.
+            // A count of 0 or less draws nothing and finds nothing, where
+            // k-NN's search of such a file fails.
+            let count = draw
+                .count
+                .unwrap_or_else(|| usize::try_from(cagra.search_entry_points).unwrap_or(0))
+                .min(crate::MAX_ENTRY_DRAWS);
+            let Some(nodes) = u64::try_from(graph.node_count()).ok().filter(|&n| n > 0) else {
+                return Ok(Vec::new());
+            };
+            let mut state = draw.entry_state();
+            let mut best: Option<(usize, f32)> = None;
+            for _ in 0..count {
+                let Ok(node) = usize::try_from(crate::splitmix64(&mut state) % nodes) else {
+                    continue;
+                };
+                // Faiss's strict `<` against FLT_MAX: a NaN distance
+                // never enters, and among equals the first drawn stays.
+                if let Some(d) = dist_to(node)
+                    && d < best.map_or(f32::MAX, |(_, b)| b)
+                {
+                    best = Some((node, d));
                 }
             }
-        }
+            let Some(found) = best else {
+                return Ok(Vec::new());
+            };
+            found
+        } else {
+            // Greedy descent: on each upper level, move to the closest
+            // neighbor until none is closer.
+            let Some(mut nearest) = usize::try_from(graph.entry_point)
+                .ok()
+                .filter(|&e| e < graph.node_count())
+            else {
+                return Ok(Vec::new());
+            };
+            let Some(mut d_nearest) = dist_to(nearest) else {
+                return Ok(Vec::new());
+            };
+            // Levels come from `max_level`, capped by the levels the per-level
+            // table describes, so a corrupt `max_level` cannot make the
+            // descent spin through billions of empty levels.
+            let described = graph.cum_nneighbor_per_level.len().saturating_sub(1);
+            let top = usize::try_from(graph.max_level)
+                .unwrap_or(0)
+                .min(described.saturating_sub(1));
+            for level in (1..=top).rev() {
+                loop {
+                    let prev = nearest;
+                    for v in neighbor_list(graph, prev, level) {
+                        if let Some(dv) = dist_to(v)
+                            && dv < d_nearest
+                        {
+                            nearest = v;
+                            d_nearest = dv;
+                        }
+                    }
+                    if nearest == prev {
+                        break;
+                    }
+                }
+            }
+            (nearest, d_nearest)
+        };
 
         // Faiss sizes the queue at max(efSearch, k). Each node enters it at
         // most once, so a queue with a slot per node never fills and never
@@ -254,25 +304,24 @@ pub(crate) fn neighbor_list<'g>(
 }
 
 /// Searches every query, in parallel, with one [`Searcher`] per thread.
-/// The results depend only on the inputs, whatever the thread count.
+/// The results depend only on the inputs, whatever the thread count: on a
+/// CAGRA graph, query `i` enters at [`Draw::for_row`]`(i)`'s nodes, so
+/// [`Searcher::search`] with that draw reproduces its list alone.
 ///
 /// # Errors
 ///
-/// Returns an error when `k` is 0, the file holds no vectors, its graph
-/// is a CAGRA graph searched from random entry points, its dimension,
-/// code size, or metric is unusable, or the queries' kind or dimension
-/// differs from the file's.
+/// Returns an error when `k` is 0, the file holds no vectors, its
+/// dimension, code size, or metric is unusable, or the queries' kind or
+/// dimension differs from the file's.
 pub fn search_all(
     index: &HnswIndex<'_>,
     queries: &Queries,
     k: usize,
     ef_search: usize,
+    draw: Draw,
 ) -> Result<Vec<Vec<Hit>>> {
     if k == 0 {
         return Err(Error::ZeroK);
-    }
-    if index.random_entry_points() {
-        return Err(Error::RandomEntryPoints);
     }
     let storage = index.storage.as_ref().ok_or(Error::NoVectors)?;
     checked_vectors(storage, queries)?;
@@ -280,11 +329,12 @@ pub fn search_all(
     let nodes = index.graph.node_count();
     queries
         .rows()
+        .enumerate()
         .collect::<Vec<_>>()
         .into_par_iter()
         .map_init(
             || Searcher::new(nodes),
-            |searcher, q| searcher.search(index, q, k, ef_search),
+            |searcher, (row, q)| searcher.search(index, q, k, ef_search, draw.for_row(row)),
         )
         .collect()
 }

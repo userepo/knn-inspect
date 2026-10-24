@@ -28,7 +28,7 @@ The macOS binary is not notarized; after unpacking, run
 `xattr -d com.apple.quarantine knn-inspect`. Or build from source:
 
 ```
-cargo install --git https://github.com/userepo/knn-inspect --tag v0.12.0 knn-inspect
+cargo install --git https://github.com/userepo/knn-inspect --tag v0.13.0 knn-inspect
 ```
 
 ## Usage
@@ -37,7 +37,7 @@ cargo install --git https://github.com/userepo/knn-inspect --tag v0.12.0 knn-ins
 knn-inspect info <file.faiss> [--json]
 knn-inspect verify <file.faiss> [--space l2|innerproduct|cosine|hamming] [--max-findings N] [--json]
 knn-inspect stats <file.faiss> [--json]
-knn-inspect recall <file.faiss> (--queries <q.f32|q.u8> | --sample N [--seed S]) [--k N] [--ef-search N] [--oversample F | --no-rescore] [--json]
+knn-inspect recall <file.faiss> (--queries <q.f32|q.u8> | --sample N) [--seed S] [--entry-points N] [--k N] [--ef-search N] [--oversample F | --no-rescore] [--json]
 knn-inspect recall <file.faiss> --queries <q.f32|q.u8> --results <r.jsonl> [--k N] [--ids <ids.json>] [--json]
 knn-inspect scan <dir> [--space l2|innerproduct|cosine|hamming] [--max-findings N] [--json]
 ```
@@ -110,7 +110,8 @@ so no query can ever visit an unreachable node. A CAGRA graph is
 searched on level 0 alone, from nodes drawn at random, so `stats`
 reports that level only. A node there is unreachable when no other
 node's neighbor list leads to it, and a search returns it only when it
-draws it as an entry point.
+starts there: when it draws the node as an entry point and, over the
+file's own vectors, the node is also the nearest of its draws.
 Exit code 0 when the file parsed, 1 otherwise.
 
 `recall` measures recall@k against exact brute force over the file's own
@@ -131,7 +132,22 @@ avoids them. `--queries` is the query vectors as row-major little-endian
 float32 in the file's dimension, or for a binary file packed bits, as
 k-NN receives a binary vector, a row the bytes of the file's code size
 (its dimension / 8); `--sample N` takes N of the file's own vectors
-instead, chosen by `--seed`. For fp16, bf16, or byte storage the search
+instead, chosen by `--seed`.
+
+A CAGRA graph stores no entry point, so each query's search starts
+from nodes drawn at random (since 0.13.0): the file's count of draws,
+or `--entry-points`. Over the file's own vectors the search enters at
+the nearest of them, as Faiss's does; a graph without its vectors is
+seeded with all of them, as k-NN's search of one is (see below). The
+draws come from the tool's own seeded generator (`--seed`, 1 when
+absent), so one seed gives the same lists on every run, where k-NN
+draws from `std::random_device` or `ThreadLocalRandom` and two of its
+runs can return different lists for one query. Recall on a CAGRA graph
+therefore measures the tool's search of the graph, not OpenSearch's;
+where faiss-cpu 1.15.1 can search the same file, its recall falls
+within the tool's across seeds (see the format notes).
+
+For fp16, bf16, or byte storage the search
 and the brute force both work on the codes decoded to float32, as the
 Faiss that k-NN 3.9.0 builds does (newer Faiss on CPUs with AVX512-BF16
 also rounds the query to bf16); binary storage is compared by Hamming
@@ -149,8 +165,7 @@ Labels are the file's own (Lucene doc ids in a k-NN segment) unless
 `--ids` names a JSON array with node i's id at index i, one per vector,
 for results that carry some other id, such as a stored position field
 returned by a live query. Scoring needs the brute force alone, not a
-search, so it works on a CAGRA graph too, whose own search `recall`
-does not run yet.
+search.
 
 A label matches when its vector is at least as close to the query as the
 k-th nearest, so a tie with the k-th neighbor counts; a label repeated
@@ -174,7 +189,11 @@ with a beam of that or `max(k, ef_search)`, whichever is larger, where
 `ef_search` is the index setting `index.knn.algo_param.ef_search` or a
 query's `method_parameters.ef_search` (100 unless set), not the efSearch
 the file records: `--ef-search` gives it. For its own search of such a
-file, `--k` is at most 10,000, as k-NN's query requires.
+file, `--k` is at most 10,000, as k-NN's query requires. A CAGRA graph's
+first pass starts from the drawn entry points in place of the descent,
+as k-NN seeds Lucene's searcher for one, drawn here without repeats;
+`--entry-points` at or past the vector count seeds the search with every
+node, in order, so the seed no longer matters.
 `--oversample F` rescores with an `oversample_factor` of F, from 1 to
 100, as a query that gives one does, and `--no-rescore` keeps the first
 pass's top k, as `"rescore": false` does. This is the search of a
@@ -361,13 +380,11 @@ entry points; with or
 without the Lucene footer. Every command reads all of them, except that
 `recall` on a graph without its vectors needs the segment's `.fnm` and
 the field's `.vemq`, `.veq`, `.vemf`, and `.vec` loose, not in a
-compound file, and `recall` scores lists from elsewhere on a CAGRA graph
-but does not search it: its search from random entry points comes in a
-later release. Fixtures and format notes target
+compound file. Fixtures and format notes target
 OpenSearch 3.9.0.
 
-Not yet: other scalar-quantized storage, product quantization, IVF, and
-`recall`'s own search of CAGRA graphs. Files in
+Not yet: other scalar-quantized storage, product quantization, and IVF.
+Files in
 another layout or scalar quantizer type are refused rather than misread:
 `verify` fails them, and `scan` reports those whose footer verifies as
 `unsupported`. NMSLIB and Lucene-engine fields write no `.faiss` file,

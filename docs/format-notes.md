@@ -789,7 +789,8 @@ layout's: the metric type is the ID map's, and the graph header's must
 agree. `stats` reports level 0 alone and, since a search can start
 from any node, counts a node as unreachable when no other node lists it
 (its own list leads nowhere new), such a node being returned only when
-a search draws it as an entry. `scan` reads the files as it reads the local build's
+a search starts there: when it draws the node as an entry and, over the
+file's own vectors, the node is also the nearest of its draws. `scan` reads the files as it reads the local build's
 and marks a CAGRA graph's text line `cagra` beside its layout (its JSON
 entry carries `graph`, `hnsw` or `cagra`, for every file that parses): the `.vec` and `.si`
 cross-checks run over the storage and labels as for an HNSW graph, and
@@ -801,9 +802,54 @@ records decide alone (by shape, sibling fields of the same shape at other
 bit widths are checked too, and the worst outcome reported, as for any
 graph-only file without a `.fnm`).
 `recall` scores result lists from elsewhere (`--results`) against brute
-force over the vectors, the `.vec`'s for `null`, as for any graph, but
-refuses its own search with a verdict until a later release brings the
-search from random entry points.
+force over the vectors, the `.vec`'s for `null`, as for any graph. Since
+0.13.0 its own search runs too, following each k-NN search above: over
+storage, the nearest of the drawn nodes enters `search_from_candidates`
+as Faiss's search does (drawn with replacement, the first winning a
+tie); over `null`, the drawn distinct nodes seed Lucene's level-0 search
+as `RandomEntryPointsKnnSearchStrategy` does, every node, in order, once
+the count reaches the vector count. The draws come from the tool's own
+SplitMix64, seeded by `--seed` (1 when absent; query `i` of a run draws
+with `seed + i`, on a stream separated from `--sample`'s, which takes
+the same seed: on the sampling stream itself, the first sampled query's
+first drawn entry would be its own row, and its search would start at
+the exact answer; consecutive seeds share most of their streams, shifted
+by one query, so seeds meant to differ should lie far apart), and `--entry-points` overrides the file's count, so one
+seed gives the same lists on every run and platform, where k-NN's own
+lists differ run to run: recall on a CAGRA graph measures this search of
+the graph, not OpenSearch's. The search over a file's own vectors draws
+at most 65,536 times, far past the 32 a build writes or faiss-cpu's 256,
+so a corrupt count cannot turn every query into billions of draws, where
+Faiss loops such a count to its end; and it enters every CAGRA graph
+this way, as the rest of the tool reads such graphs, where Faiss honors
+`base_level_only` and, with it off (a file no build writes, which
+`verify` warns on), descends from the `-1` entry point and finds
+nothing. A count of 0 draws nothing and finds nothing, where k-NN's
+native search fails ("Could not find a valid entrypoint") and its
+memory-optimized one, handed no seeds, starts from the `-1` entry point
+and finds nothing; a negative count, which only a corrupt file holds,
+draws nothing too, where both k-NN searches fail (the native one as
+for 0, the memory-optimized one refusing the count).
+
+The search's validation (run 2026-10-23; no bit-for-bit oracle exists,
+see above): a fixed seed returns identical reports across runs; a
+search wide enough to explore every node its entries lead to returns
+recall 1.0 on all twelve CAGRA fixtures, whose stats report no
+unreachable node (with its vectors, `--ef-search` past the vector count;
+without them, the on-disk field's beam one below it, so the seeded graph
+search runs rather than the scan of every vector a beam at the vector
+count gives, and `--oversample 30` for the rescoring); and over 100
+noisy queries per fixture, at the file's `efSearch` and entry-point
+count, faiss-cpu 1.15.1's recall@10 fell within the tool's across five
+widely spaced seeds on all nine float, fp16, and byte fixtures: 1.0 for
+both on eight, and on the 1,000-vector file faiss 0.991 against the
+tool's 0.990 to 0.993 by seed. faiss-cpu 1.15.1 seeds each query's draw
+by its row (above), so its search is one fixed draw, not a spread. Its
+binary CAGRA search is no oracle on this host: it returned entirely
+empty rows for 68 of the 100 queries on both binary fixtures, at every
+`FAISS_SIMD_LEVEL` tried (unset, `NONE`, `AVX2`), where the synthetic
+fixtures' generator met the empty rows only on the portable path (below),
+while the tool scored 1.0.
 
 ### Synthetic CAGRA fixtures
 

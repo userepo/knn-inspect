@@ -14,7 +14,11 @@
 //! caller supplies [`Labels`] built from ids of its own, such as the
 //! position field a live query returns. The tool's own result lists come
 //! from [`search_all`], an HNSW search over the file's graph that follows
-//! Faiss's; [`sample_queries`] draws queries from the file's vectors.
+//! Faiss's; a CAGRA graph, which stores no entry point, is entered at
+//! random nodes drawn by a [`Draw`]'s seed, so the lists are reproducible
+//! here, where k-NN's own are not (it draws from `std::random_device` or
+//! `ThreadLocalRandom`). [`sample_queries`] draws queries from the file's
+//! vectors.
 //! [`quantizer`] ports Lucene's `OptimizedScalarQuantizer`, which wrote
 //! the quantized vectors Lucene keeps for a graph without its own,
 //! [`quantized_scorer`] the scorer of a query against them,
@@ -122,13 +126,6 @@ pub enum Error {
     /// `k` was 0.
     #[error("k must be at least 1")]
     ZeroK,
-    /// The graph is a CAGRA graph, which k-NN's remote index build
-    /// writes and k-NN searches from random entry points on its base
-    /// level: a search this crate does not run yet.
-    #[error(
-        "the graph is a CAGRA graph (k-NN's remote index build), searched from random entry points, which this crate does not search yet"
-    )]
-    RandomEntryPoints,
     /// The file is a graph without its vectors, which k-NN keeps in
     /// Lucene's files for the field: [`on_disk::OnDiskField`] searches it
     /// over them, as k-NN does.
@@ -611,22 +608,7 @@ pub fn sample_queries(
         return Err(Error::SampleTooLarge { count, rows });
     }
     let d = vectors.d;
-    // A partial Fisher-Yates shuffle over the identity permutation, kept
-    // sparse: only positions a swap has touched are stored, so memory
-    // follows the sample size, not the file. The first `count` positions
-    // end up holding distinct rows.
-    let mut moved: HashMap<usize, usize> = HashMap::with_capacity(count.saturating_mul(2));
-    let at = |moved: &HashMap<usize, usize>, p: usize| moved.get(&p).copied().unwrap_or(p);
-    let mut state = seed;
-    for i in 0..count {
-        let remaining = u64::try_from(rows - i).unwrap_or(u64::MAX);
-        let offset = usize::try_from(splitmix64(&mut state) % remaining).unwrap_or(0);
-        let j = i.saturating_add(offset);
-        let (vi, vj) = (at(&moved, i), at(&moved, j));
-        moved.insert(i, vj);
-        moved.insert(j, vi);
-    }
-    let order: Vec<usize> = (0..count).map(|i| at(&moved, i)).collect();
+    let order = draw_distinct(rows, count, seed);
     let queries = if let Codes::Bits(codes) = vectors.codes {
         let mut data = Vec::with_capacity(count.saturating_mul(d));
         for &row in &order {
@@ -649,6 +631,109 @@ fn row_of<T>(codes: &[T], len: usize, row: usize) -> Option<&[T]> {
     let start = row.checked_mul(len)?;
     codes.get(start..start.checked_add(len)?)
 }
+
+/// `count` distinct values of `0..n`, drawn by `seed`: a partial
+/// Fisher-Yates shuffle over the identity permutation. A small `count`
+/// keeps it sparse, storing only the positions a swap has touched, so
+/// memory follows `count`, not `n`; past an eighth of `n` the map would
+/// outgrow the permutation itself, so the shuffle runs over a dense one,
+/// with the same swaps and the same values. `count` is capped at `n`,
+/// past which no more distinct values exist. The same seed gives the
+/// same values on every platform.
+pub(crate) fn draw_distinct(n: usize, count: usize, seed: u64) -> Vec<usize> {
+    let count = count.min(n);
+    if count > n / 8 {
+        let mut perm: Vec<usize> = (0..n).collect();
+        let mut state = seed;
+        for i in 0..count {
+            let remaining = u64::try_from(n - i).unwrap_or(u64::MAX);
+            let offset = usize::try_from(splitmix64(&mut state) % remaining).unwrap_or(0);
+            perm.swap(i, i.saturating_add(offset));
+        }
+        perm.truncate(count);
+        return perm;
+    }
+    let mut moved: HashMap<usize, usize> = HashMap::with_capacity(count.saturating_mul(2));
+    let at = |moved: &HashMap<usize, usize>, p: usize| moved.get(&p).copied().unwrap_or(p);
+    let mut state = seed;
+    for i in 0..count {
+        let remaining = u64::try_from(n - i).unwrap_or(u64::MAX);
+        let offset = usize::try_from(splitmix64(&mut state) % remaining).unwrap_or(0);
+        let j = i.saturating_add(offset);
+        let (vi, vj) = (at(&moved, i), at(&moved, j));
+        moved.insert(i, vj);
+        moved.insert(j, vi);
+    }
+    (0..count).map(|i| at(&moved, i)).collect()
+}
+
+/// How a search enters a CAGRA graph, which stores no entry point: each
+/// query starts from nodes drawn at random, as every k-NN search of such
+/// a graph does. The draws come from this crate's seeded generator, so
+/// one seed gives the same result lists on every run and platform, where
+/// k-NN's own draws (`std::random_device` natively, `ThreadLocalRandom`
+/// in its memory-optimized search) make its lists differ run to run. A
+/// search of an HNSW graph starts from the stored entry point and never
+/// reads this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Draw {
+    /// Seeds the draws; 1 matches the tool's default. Query `i` of a
+    /// batch draws with `seed + i` ([`Self::for_row`]), so consecutive
+    /// seeds share most of their streams, shifted by one query: seeds
+    /// meant to differ should lie far apart. The entry draws run on a
+    /// stream separated from [`sample_queries`]'s, which takes the same
+    /// seed: on the sampling stream itself, the first sampled query's
+    /// first drawn entry would be its own row, and its search would start
+    /// at the exact answer.
+    pub seed: u64,
+    /// Nodes drawn per query; the file's entry-point count when `None`.
+    /// A search over the file's own vectors draws at most
+    /// [`MAX_ENTRY_DRAWS`] times.
+    pub count: Option<usize>,
+}
+
+impl Default for Draw {
+    fn default() -> Self {
+        Self {
+            seed: 1,
+            count: None,
+        }
+    }
+}
+
+impl Draw {
+    /// The draw for query `row` of a batch: `seed + row`, so one query's
+    /// list can be reproduced on its own.
+    #[must_use]
+    pub fn for_row(self, row: usize) -> Self {
+        Self {
+            seed: self
+                .seed
+                .wrapping_add(u64::try_from(row).unwrap_or(u64::MAX)),
+            count: self.count,
+        }
+    }
+
+    /// The state the entry draws start from: the seed on its own stream
+    /// (see [`Self::seed`]).
+    pub(crate) fn entry_state(self) -> u64 {
+        self.seed ^ ENTRY_STREAM
+    }
+}
+
+/// Separates the entry draws from the query sampling, which run on one
+/// seed (see [`Draw::seed`]). An arbitrary constant; changing it changes
+/// every CAGRA search's result lists.
+const ENTRY_STREAM: u64 = 0x7FB5_D329_728E_A185;
+
+/// The most entry nodes one query's search over the file's own vectors
+/// draws: far past any count a build writes (the remote builder's
+/// default is 32, faiss-cpu 1.15.1's 256), so only a corrupt count or an
+/// override past it is cut, and a file declaring billions of draws costs
+/// each query 65,536 distances, not billions. A graph without its
+/// vectors needs no such cap: its distinct draws never exceed the vector
+/// count, and a count near it is drawn over a dense permutation.
+pub const MAX_ENTRY_DRAWS: usize = 1 << 16;
 
 /// `SplitMix64`: a small, well-distributed generator with no dependency.
 fn splitmix64(state: &mut u64) -> u64 {
@@ -1196,4 +1281,28 @@ fn ratio(numerator: usize, denominator: usize) -> f64 {
     )]
     let (n, d) = (numerator as f64, denominator as f64);
     n / d
+}
+
+#[cfg(test)]
+mod tests {
+    use super::draw_distinct;
+
+    #[test]
+    fn dense_and_sparse_draws_agree() {
+        // The dense shuffle takes over past an eighth of n; it must draw
+        // the values the sparse one would, so a count that crosses the
+        // switch changes nothing.
+        for n in [1, 7, 64, 1000] {
+            for seed in [0, 1, 99] {
+                let all = draw_distinct(n, n, seed);
+                let mut sorted = all.clone();
+                sorted.sort_unstable();
+                assert_eq!(sorted, (0..n).collect::<Vec<_>>(), "n {n}");
+                for count in 0..=n.min(200) {
+                    let drawn = draw_distinct(n, count, seed);
+                    assert_eq!(drawn, all[..count], "n {n} count {count}");
+                }
+            }
+        }
+    }
 }
