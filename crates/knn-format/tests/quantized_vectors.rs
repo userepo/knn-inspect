@@ -274,7 +274,7 @@ fn additional_corrections_are_the_quantizers_own() {
     // values, decoded. The half_float cosine field is left out: its fp16
     // values are k-NN's normalized vectors rounded, which Lucene's merge
     // normalizes again before it quantizes them, by a sum this crate does
-    // not port; knn-recall's quantizer tests recompute it bit for bit.
+    // not port; knn-recall's quantizer tests recompute it exactly.
     for case in CASES.iter().filter(|c| c.stem == STEM || c.similarity != 2) {
         let dir = fixtures().join(case.dir);
         let meta = QuantizedVectorsMeta::parse(

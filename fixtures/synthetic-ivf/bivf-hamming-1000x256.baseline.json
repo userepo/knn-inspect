@@ -1,0 +1,21 @@
+{
+  "file": "bivf-hamming-1000x256.faiss",
+  "faiss_version": "1.15.1",
+  "queries_file": "bivf-hamming-1000x256.queries.u8",
+  "queries": 100,
+  "k": 10,
+  "runs": [
+    {
+      "results_file": "bivf-hamming-1000x256.results-nprobes-1.jsonl",
+      "nprobes": 1
+    },
+    {
+      "results_file": "bivf-hamming-1000x256.results-nprobes-2.jsonl",
+      "nprobes": 2
+    },
+    {
+      "results_file": "bivf-hamming-1000x256.results-nprobes-4.jsonl",
+      "nprobes": 4
+    }
+  ]
+}

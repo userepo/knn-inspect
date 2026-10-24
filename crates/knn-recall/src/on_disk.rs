@@ -55,7 +55,7 @@
 //! can differ in a last bit, as can another host (a wider or narrower
 //! vector unit, products rounded on their own where Lucene finds fused
 //! multiply-adds slow); that matters only to a tie. Every score of every
-//! live result list the fixtures record recomputes bit for bit, and
+//! live result list the fixtures record recomputes exactly, and
 //! `tools/RescoreOracle.java` holds the sums to Lucene's, compiled, over
 //! every similarity and 29 dimensions from 1 to 384.
 //!
@@ -67,7 +67,7 @@
 //! that k-NN loads on an x86-64 CPU with AVX2,
 //! `libopensearchknn_simd_avx2`, unless the node's settings disable it; the
 //! AVX-512 and generic ones add in other orders. Every live result list the
-//! fixtures record of such a field recomputes bit for bit too, and
+//! fixtures record of such a field recomputes identically too, and
 //! `tools/Fp16RescoreOracle.java` holds the scores to k-NN's own, over
 //! every similarity and 27 dimensions from 1 to 384.
 

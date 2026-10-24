@@ -766,7 +766,7 @@ count of 0 refuses every search. Nothing reads the entry point,
 `base_level_only` says. Faiss's own search honors the flag: without it,
 `HNSW::search` starts from the entry point and returns nothing from the
 `-1` the copy leaves. Either way two runs of one query can return
-different lists, so no live result list is a bit-for-bit oracle for a
+different lists, so no live result list is an exact oracle for a
 CAGRA graph; faiss-cpu 1.15.1 seeds the draw per query
 (`SplitMix64RandomGenerator(i)`), which makes its own runs repeatable.
 
@@ -832,7 +832,7 @@ and finds nothing; a negative count, which only a corrupt file holds,
 draws nothing too, where both k-NN searches fail (the native one as
 for 0, the memory-optimized one refusing the count).
 
-The search's validation (run 2026-10-23; no bit-for-bit oracle exists,
+The search's validation (run 2026-10-23; no exact oracle exists,
 see above): a fixed seed returns identical reports across runs; a
 search wide enough to explore every node its entries lead to returns
 recall 1.0 on all twelve CAGRA fixtures, whose stats report no
@@ -1254,14 +1254,26 @@ first 8 entries of each 16, then the next 8) and then the rest in order;
 `distance_four_codes`, which the IVF-PQ scan uses four codes at a time,
 sums each code the same way.
 
-Two comparisons were made for 0.15.0 with scripts outside the
-repository (their inputs are not fixtures). Over the synthetic and live
-trained fixtures, 200 random queries each, `nprobes` from 1 to 1,000
-(`efSearch` 16 to 256 for `IHNp`), every one of the tool's result lists
-equalled faiss-cpu 1.15.1's for the same file, labels in order; that
-wheel's portable code adds in order, so the distances agreed to float32
-rounding only, and the order of the sums above rests on the disassembly
-alone: it has not been compared with a live cluster's results. Over IVF
+Every result list the live index returned for the trained fixtures
+(`opensearch-3.9.0-trained/*/*/results*.jsonl`: 100 queries each, IVF
+at `nprobes` 1, 2, and 4 and the 100 nearest at 4, `IHNp` at its
+`ef_search` and at 16 and the 100 nearest) is reproduced exactly,
+doc ids and scores, k-NN's score of the search's distance
+(`Faiss.SCORE_TRANSLATIONS`: `1 / (1 + d)` for L2 and Hamming, for inner
+product of the negated product), ranked as OpenSearch ranks hits, by
+score and then doc id; k-NN searched them with
+`libopensearchknn_faiss_avx2`, as the manifests record. The scores pin
+the sums: reordering the float32 loop's last additions, or the pairs in
+a four-entry code sum, changes some. faiss-cpu 1.15.1's lists for the synthetic
+files (`tools/ivf_baseline.py`), labels and distances, at `nprobe` 1,
+2, and `nlist` and `efSearch` 16 and 64, are reproduced too, labels in
+order; that wheel's portable code adds in order, so its distances agree
+to float32 rounding only. The live HNSW graphs over PQ codes are not
+the same graph from one extraction to the next (the build is not
+deterministic; the IVF files and every model blob are), so their
+fixtures and their live lists are of one run. Earlier, with scripts
+outside the repository, every own list equalled faiss-cpu's over 200
+random queries per fixture and `nprobes` up to 1,000; and over IVF
 indexes built with integer vectors and integer queries on lattice
 points (up to 1,257 lists), where every distance is exact and ties are
 everywhere, coarse and in the lists, the lists equalled faiss-cpu's too,
@@ -1400,7 +1412,7 @@ clean with its space, its stats match Faiss Python's (`stats.json`), and
 `scan` finds every vector its lists code in the field's `.vec`, row by
 row, through fp16 residual rounding and the byte truncation above alike.
 The HNSW graph k-NN builds over product-quantized codes for the
-inner-product field leaves 69 of its 500 nodes on level 0, and 3 on
+inner-product field leaves 66 of its 500 nodes on level 0, and 3 on
 level 1, that no neighbor list reaches, where the L2 one leaves none.
 
 ## Real files from OpenSearch 3.9.0
@@ -1606,8 +1618,8 @@ name, so its files carry that name, and its `.vemq` and `.veq` are the
 same Lucene files; its raw vectors are in k-NN's half-float flat format
 (`KNN1040HalfFloatFlatVectorsFormatMeta`), two bytes a component. The
 fixtures of one (`on-disk-half-float/`) show the records quantized from
-the fp16 values: every record's additional correction recomputes bit for
-bit from the `.vec`'s fp16 components, decoded, and for `cosinesimil`
+the fp16 values: every record's additional correction recomputes exactly
+from the `.vec`'s fp16 components, decoded, and for `cosinesimil`
 normalized, as Lucene's writer normalizes a cosine field's vectors
 before it quantizes them (`VectorUtil.l2normalize`): k-NN's normalized
 float32 vectors are within its 1e-4 of unit length and stay as they are,
@@ -1674,7 +1686,7 @@ correction is the squared norm of the vector less the centroid for
 `EUCLIDEAN` and the vector's dot product with the centroid otherwise,
 which `OptimizedScalarQuantizer` computes in float32, component by
 component; from the `.vec`'s vectors and the stored centroid it
-recomputes bit for bit for all 2,500 records of the fixtures, the cosine
+recomputes exactly for all 2,500 records of the fixtures, the cosine
 ones' too, whose `.vec` holds k-NN's normalized vectors, which Lucene's
 merge leaves as they are. A flushed segment of a cosine field divides
 each vector by its magnitude once more, which can move a last bit, and a
@@ -1706,7 +1718,7 @@ float32 where the Java computes in float, float64 where it widens (a
 product of two floats is rounded before it is widened), Java's
 `Math.round` (ties toward positive infinity), `Math.min` and `Math.max`
 (-0 below +0), and no fused multiply-add. It recomputes the codes and
-all four corrective terms of the fixtures' 2,500 records bit for bit.
+all four corrective terms of the fixtures' 2,500 records to the last bit.
 `tools/quantizer_oracle.py` runs Lucene's own quantizer, from the Lucene
 10.5.1 jar and the JDK in the OpenSearch 3.9.0 image
 (`tools/QuantizerOracle.java`), over 1,600 synthetic cases in
@@ -1741,14 +1753,14 @@ expression and transforms; the AVX2 build's compiler fuses its
 multiply-adds, as `fma(lx ly, codes . codes, fma(ax ly, sy, fma(ax ay,
 d, ay lx sx)))`, which can change the last bit, and its Euclidean clamp
 turns a NaN distance into 0. `QuantizedScorer::knn_native_kernel` scores
-that way, and the 1-bit fixtures' live first-pass scores recompute bit
-for bit with it; another build can fuse otherwise.
+that way, and the 1-bit fixtures' live first-pass scores recompute
+exactly with it; another build can fuse otherwise.
 `knn_recall::quantized_scorer` ports Lucene's scorer operation for
 operation. `tools/scorer_oracle.py` runs Lucene's own scorer
 (`tools/ScorerOracle.java`) over the five `on_disk` fixtures' vectors
 with ten queries each and over 160 synthetic sets of eight vectors and
 three queries, every similarity and scalar encoding; the port matches
-all 28,840 scores bit for bit, and scoring the fixtures' own `.veq`
+all 28,840 scores exactly, and scoring the fixtures' own `.veq`
 records gives the same.
 
 k-NN 3.9 searches these records with Lucene, not Faiss: its
@@ -1825,9 +1837,9 @@ through a fixture. `knn_recall::vector_util` follows the compiled order;
 `tools/rescore_oracle.py` runs Lucene's sums
 (`tools/RescoreOracle.java`) with the vector module, after a warm-up,
 over every similarity and 29 dimensions from 1 to 384: the port matches
-every normalized query and score bit for bit. On the float32 fixtures,
+every normalized query and score in every bit. On the float32 fixtures,
 every result list the live index returned for 100 queries in each of six
-modes is reproduced bit for bit, doc ids and scores, 3,000 lists in all:
+modes is reproduced identically, doc ids and scores, 3,000 lists in all:
 the 10 nearest with k-NN's default rescoring, without rescoring, with an
 `oversample_factor` of 30 (a first pass and beam of 300), and with an
 `ef_search` of 300 (a beam of 300, cut to the 100 best); the 150 nearest
@@ -1881,9 +1893,9 @@ float32 cosine field's to 2e-4 (`scan` warns, `recall` refuses).
 (`tools/Fp16RescoreOracle.java`: k-NN's fp16 values over a memory-mapped
 file, with the library k-NN picks, which the script refuses unless it is
 the AVX2 one) over every similarity and 27 dimensions from 1 to 384: the
-port (`knn_recall::on_disk::fp16_exact_score`) matches every score bit
-for bit. On the fixtures, every result list the live index returned for
-100 queries in each of three modes is reproduced bit for bit, doc ids
+port (`knn_recall::on_disk::fp16_exact_score`) matches every score
+exactly. On the fixtures, every result list the live index returned for
+100 queries in each of three modes is reproduced exactly, doc ids
 and scores, 900 lists in all. The AVX-512 and Arm libraries have fp16
 kernels of their own (an SPR build computes cosine's inner product in
 fp16 arithmetic), whose scores can differ.

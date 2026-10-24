@@ -134,8 +134,8 @@ fn stats_match_faiss_python() {
     // asymmetric PQ distances links to nothing; and so does k-NN's own
     // build of the live inner-product field,
     // opensearch-3.9.0-trained/hnsw-pq/innerproduct,
-    // 69 of its 500 nodes on level 0 and 3 on level 1.
-    assert_eq!(unreachable_seen, 122);
+    // 66 of its 500 nodes on level 0 and 3 on level 1.
+    assert_eq!(unreachable_seen, 119);
 }
 
 #[test]

@@ -550,7 +550,7 @@ pub fn quantizer_type_name(qtype: i32) -> Option<&'static str> {
     })
 }
 
-/// Decodes an IEEE 754 half float, bit for bit as the portable
+/// Decodes an IEEE 754 half float exactly as the portable
 /// `decode_fp16` in Faiss's `utils/fp16-inl.h` does. Every half float is
 /// exactly representable in float32, so this is exact; a NaN keeps its
 /// payload.

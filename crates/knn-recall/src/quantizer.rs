@@ -10,7 +10,7 @@
 //! +0), and no fused multiply-add but where Lucene calls one: Java does not
 //! contract `a * b + c`, and neither does Rust (see [`l2normalize`] for
 //! the one sum Lucene fuses). On every record of the fixtures, the codes and all
-//! four corrective terms recompute bit for bit from the `.vec`'s vector and
+//! four corrective terms recompute exactly from the `.vec`'s vector and
 //! the stored centroid.
 //!
 //! A vector is centered on the centroid; an interval is set from the mean

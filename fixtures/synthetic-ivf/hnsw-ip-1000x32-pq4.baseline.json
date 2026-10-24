@@ -1,0 +1,17 @@
+{
+  "file": "hnsw-ip-1000x32-pq4.faiss",
+  "faiss_version": "1.15.1",
+  "queries_file": "hnsw-ip-1000x32-pq4.queries.f32",
+  "queries": 100,
+  "k": 10,
+  "runs": [
+    {
+      "results_file": "hnsw-ip-1000x32-pq4.results-ef-search-16.jsonl",
+      "ef_search": 16
+    },
+    {
+      "results_file": "hnsw-ip-1000x32-pq4.results-ef-search-64.jsonl",
+      "ef_search": 64
+    }
+  ]
+}

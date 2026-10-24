@@ -2,7 +2,7 @@
   "opensearch_version": "3.9.0",
   "knn_plugin_version": "3.9.0.0",
   "index": "knn-l2-ivf-pq",
-  "index_uuid": "PQ0rOK_sQJWAhxpuU3ukMw",
+  "index_uuid": "TjBTHdDfTbOr0yyjoOokMw",
   "segment": "_2",
   "compound_files": false,
   "encoding": "ivf-pq",
@@ -539,83 +539,103 @@
   "files": [
     {
       "name": "_2.fdm",
-      "size": 158
+      "size": 158,
+      "sha256": "aebe66b4c9f392dd6daea130b4a2dcec5e6793236a85bf286b5e268421bfa0b1"
     },
     {
       "name": "_2.fdt",
-      "size": 4727
+      "size": 4727,
+      "sha256": "5568c77f85a279a37a23953874b07574749dd52b77c01174cde5ab943648cf45"
     },
     {
       "name": "_2.fdx",
-      "size": 64
+      "size": 64,
+      "sha256": "00eacb043ffb00de65cd90e882653100f6c87bd5c2602e10998fcf10e2b17761"
     },
     {
       "name": "_2.fnm",
-      "size": 749
+      "size": 749,
+      "sha256": "6f8d78671060e8739cf09468153f6b00530bc1c611f64a6d3d58652d702b8c2d"
     },
     {
       "name": "_2.kdd",
-      "size": 3098
+      "size": 3098,
+      "sha256": "4dad864f5b0d931ebf20b80fc8900630369d67456b5b9fa9322e486681d02dde"
     },
     {
       "name": "_2.kdi",
-      "size": 70
+      "size": 70,
+      "sha256": "5a659e7f302721848fa174b8db76916cca1a95d712731df2ba78e22faf99e1df"
     },
     {
       "name": "_2.kdm",
-      "size": 196
+      "size": 196,
+      "sha256": "6edd2f1b0fcc6db4ba0fe329d3430a3bef89d58bb1de455a1711919614b4741c"
     },
     {
       "name": "_2.si",
-      "size": 772
+      "size": 772,
+      "sha256": "d486fe78ecbb74e4f409e0312870b15899efc6cba1a25e0c04168058639ccd8b"
     },
     {
       "name": "_2_165_vec.faiss",
-      "size": 30913
+      "size": 30913,
+      "sha256": "ca1c66f9181c05116e5e46c7715c480550092963e36938f0f683340f62957c5d"
     },
     {
       "name": "_2_Lucene104_0.doc",
-      "size": 79
+      "size": 79,
+      "sha256": "6caab284334d7dabe406384c35619f4ddd8dedc398d9e5bd450603646aa6867c"
     },
     {
       "name": "_2_Lucene104_0.psm",
-      "size": 104
+      "size": 104,
+      "sha256": "dad9513a2729235c2128fb0b6ea1287296e56ae36dcba37a28f2e5df7726b0b6"
     },
     {
       "name": "_2_Lucene104_0.tim",
-      "size": 2151
+      "size": 2151,
+      "sha256": "f869490fc0ca6b08e13e9701342f490ed60e15c2e637aefbe5cf6ce6d3eeb342"
     },
     {
       "name": "_2_Lucene104_0.tip",
-      "size": 130
+      "size": 130,
+      "sha256": "7d3f59430532127f7ce3cbf55decbb566d059e521e5bc1a7c0634b501b1206ec"
     },
     {
       "name": "_2_Lucene104_0.tmd",
-      "size": 171
+      "size": 171,
+      "sha256": "51e276d69b73b31a171a6a629d4b84a7de757bd565822e552e7390ca73c44307"
     },
     {
       "name": "_2_Lucene90_0.dvd",
-      "size": 1575
+      "size": 1575,
+      "sha256": "bcedac9747433196999aeb7d6bfb7311fc1227a13c8198f08a381df0ee61d080"
     },
     {
       "name": "_2_Lucene90_0.dvm",
-      "size": 393
+      "size": 393,
+      "sha256": "92096b534e7342ccef16ef58b77b96f46694bb4020744247d8c2a2af0dfa53e8"
     },
     {
       "name": "_2_Lucene90_0.dvs",
-      "size": 78
+      "size": 78,
+      "sha256": "f8ac02350ab7dd126b1afa82552eecf5a8f421e7d5d9c1fd5af01db1d18328a3"
     },
     {
       "name": "_2_NativeEngines990KnnVectorsFormat_0.vec",
-      "size": 32144
+      "size": 32144,
+      "sha256": "3fa6fa587156e9246c56e95f8fa0ca616a6a0c4bfd97d4f1c68d326b0672bd99"
     },
     {
       "name": "_2_NativeEngines990KnnVectorsFormat_0.vemf",
-      "size": 150
+      "size": 150,
+      "sha256": "2fa04e3a0409177a8cbbf571c0962f26c49a5d457e428cd75bf7ee273f7ba366"
     },
     {
       "name": "segments_3",
-      "size": 361
+      "size": 361,
+      "sha256": "fb104f3f8aa0600cbadecf28e085e72f46a713f6b689f72e274eec4a5519621d"
     }
   ],
   "model": {
@@ -644,13 +664,13 @@
     "record": {
       "model_id": "knn-l2-ivf-pq-model",
       "state": "created",
-      "timestamp": "2026-10-24T04:12:49.193250398Z",
+      "timestamp": "2026-10-24T17:25:22.357771526Z",
       "description": "knn-inspect fixture: ivf-pq l2",
       "error": "",
       "space_type": "l2",
       "dimension": 16,
       "engine": "faiss",
-      "training_node_assignment": "IwR1IvpzRSuRxeIMSXCaTA",
+      "training_node_assignment": "77wcETFTS-GrIVCxdt7erw",
       "model_definition": {
         "name": "ivf",
         "parameters": {
@@ -670,6 +690,42 @@
       "model_version": "3.9.0"
     },
     "blob_file": "model.blob",
-    "blob_size": 16820
+    "blob_size": 16820,
+    "blob_sha256": "0ba32000f9e8ff8c1c87fa70e014c11bd1ea0881ef96fba15d35bad5dd486579"
+  },
+  "live_queries": {
+    "queries_file": "queries.f32",
+    "queries_seed": 20261020,
+    "results_files": {
+      "results.jsonl": {
+        "k": 10,
+        "query": {}
+      },
+      "results-nprobes-2.jsonl": {
+        "k": 10,
+        "query": {
+          "method_parameters": {
+            "nprobes": 2
+          }
+        }
+      },
+      "results-nprobes-4.jsonl": {
+        "k": 10,
+        "query": {
+          "method_parameters": {
+            "nprobes": 4
+          }
+        }
+      },
+      "results-k-100.jsonl": {
+        "k": 100,
+        "query": {
+          "method_parameters": {
+            "nprobes": 4
+          }
+        }
+      }
+    },
+    "faiss_library": "opensearchknn_faiss_avx2"
   }
 }

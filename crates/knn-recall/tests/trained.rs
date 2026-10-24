@@ -627,3 +627,197 @@ fn malformed_lists_and_quantizers_are_refused() {
         "{err}"
     );
 }
+
+/// One `<name>.baseline.json` of `tools/ivf_baseline.py`.
+#[derive(serde::Deserialize)]
+struct Baseline {
+    file: String,
+    queries_file: String,
+    k: usize,
+    runs: Vec<Run>,
+}
+
+#[derive(serde::Deserialize)]
+struct Run {
+    results_file: String,
+    nprobes: Option<usize>,
+    ef_search: Option<usize>,
+}
+
+#[derive(serde::Deserialize)]
+struct Line {
+    labels: Vec<i64>,
+    distances: Vec<f64>,
+}
+
+#[test]
+fn own_searches_return_faiss_lists() {
+    // Faiss Python's lists for the same files, queries, and nprobes or
+    // efSearch: the same labels in the same order; distances to float32
+    // rounding (that build adds in order, the search here as k-NN's AVX2
+    // library does).
+    let dir = fixtures().join("synthetic-ivf");
+    let mut baselines: Vec<PathBuf> = fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.to_string_lossy().ends_with(".baseline.json"))
+        .collect();
+    baselines.sort();
+    assert_eq!(baselines.len(), 14);
+    let (mut lists, mut worst) = (0, 0.0_f64);
+    for b in baselines {
+        let b: Baseline = serde_json::from_slice(&fs::read(&b).unwrap()).unwrap();
+        let bytes = fs::read(dir.join(&b.file)).unwrap();
+        let parsed = knn_format::parse(&bytes).unwrap();
+        let raw = fs::read(dir.join(&b.queries_file)).unwrap();
+        for run in &b.runs {
+            let hits = match &parsed.index.index {
+                knn_format::faiss::Inner::Ivf(ivf) => {
+                    let searcher = IvfSearcher::new(ivf).unwrap();
+                    let queries = if Path::new(&b.queries_file)
+                        .extension()
+                        .is_some_and(|e| e == "u8")
+                    {
+                        Queries::from_bits(&raw, searcher.dimension()).unwrap()
+                    } else {
+                        Queries::from_bytes(&raw, searcher.dimension()).unwrap()
+                    };
+                    searcher
+                        .search_all(&queries, b.k, run.nprobes.unwrap())
+                        .unwrap()
+                }
+                knn_format::faiss::Inner::Hnsw(hnsw) => {
+                    let d = usize::try_from(hnsw.header.d).unwrap();
+                    let queries = Queries::from_bytes(&raw, d).unwrap();
+                    search_all(hnsw, &queries, b.k, run.ef_search.unwrap(), Draw::default())
+                        .unwrap()
+                }
+            };
+            let text = fs::read_to_string(dir.join(&run.results_file)).unwrap();
+            let expected: Vec<Line> = text
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+            assert_eq!(expected.len(), hits.len(), "{}", run.results_file);
+            for (row, (h, e)) in hits.iter().zip(&expected).enumerate() {
+                let labels: Vec<i64> = result_labels(&parsed.index, h, b.k)
+                    .into_iter()
+                    .filter(|&l| l >= 0)
+                    .collect();
+                assert_eq!(labels, e.labels, "{} row {row}", run.results_file);
+                for (got, want) in h.iter().zip(&e.distances) {
+                    let diff = (f64::from(got.distance) - want).abs() / want.abs().max(1.0);
+                    worst = worst.max(diff);
+                }
+                lists += 1;
+            }
+        }
+    }
+    assert_eq!(lists, 4000);
+    assert!(worst < 2e-6, "worst relative distance difference {worst}");
+}
+
+#[derive(serde::Deserialize)]
+struct LiveLine {
+    labels: Vec<i64>,
+    scores: Vec<f32>,
+}
+
+/// k-NN's score for a Faiss distance (`Faiss.SCORE_TRANSLATIONS`,
+/// `SpaceType.scoreTranslation`), in float32: `1 / (1 + d)` for L2 and
+/// Hamming; for inner product, of the negated product, `1 / (1 - ip)`
+/// when the product is 0 or less, else `ip + 1`.
+fn knn_score(distance: f32, inner_product: bool) -> f32 {
+    if !inner_product {
+        return 1.0 / (1.0 + distance);
+    }
+    let raw = -distance;
+    if raw >= 0.0 {
+        1.0 / (1.0 + raw)
+    } else {
+        -raw + 1.0
+    }
+}
+
+#[test]
+fn own_searches_return_the_live_lists() {
+    // The live cluster's results for the segments the fixtures hold, as
+    // OpenSearch ranks them: by k-NN's score, then by doc id. The own
+    // search's lists, scored and ranked the same way, are the same doc
+    // ids with the same scores, to the bit.
+    let root = fixtures().join("opensearch-3.9.0-trained");
+    let (mut lists, mut sets) = (0, 0);
+    for set in [
+        "ivf-flat/l2",
+        "ivf-flat/innerproduct",
+        "ivf-sq-fp16/l2",
+        "ivf-pq/l2",
+        "ivf-byte/l2",
+        "ivf-binary/hamming",
+        "hnsw-pq/l2",
+        "hnsw-pq/innerproduct",
+    ] {
+        let dir = root.join(set);
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+        let live = &manifest["live_queries"];
+        assert_eq!(live["faiss_library"], "opensearchknn_faiss_avx2", "{set}");
+        let bytes = fs::read(dir.join("_2_165_vec.faiss")).unwrap();
+        let parsed = knn_format::parse(&bytes).unwrap();
+        let queries_file = live["queries_file"].as_str().unwrap();
+        let raw = fs::read(dir.join(queries_file)).unwrap();
+        let inner_product = set.ends_with("innerproduct");
+        for (name, mode) in live["results_files"].as_object().unwrap() {
+            let k = usize::try_from(mode["k"].as_u64().unwrap()).unwrap();
+            let params = &mode["query"]["method_parameters"];
+            let hits = match &parsed.index.index {
+                knn_format::faiss::Inner::Ivf(ivf) => {
+                    let searcher = IvfSearcher::new(ivf).unwrap();
+                    let queries = if Path::new(queries_file)
+                        .extension()
+                        .is_some_and(|e| e == "u8")
+                    {
+                        Queries::from_bits(&raw, searcher.dimension()).unwrap()
+                    } else {
+                        Queries::from_bytes(&raw, searcher.dimension()).unwrap()
+                    };
+                    let nprobes = params["nprobes"]
+                        .as_u64()
+                        .map(|n| usize::try_from(n).unwrap());
+                    let nprobes = searcher.nprobes(nprobes).unwrap();
+                    searcher.search_all(&queries, k, nprobes).unwrap()
+                }
+                knn_format::faiss::Inner::Hnsw(hnsw) => {
+                    let queries =
+                        Queries::from_bytes(&raw, usize::try_from(hnsw.header.d).unwrap()).unwrap();
+                    let ef = params["ef_search"].as_u64().map_or_else(
+                        || usize::try_from(hnsw.graph.ef_search).unwrap(),
+                        |e| usize::try_from(e).unwrap(),
+                    );
+                    search_all(hnsw, &queries, k, ef, Draw::default()).unwrap()
+                }
+            };
+            let text = fs::read_to_string(dir.join(name)).unwrap();
+            let expected: Vec<LiveLine> = text
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+            assert_eq!(expected.len(), hits.len(), "{set} {name}");
+            for (row, (h, e)) in hits.iter().zip(&expected).enumerate() {
+                let labels = result_labels(&parsed.index, h, k);
+                let mut ranked: Vec<(f32, i64)> = h
+                    .iter()
+                    .zip(labels)
+                    .map(|(hit, label)| (knn_score(hit.distance, inner_product), label))
+                    .collect();
+                ranked.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+                let (scores, labels): (Vec<f32>, Vec<i64>) = ranked.into_iter().unzip();
+                assert_eq!(labels, e.labels, "{set} {name} row {row}");
+                assert_eq!(scores, e.scores, "{set} {name} row {row}");
+                lists += 1;
+            }
+        }
+        sets += 1;
+    }
+    assert_eq!((sets, lists), (8, 3000));
+}

@@ -11,7 +11,12 @@ container with `docker cp`. Every document also stores its position in
 Next to the copied segment files the script writes `vectors.f32` (the
 indexed vectors as row-major little-endian float32, in doc-id order so
 row i is Faiss label i) and `manifest.json` (versions, settings, mapping,
-the file list, and `pos_of_doc`, the insertion position of each doc).
+the file list with each file's size and SHA-256, and `pos_of_doc`, the
+insertion position of each doc). When it replaces a fixture, it says
+whether the new native file, and the model's blob, are the old ones byte
+for byte, and records that in the manifest under `replaces` (`same` per
+file name): k-NN's HNSW build is not deterministic, so a rebuilt graph
+differs, and so do its statistics and live results.
 
 `--encoding` picks how the field stores its vectors: `float` (the
 default), `sq-fp16` (the `sq` encoder with `type: fp16`, `bits: 16`),
@@ -36,7 +41,7 @@ the trained index k-NN stores at `ntotal` 0, is written beside the
 segment as `model.blob` (not `.faiss`, which `scan` would read as a native
 file), and the training request and the model's record, blob left out,
 under `model.request` and `model.record` in the manifest, with
-`model.blob_file` and `model.blob_size`.
+`model.blob_file`, `model.blob_size`, and `model.blob_sha256`.
 The vectors indexed are the same for every encoding, except that `byte`
 and `ivf-byte` scale them by 32, round them, and clip them to
 [-128, 127], the only values a byte field takes, and `binary` and
@@ -49,11 +54,11 @@ only `hamming` for binary fields.
 Next to a binary field's segment, `vectors.u8` holds the packed bits in
 place of `vectors.f32`, the bytes of row i the bits of document i.
 
-With `--queries N` (the on-disk encodings only), the script also queries
-the live index, whose one segment is the one copied out, N times in each
-of the modes `QUERY_MODES` lists, or those `--modes` names, and writes
-the queries as `queries.f32` (their own seeded draw, the same for every
-space) and each mode's results as doc ids with their scores:
+With `--queries N` (the on-disk and trained encodings), the script also
+queries the live index, whose one segment is the one copied out, N times
+in each of the modes `QUERY_MODES` lists, or those `--modes` names, and
+writes the queries as `queries.f32` (their own seeded draw, the same for
+every space) and each mode's results as doc ids with their scores:
 `results.jsonl` the 10 nearest with k-NN's default rescoring,
 `results-no-rescore.jsonl` with `"rescore": false`,
 `results-oversample-30.jsonl` with an `oversample_factor` of 30 (a first
@@ -63,16 +68,29 @@ the 150 nearest (a first pass of 150, all of it kept, for 2 and 4 bits),
 and `results-no-rescore-ef-search-10.jsonl` without rescoring at an
 `ef_search` of 10 (a beam of 10). The manifest records each mode's `k`
 and query parameters. These are the baselines `knn-inspect recall` must
-match for a graph without its vectors. Before recording, it rescores
-every document a few hundred times, so that the JVM has compiled
-Lucene's vector code, which adds its SIMD lanes in another order once
-compiled, as a node that has served queries for a while runs it. For a
-`half_float` field, which k-NN rescores with its native library, the
-manifest also records the library, as the node's log names it, in
-`live_queries.simd_library` (the node's, which loads it once), and the
-script refuses any but the AVX2 one, whose sums `recall` follows, before
-it writes the queries, results, and manifest (the segment's files are
-copied by then).
+match for a graph without its vectors. A trained encoding's modes are
+`IVF_MODES` or `GRAPH_PQ_MODES` instead: for an IVF index
+`results.jsonl` the 10 nearest at the stored `nprobes`,
+`results-nprobes-2.jsonl` and `results-nprobes-4.jsonl` at those
+`nprobes`, and `results-k-100.jsonl` the 100 nearest at `nprobes` 4; for
+HNSW over product-quantized codes `results.jsonl` the 10 nearest,
+`results-ef-search-16.jsonl` at an `ef_search` of 16, and
+`results-k-100.jsonl` the 100 nearest. A byte field's queries are the
+draw scaled, rounded, and clipped as its vectors are; a binary field's,
+the signs of the draw packed as its vectors are, written as
+`queries.u8`. k-NN searches these with its native Faiss library, so no
+warm-up runs; the manifest records the library, as the node's log names
+it, in `live_queries.faiss_library`, and the script refuses any but the
+AVX2 one, whose sums `recall` follows. For the on-disk encodings, before
+recording, it rescores every document a few hundred times, so that the
+JVM has compiled Lucene's vector code, which adds its SIMD lanes in
+another order once compiled, as a node that has served queries for a
+while runs it. For a `half_float` field, which k-NN rescores with its
+native library, the manifest also records the library, as the node's log
+names it, in `live_queries.simd_library` (the node's, which loads it
+once), and the script refuses any but the AVX2 one, whose sums `recall`
+follows, before it writes the queries, results, and manifest (the
+segment's files are copied by then).
 
 With `--remote`, the segment is built by k-NN's remote index build: the
 script creates the S3 bucket in LocalStack, registers it as a repository,
@@ -109,12 +127,12 @@ Usage:
     python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-binary/on-disk-16x --encoding on-disk --compression 16x --spaces l2 --queries 100
     python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-binary/on-disk-8x --encoding on-disk --compression 8x --spaces l2 --queries 100
     python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-binary/on-disk-half-float --encoding on-disk-half-float --queries 100 --modes results.jsonl results-no-rescore.jsonl results-oversample-30.jsonl
-    python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-trained/ivf-flat --encoding ivf-flat --spaces l2 innerproduct
-    python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-trained/ivf-sq-fp16 --encoding ivf-sq-fp16 --spaces l2
-    python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-trained/ivf-pq --encoding ivf-pq --spaces l2
-    python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-trained/hnsw-pq --encoding hnsw-pq --spaces l2 innerproduct
-    python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-trained/ivf-byte --encoding ivf-byte --spaces l2
-    python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-trained/ivf-binary --encoding ivf-binary --dim 128
+    python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-trained/ivf-flat --encoding ivf-flat --spaces l2 innerproduct --queries 100
+    python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-trained/ivf-sq-fp16 --encoding ivf-sq-fp16 --spaces l2 --queries 100
+    python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-trained/ivf-pq --encoding ivf-pq --spaces l2 --queries 100
+    python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-trained/hnsw-pq --encoding hnsw-pq --spaces l2 innerproduct --queries 100
+    python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-trained/ivf-byte --encoding ivf-byte --spaces l2 --queries 100
+    python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-trained/ivf-binary --encoding ivf-binary --dim 128 --queries 100
 
     docker compose -f tools/docker-compose.remote.yml up -d
     python tools/extract_opensearch.py --remote --dim 64 --out fixtures/opensearch-3.9.0-remote/float --spaces l2
@@ -129,6 +147,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import pathlib
 import re
@@ -204,6 +223,34 @@ QUERY_MODES = {
     "results-k-150.jsonl": (150, {}),
     "results-no-rescore-ef-search-10.jsonl": (QUERY_K, {"rescore": False, "method_parameters": {"ef_search": 10}}),
 }
+# A trained encoding's live queries: an IVF index at its stored nprobes
+# and at others, a graph over product-quantized codes at its ef_search
+# and at another, each with a deeper k too.
+TRAINED_K = 100
+IVF_MODES = {
+    "results.jsonl": (QUERY_K, {}),
+    "results-nprobes-2.jsonl": (QUERY_K, {"method_parameters": {"nprobes": 2}}),
+    "results-nprobes-4.jsonl": (QUERY_K, {"method_parameters": {"nprobes": 4}}),
+    "results-k-100.jsonl": (TRAINED_K, {"method_parameters": {"nprobes": 4}}),
+}
+GRAPH_PQ_MODES = {
+    "results.jsonl": (QUERY_K, {}),
+    "results-ef-search-16.jsonl": (QUERY_K, {"method_parameters": {"ef_search": 16}}),
+    "results-k-100.jsonl": (TRAINED_K, {}),
+}
+# The native Faiss library k-NN searches a trained field with, whose sums
+# the Rust port follows: the AVX2 one, which it loads on an x86-64 CPU
+# with AVX2 and without AVX-512.
+FAISS_LIBRARY = "opensearchknn_faiss_avx2"
+
+
+def modes_of(encoding: str) -> dict:
+    """The live query modes of `encoding`."""
+    if encoding == "hnsw-pq":
+        return GRAPH_PQ_MODES
+    if encoding in TRAIN_PARAMETERS:
+        return IVF_MODES
+    return QUERY_MODES
 # The native library whose kernels k-NN rescores a half_float field with,
 # which the Rust port follows: k-NN loads the widest its CPU runs, and this
 # one on an x86-64 CPU with AVX2 but not AVX-512.
@@ -521,55 +568,79 @@ def copy_shard(container: str, uuid: str, segment: str, dest: pathlib.Path) -> l
             if not keep:
                 continue
             shutil.copy2(path, dest / path.name)
-            files.append({"name": path.name, "size": path.stat().st_size})
+            files.append({"name": path.name, "size": path.stat().st_size, "sha256": sha256_of(path)})
     return files
 
 
-def simd_library(container: str) -> str | None:
-    """The SIMD library the node's k-NN plugin loaded since the container
-    last started, as its log names it. It loads once per node, for the
-    first query that needs it, so every index of a run is rescored with
-    the one the first index's warm-up loaded."""
+def sha256_of(path: pathlib.Path) -> str:
+    """The file's SHA-256, in hex."""
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def loaded_library(container: str, prefix: str = "opensearchknn_simd") -> str | None:
+    """The library named `prefix...` the node's k-NN plugin loaded since
+    the container last started, as its log names it. Each loads once per
+    node, for the first use that needs it, so every index of a run is
+    rescored, or searched, with the one the run loaded first."""
     started = subprocess.run(
         ["docker", "inspect", "--format", "{{.State.StartedAt}}", container],
         capture_output=True, text=True, check=True,
     ).stdout.strip()
     logs = subprocess.run(["docker", "logs", "--since", started, container], capture_output=True, text=True, check=True)
-    names = re.findall(r"Loaded library: (opensearchknn_simd\w*)", logs.stdout + logs.stderr)
+    names = re.findall(rf"Loaded library: ({prefix}\w*)", logs.stdout + logs.stderr)
     return names[-1] if names else None
 
 
-def record_queries(host: str, index: str, dest: pathlib.Path, dim: int, count: int, pos_of_doc: list[int], modes: list[str], simd_container: str | None) -> dict:
+def record_queries(host: str, index: str, dest: pathlib.Path, dim: int, count: int, pos_of_doc: list[int], modes: list[str], encoding: str, container: str) -> dict:
     """Query the live index, whose one segment is the one copied out, and
-    write the queries and each rescoring's result lists as doc ids, the
-    Faiss labels, with their scores, one line per query in query order.
-    With `simd_container`, the node's container, a half_float field's
-    rescoring library is checked once the warm-up has loaded it, before
-    anything is written."""
-    warm_up = np.random.default_rng(QUERY_SEED + 1).standard_normal((WARM_UP_QUERIES, dim), dtype=np.float32)
-    for q in warm_up:
-        rescore = {"oversample_factor": WARM_UP_OVERSAMPLE}
-        body = {"size": QUERY_K, "query": {"knn": {"vec": {"vector": q.tolist(), "k": QUERY_K, "rescore": rescore}}}}
-        requests.post(f"{host}/{index}/_search", json=body, timeout=60).raise_for_status()
+    write the queries and each mode's result lists as doc ids, the Faiss
+    labels, with their scores, one line per query in query order. A
+    half_float field's rescoring library, or a trained field's Faiss
+    library, is checked in the node's log, `container`'s, once a query has
+    loaded it, before anything is written."""
+    trained = encoding in TRAIN_PARAMETERS
     library = None
-    if simd_container is not None:
+    # One draw of the dimension's components, bits for a binary field.
+    draw = np.random.default_rng(QUERY_SEED).standard_normal((count, dim), dtype=np.float32)
+    if encoding == "ivf-binary":
+        # The signs, packed as the vectors are.
+        packed = np.packbits(draw > 0, axis=1)
+        packed.tofile(dest / "queries.u8")
+        query_values = [row.view(np.int8).tolist() for row in packed]
+        queries_file = "queries.u8"
+    else:
+        queries = draw
+        if encoding == "ivf-byte":
+            queries = np.clip(np.rint(queries * 32), -128, 127).astype(np.float32)
+        queries.astype("<f4").tofile(dest / "queries.f32")
+        query_values = [q.tolist() for q in queries]
+        queries_file = "queries.f32"
+        if encoding == "ivf-byte":
+            query_values = [[int(x) for x in q] for q in query_values]
+    if not trained:
+        warm_up = np.random.default_rng(QUERY_SEED + 1).standard_normal((WARM_UP_QUERIES, dim), dtype=np.float32)
+        for q in warm_up:
+            rescore = {"oversample_factor": WARM_UP_OVERSAMPLE}
+            body = {"size": QUERY_K, "query": {"knn": {"vec": {"vector": q.tolist(), "k": QUERY_K, "rescore": rescore}}}}
+            requests.post(f"{host}/{index}/_search", json=body, timeout=60).raise_for_status()
+    if encoding == "on-disk-half-float":
         # Rescored by the native library, whose sums are the host's.
-        library = simd_library(simd_container)
+        library = loaded_library(container)
         if library is None:
             sys.exit(f"{index}: the node's log names no SIMD library k-NN loaded since the container started")
         if library != HALF_FLOAT_SIMD_LIBRARY:
             sys.exit(f"{index}: k-NN rescored with {library}, not {HALF_FLOAT_SIMD_LIBRARY}, whose sums recall follows")
-    queries = np.random.default_rng(QUERY_SEED).standard_normal((count, dim), dtype=np.float32)
-    queries.astype("<f4").tofile(dest / "queries.f32")
     doc_of_pos = {pos: doc for doc, pos in enumerate(pos_of_doc)}
-    recorded = {name: QUERY_MODES[name] for name in modes}
+    table = modes_of(encoding)
+    recorded = {name: table[name] for name in modes}
+    results: dict[str, list[str]] = {}
     for name, (k, extra) in recorded.items():
         lines = []
-        for q in queries:
+        for q in query_values:
             body = {
                 "size": k,
                 "_source": ["pos"],
-                "query": {"knn": {"vec": {"vector": q.tolist(), "k": k, **extra}}},
+                "query": {"knn": {"vec": {"vector": q, "k": k, **extra}}},
             }
             r = requests.post(f"{host}/{index}/_search", json=body, timeout=60)
             r.raise_for_status()
@@ -578,17 +649,30 @@ def record_queries(host: str, index: str, dest: pathlib.Path, dim: int, count: i
                 "labels": [doc_of_pos[h["_source"]["pos"]] for h in hits],
                 "scores": [h["_score"] for h in hits],
             }))
+        results[name] = lines
+    faiss_library = None
+    if trained:
+        # Searched by the native Faiss library, whose sums are the host's.
+        faiss_library = loaded_library(container, "opensearchknn_faiss")
+        if faiss_library is None:
+            sys.exit(f"{index}: the node's log names no Faiss library k-NN loaded since the container started")
+        if faiss_library != FAISS_LIBRARY:
+            sys.exit(f"{index}: k-NN searched with {faiss_library}, not {FAISS_LIBRARY}, whose sums recall follows")
+    for name, lines in results.items():
         with open(dest / name, "w", encoding="utf-8", newline="\n") as f:
             f.write("\n".join(lines) + "\n")
     recording = {
-        "queries_file": "queries.f32",
+        "queries_file": queries_file,
         "queries_seed": QUERY_SEED,
-        "warm_up_queries": WARM_UP_QUERIES,
-        "warm_up_oversample_factor": WARM_UP_OVERSAMPLE,
         "results_files": {name: {"k": k, "query": extra} for name, (k, extra) in recorded.items()},
     }
+    if not trained:
+        recording["warm_up_queries"] = WARM_UP_QUERIES
+        recording["warm_up_oversample_factor"] = WARM_UP_OVERSAMPLE
     if library is not None:
         recording["simd_library"] = library
+    if faiss_library is not None:
+        recording["faiss_library"] = faiss_library
     return recording
 
 
@@ -604,8 +688,8 @@ def main() -> None:
     parser.add_argument("--batches", type=int, default=2, help="bulk batches before the force merge")
     parser.add_argument("--encoding", default="float", choices=ENCODINGS, help="how the field stores its vectors")
     parser.add_argument("--compression", choices=COMPRESSIONS, help="the on-disk encodings only: the field's compression level, 32x when absent")
-    parser.add_argument("--queries", type=int, default=0, help="the on-disk encodings only: query the live index this many times and record the results")
-    parser.add_argument("--modes", nargs="+", choices=list(QUERY_MODES), help="with --queries: the modes to record, by result file; default: every mode")
+    parser.add_argument("--queries", type=int, default=0, help="the on-disk and trained encodings: query the live index this many times and record the results")
+    parser.add_argument("--modes", nargs="+", choices=sorted({*QUERY_MODES, *IVF_MODES, *GRAPH_PQ_MODES}), help="with --queries: the modes to record, by result file; default: every mode of the encoding")
     parser.add_argument("--remote", action="store_true", help="build the segment with k-NN's remote index build (tools/docker-compose.remote.yml)")
     parser.add_argument("--localstack", default="http://localhost:4566", help="with --remote: LocalStack, as this script reaches it")
     parser.add_argument("--s3-endpoint", default="http://localstack:4566", help="with --remote: LocalStack, as the node reaches it")
@@ -630,12 +714,14 @@ def main() -> None:
         parser.error(f"k-NN's Faiss engine refuses {', '.join(refused)} for {args.encoding} fields")
     if args.compression is not None and not args.encoding.startswith("on-disk"):
         parser.error("--compression applies to the on-disk encodings only")
-    if args.queries and not args.encoding.startswith("on-disk"):
-        parser.error("--queries applies to the on-disk encodings only")
+    if args.queries and not (args.encoding.startswith("on-disk") or trained):
+        parser.error("--queries applies to the on-disk and trained encodings only")
     if args.modes is not None and not args.queries:
         parser.error("--modes applies with --queries only")
     if args.modes is None:
-        args.modes = list(QUERY_MODES)
+        args.modes = list(modes_of(args.encoding))
+    if foreign := [m for m in args.modes if m not in modes_of(args.encoding)]:
+        parser.error(f"--modes: {', '.join(foreign)} is not a mode of {args.encoding}")
     if args.encoding in ("binary", "ivf-binary") and args.dim % 8:
         parser.error("--dim counts bits for binary fields, and k-NN requires a multiple of 8")
 
@@ -700,7 +786,13 @@ def main() -> None:
                 train_request, model, blob = train_model(args.host, model_id, training_index, space, args.dim, args.encoding)
                 requests.delete(f"{args.host}/{training_index}", timeout=30)
                 (dest / "model.blob").write_bytes(blob)
-                model_record = {"request": train_request, "record": model, "blob_file": "model.blob", "blob_size": len(blob)}
+                model_record = {
+                    "request": train_request,
+                    "record": model,
+                    "blob_file": "model.blob",
+                    "blob_size": len(blob),
+                    "blob_sha256": hashlib.sha256(blob).hexdigest(),
+                }
             body = create_index(args.host, index, space, args.dim, args.compound, args.encoding, compression, args.remote, model_id)
             bulk_index(args.host, index, vectors, args.batches)
             segment = force_merge(args.host, index)
@@ -776,21 +868,36 @@ def main() -> None:
             if model_record is not None:
                 manifest["model"] = model_record
             if args.queries:
-                simd_container = args.container if args.encoding == "on-disk-half-float" else None
-                manifest["live_queries"] = record_queries(args.host, index, dest, args.dim, args.queries, pos_of_doc, args.modes, simd_container)
+                manifest["live_queries"] = record_queries(args.host, index, dest, args.dim, args.queries, pos_of_doc, args.modes, args.encoding, args.container)
+            # Whether the native file and the model's blob come back the
+            # same as the fixture's this replaces: a rebuilt graph's
+            # statistics and live results change with it.
+            replaced = {}
+            compared = [f["name"] for f in files if ".faiss" in f["name"]]
+            if model_record is not None:
+                compared.append("model.blob")
+            for name in compared:
+                if (final / name).exists():
+                    replaced[name] = sha256_of(final / name) == sha256_of(dest / name)
+            if replaced:
+                manifest["replaces"] = {name: {"same": same} for name, same in replaced.items()}
             with open(dest / "manifest.json", "w", encoding="utf-8", newline="\n") as f:
                 json.dump(manifest, f, indent=2)
                 f.write("\n")
         except BaseException:
             shutil.rmtree(dest, ignore_errors=True)
             raise
+        native = [f for f in files if ".faiss" in f["name"]]
+        drift = "".join(
+            f"; {name} {'unchanged' if same else 'CHANGED from the fixture it replaces'}"
+            for name, same in replaced.items()
+        )
         if final.exists():
             shutil.rmtree(final)
         dest.rename(final)
 
-        native = [f for f in files if ".faiss" in f["name"]]
         native_desc = ", ".join(f"{f['name']} ({f['size']} B)" for f in native) or "NONE"
-        print(f"  {space:<13} segment {segment}, {len(files)} files, native: {native_desc}")
+        print(f"  {space:<13} segment {segment}, {len(files)} files, native: {native_desc}{drift}")
 
 
 if __name__ == "__main__":

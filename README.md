@@ -228,11 +228,11 @@ Faiss's does: for an L2 IVF index by residual, through the precomputed
 table k-NN installs on every such index. The sums of the IVF and PQ
 searches follow k-NN's Faiss library for AVX2, which it loads on an
 x86-64 CPU with AVX2 and without AVX-512: its kernels and, where its
-compiler chose the order, the library's disassembly. On the fixtures
-their result lists are faiss-cpu 1.15.1's, labels in order; that build
-adds in plain order, so it confirms the lists, not the last bits of the
-sums, which have not been compared with a live cluster's results, and on
-another host they can differ in a last bit (see
+compiler chose the order, the library's disassembly. On the fixtures,
+every result list the live index returned is reproduced exactly, doc
+ids and k-NN's scores, at several `nprobes`, `ef_search`, and `k`,
+and every list faiss-cpu 1.15.1 returns for the synthetic files, labels
+in order. On another host, k-NN's own sums can differ in a last bit (see
 [docs/format-notes.md](docs/format-notes.md)).
 
 With `--results`, the tool scores lists produced elsewhere (Faiss, or a
@@ -277,8 +277,8 @@ pass's top k, as `"rescore": false` does. This is the search of a
 one-segment index without a filter or deleted documents, under k-NN's
 default settings (shard-level rescoring on), with the arithmetic k-NN
 runs on an x86-64 host with AVX2: on the fixtures, every result list the
-live index returned, with and without rescoring, is reproduced bit for
-bit, doc ids and scores. A `half_float` field's fp16 vectors are
+live index returned, with and without rescoring, is reproduced exactly,
+doc ids and scores. A `half_float` field's fp16 vectors are
 rescored as k-NN's native library scores them there, with Faiss's fp16
 distance computer and k-NN's conversion to Lucene's scores. On another
 host, k-NN's own sums, Lucene's float32 ones and its library's, can
@@ -351,8 +351,8 @@ Each record's additional correction, recomputed from its vector in the
 `.vec` (normalized first for a cosine field, as Lucene's writer
 normalizes it) and the stored centroid, and the centroid's dot product,
 recomputed from its components, must agree with the stored ones within a
-small relative tolerance (on the fixtures the corrections agree bit for
-bit), or `scan` warns. Since 0.11.0 a cosine field's vectors are
+small relative tolerance (on the fixtures the corrections agree to the
+last bit), or `scan` warns. Since 0.11.0 a cosine field's vectors are
 normalized first, and `scan` also warns of one that is not of unit
 length, as k-NN keeps them (within 2e-4 of a squared norm of 1, or
 2.2e-3 for fp16), as `recall` refuses it. A sound `.vemf` in a format
@@ -539,7 +539,11 @@ whose results come from Lucene 10.5.1 itself.
   `make_direct_map`, `train`) and filled as a segment's file is: IVF
   over float32 (one with sparse list sizes, one with an `nprobe` of 2),
   fp16, bf16, byte, and product-quantized codes, HNSW over
-  product-quantized codes, and binary IVF, each with an `.expected.json`
+  product-quantized codes, and binary IVF, each with an `.expected.json`,
+  and the queries and result lists faiss-cpu 1.15.1 returns for them,
+  labels and distances, by `nprobe` or `efSearch`
+  (`<name>.baseline.json` lists the runs), which `recall`'s own search
+  must reproduce, labels in order
 - `fixtures/opensearch-3.9.0-trained/` - real segments of fields that
   name a model k-NN trained on the same vectors, 500 of 16 dimensions
   (binary: 128 bits): IVF over float32 codes for `l2` and `innerproduct`
@@ -548,7 +552,13 @@ whose results come from Lucene 10.5.1 itself.
   (`ivf-byte/l2/`), HNSW over product-quantized codes for `l2` and
   `innerproduct` (`hnsw-pq/`), and IVF over a binary field
   (`ivf-binary/hamming/`), each with the model's blob, the trained index
-  k-NN stores, as `model.blob`
+  k-NN stores, as `model.blob`, and the live index's results for 100
+  queries (`queries.f32`, or `queries.u8` for the binary field), doc ids
+  and scores, in the modes `manifest.json` records: the 10 nearest at
+  the stored `nprobes` (`results.jsonl`), at `nprobes` 2 and 4, and the
+  100 nearest at 4 (`results-k-100.jsonl`); for HNSW, the 10 nearest at
+  the stored `ef_search`, at 16, and the 100 nearest, which `recall`'s
+  own search must reproduce exactly
 - `fixtures/opensearch-3.9.0-binary/` - real segments of a binary field
   of 128 bits, the signs of the `l2` vectors (`binary/hamming/`); of a
   float field with the binary encoder, one bit per component
@@ -565,7 +575,7 @@ whose results come from Lucene 10.5.1 itself.
   (`results-ef-search-300.jsonl`); the 150 nearest
   (`results-k-150.jsonl`); and the 10 nearest without rescoring at an
   `ef_search` of 10 (`results-no-rescore-ef-search-10.jsonl`), which
-  `recall`'s search must reproduce bit for bit; and of a `half_float`
+  `recall`'s search must reproduce to the last bit; and of a `half_float`
   field in `on_disk` mode for every space, in k-NN's own quantized
   format, its `.vec` in fp16 (`on-disk-half-float/`), with graph
   statistics and the live index's results in three of those modes
@@ -600,11 +610,11 @@ whose results come from Lucene 10.5.1 itself.
   for every similarity, 1 to 8 bits, and dimensions 1 to 768
   (`quantizer.cases`), and the codes and corrective terms Lucene's own
   `OptimizedScalarQuantizer` gives them (`quantizer.expected`), which
-  the port in `knn_recall::quantizer` must match bit for bit; and the
+  the port in `knn_recall::quantizer` must match exactly; and the
   `on_disk` fixtures' vectors and 160 synthetic sets over every
   similarity and scalar encoding, with queries (`scorer.cases`), and the
   scores Lucene's own scorer gives them (`scorer.expected`), which
-  `knn_recall::quantized_scorer` must match bit for bit; and fixture
+  `knn_recall::quantized_scorer` must match in every bit; and fixture
   graphs with looked-up scores (`search.cases`), and the results k-NN's
   own `FaissMemoryOptimizedSearcher` finds over them
   (`search.expected`), which `knn_recall::lucene_search` must match
@@ -612,17 +622,19 @@ whose results come from Lucene 10.5.1 itself.
   dimensions 1 to 384 (`rescore.cases`), with each query as Lucene
   normalizes it and every score as k-NN's rescoring computes it, with
   the JDK's vector module, compiled (`rescore.expected`), which
-  `knn_recall::on_disk` must match bit for bit; and fp16 vectors and
+  `knn_recall::on_disk` must reproduce identically; and fp16 vectors and
   float32 queries over every similarity and dimensions 1 to 384
   (`fp16-rescore.cases`), with every score as k-NN's rescoring of a
   `half_float` field computes it, with its native library for AVX2
-  (`fp16-rescore.expected`), which `knn_recall::on_disk` must match bit
-  for bit
+  (`fp16-rescore.expected`), which `knn_recall::on_disk` must match
+  score for score
 
 Each real fixture directory also holds `vectors.f32`, the indexed vectors
 in doc-id order (row i is Faiss label i), or for a binary field
 `vectors.u8`, the packed bits, and `manifest.json` with the versions, the
-index request, the file list, and `pos_of_doc`.
+index request, the file list, and `pos_of_doc`; the trained fixtures'
+also record each file's SHA-256, as every fixture's will once it is
+extracted again.
 
 ### Regenerating
 
@@ -674,12 +686,12 @@ docker compose -f tools\docker-compose.yml up -d
 .venv\Scripts\python tools\extract_opensearch.py --out fixtures\opensearch-3.9.0-binary\on-disk-16x --encoding on-disk --compression 16x --spaces l2 --queries 100
 .venv\Scripts\python tools\extract_opensearch.py --out fixtures\opensearch-3.9.0-binary\on-disk-8x --encoding on-disk --compression 8x --spaces l2 --queries 100
 .venv\Scripts\python tools\extract_opensearch.py --out fixtures\opensearch-3.9.0-binary\on-disk-half-float --encoding on-disk-half-float --queries 100 --modes results.jsonl results-no-rescore.jsonl results-oversample-30.jsonl
-.venv\Scripts\python tools\extract_opensearch.py --out fixtures\opensearch-3.9.0-trained\ivf-flat --encoding ivf-flat --spaces l2 innerproduct
-.venv\Scripts\python tools\extract_opensearch.py --out fixtures\opensearch-3.9.0-trained\ivf-sq-fp16 --encoding ivf-sq-fp16 --spaces l2
-.venv\Scripts\python tools\extract_opensearch.py --out fixtures\opensearch-3.9.0-trained\ivf-pq --encoding ivf-pq --spaces l2
-.venv\Scripts\python tools\extract_opensearch.py --out fixtures\opensearch-3.9.0-trained\hnsw-pq --encoding hnsw-pq --spaces l2 innerproduct
-.venv\Scripts\python tools\extract_opensearch.py --out fixtures\opensearch-3.9.0-trained\ivf-byte --encoding ivf-byte --spaces l2
-.venv\Scripts\python tools\extract_opensearch.py --out fixtures\opensearch-3.9.0-trained\ivf-binary --encoding ivf-binary --dim 128
+.venv\Scripts\python tools\extract_opensearch.py --out fixtures\opensearch-3.9.0-trained\ivf-flat --encoding ivf-flat --spaces l2 innerproduct --queries 100
+.venv\Scripts\python tools\extract_opensearch.py --out fixtures\opensearch-3.9.0-trained\ivf-sq-fp16 --encoding ivf-sq-fp16 --spaces l2 --queries 100
+.venv\Scripts\python tools\extract_opensearch.py --out fixtures\opensearch-3.9.0-trained\ivf-pq --encoding ivf-pq --spaces l2 --queries 100
+.venv\Scripts\python tools\extract_opensearch.py --out fixtures\opensearch-3.9.0-trained\hnsw-pq --encoding hnsw-pq --spaces l2 innerproduct --queries 100
+.venv\Scripts\python tools\extract_opensearch.py --out fixtures\opensearch-3.9.0-trained\ivf-byte --encoding ivf-byte --spaces l2 --queries 100
+.venv\Scripts\python tools\extract_opensearch.py --out fixtures\opensearch-3.9.0-trained\ivf-binary --encoding ivf-binary --dim 128 --queries 100
 docker compose -f tools\docker-compose.yml down -v
 ```
 
@@ -693,6 +705,7 @@ so rewrite them after regenerating either fixture set:
 ```
 .venv\Scripts\python tools\graph_stats.py --fixtures fixtures
 .venv\Scripts\python tools\recall_baseline.py --fixtures fixtures
+.venv\Scripts\python tools\ivf_baseline.py --fixtures fixtures
 ```
 
 ### Inspecting a file without the Rust tool

@@ -2,7 +2,7 @@
   "opensearch_version": "3.9.0",
   "knn_plugin_version": "3.9.0.0",
   "index": "knn-innerproduct-hnsw-pq",
-  "index_uuid": "xQMZhUTDTtqjqixeegfy7A",
+  "index_uuid": "8AdP1jmjSdKCAH8xPiMppA",
   "segment": "_2",
   "compound_files": false,
   "encoding": "hnsw-pq",
@@ -539,83 +539,103 @@
   "files": [
     {
       "name": "_2.fdm",
-      "size": 158
+      "size": 158,
+      "sha256": "d4566264a69d18e2d2f2ecff9e3cb334f102eaab744b756876ba38150f672cfb"
     },
     {
       "name": "_2.fdt",
-      "size": 4727
+      "size": 4727,
+      "sha256": "521dd7dadbc3139ec49ea069fe153fc1317e0bec5f5bcec18d628618d998e573"
     },
     {
       "name": "_2.fdx",
-      "size": 64
+      "size": 64,
+      "sha256": "221e55860d259a8bf90e0d6a4c9ab6035b16837535b48730e1431198fa8d79f4"
     },
     {
       "name": "_2.fnm",
-      "size": 760
+      "size": 760,
+      "sha256": "76b6b61efcb32d470d44899bdd588f217c6907744a37c9c8081d57a841481e5e"
     },
     {
       "name": "_2.kdd",
-      "size": 3098
+      "size": 3098,
+      "sha256": "f650d3764e850c242ad31fc5c6c3ad6303d4099145491fb97a1311a0fdac3211"
     },
     {
       "name": "_2.kdi",
-      "size": 70
+      "size": 70,
+      "sha256": "fd78fd15e77019c26726a5e47e34da04494d02afa94168d465f7f78b54a989ad"
     },
     {
       "name": "_2.kdm",
-      "size": 196
+      "size": 196,
+      "sha256": "94dfc0c7688dafd0eff1e445a823dfe9c2cbff1061876de22d3ee7a6d961ab93"
     },
     {
       "name": "_2.si",
-      "size": 772
+      "size": 772,
+      "sha256": "9aa8d342b9440863221443874ccf48a18ee0738a773504541da06b1f4d26c1b7"
     },
     {
       "name": "_2_165_vec.faiss",
-      "size": 94336
+      "size": 94336,
+      "sha256": "fbe99148826dad96beb731d203d649317ddcfe233169b981b4d9e4c074b18562"
     },
     {
       "name": "_2_Lucene104_0.doc",
-      "size": 79
+      "size": 79,
+      "sha256": "8d77e697913f7e9a33606b43a596480ef0d424ddb189485b9fb743bc181e7ace"
     },
     {
       "name": "_2_Lucene104_0.psm",
-      "size": 104
+      "size": 104,
+      "sha256": "12ea078ecbe71197c75faae53caf36d0663fa85d9ddf0e79de3fb64659d0c8b1"
     },
     {
       "name": "_2_Lucene104_0.tim",
-      "size": 2151
+      "size": 2151,
+      "sha256": "33aa19b843fc55cf02386ee97eb052da104a0ac64d0e155c8b476605f9645d77"
     },
     {
       "name": "_2_Lucene104_0.tip",
-      "size": 130
+      "size": 130,
+      "sha256": "570e9f4c65156313f2d14075fd61209fdac273e318d7b510558177c28eb3983b"
     },
     {
       "name": "_2_Lucene104_0.tmd",
-      "size": 171
+      "size": 171,
+      "sha256": "f20dbc780fdbc867ec957eb7e651c9a459a575cdd795cf42ccf5c0c0453e29c3"
     },
     {
       "name": "_2_Lucene90_0.dvd",
-      "size": 1575
+      "size": 1575,
+      "sha256": "9efda2f5175ba6774e841d0985fb4457c57649cd55431610979fa7abad35568a"
     },
     {
       "name": "_2_Lucene90_0.dvm",
-      "size": 393
+      "size": 393,
+      "sha256": "0a1268cbf0d6b61d1eb1fb343b62471c0452107b5114a7ade79616c9a60c9cbf"
     },
     {
       "name": "_2_Lucene90_0.dvs",
-      "size": 78
+      "size": 78,
+      "sha256": "00f97140acc79e43e5176a9e84c9a85886ef1046331090618b56f3e23ef50ad3"
     },
     {
       "name": "_2_NativeEngines990KnnVectorsFormat_0.vec",
-      "size": 32144
+      "size": 32144,
+      "sha256": "d615dbe3cb696e918cc6dda8dbde928769d640b8bfd0310a441dee0e19096a9e"
     },
     {
       "name": "_2_NativeEngines990KnnVectorsFormat_0.vemf",
-      "size": 150
+      "size": 150,
+      "sha256": "210565479863451c4171415886b48d8958b226dda8781f227b096c4516e71498"
     },
     {
       "name": "segments_3",
-      "size": 361
+      "size": 361,
+      "sha256": "4f5b1de2a8ffe5170b31ec1452708cd2ce70db788fef4f476aeafc64e69db8c2"
     }
   ],
   "model": {
@@ -644,13 +664,13 @@
     "record": {
       "model_id": "knn-innerproduct-hnsw-pq-model",
       "state": "created",
-      "timestamp": "2026-10-24T04:13:20.198884216Z",
+      "timestamp": "2026-10-24T17:25:39.549888057Z",
       "description": "knn-inspect fixture: hnsw-pq innerproduct",
       "error": "",
       "space_type": "innerproduct",
       "dimension": 16,
       "engine": "faiss",
-      "training_node_assignment": "IwR1IvpzRSuRxeIMSXCaTA",
+      "training_node_assignment": "77wcETFTS-GrIVCxdt7erw",
       "model_definition": {
         "name": "hnsw",
         "parameters": {
@@ -671,6 +691,30 @@
       "model_version": "3.9.0"
     },
     "blob_file": "model.blob",
-    "blob_size": 16675
+    "blob_size": 16675,
+    "blob_sha256": "ebf181d399faccc86df2fa915fa420527d3d00a9a44d9ed21c3c0922d94f61b0"
+  },
+  "live_queries": {
+    "queries_file": "queries.f32",
+    "queries_seed": 20261020,
+    "results_files": {
+      "results.jsonl": {
+        "k": 10,
+        "query": {}
+      },
+      "results-ef-search-16.jsonl": {
+        "k": 10,
+        "query": {
+          "method_parameters": {
+            "ef_search": 16
+          }
+        }
+      },
+      "results-k-100.jsonl": {
+        "k": 100,
+        "query": {}
+      }
+    },
+    "faiss_library": "opensearchknn_faiss_avx2"
   }
 }

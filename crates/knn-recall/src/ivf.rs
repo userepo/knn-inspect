@@ -23,8 +23,9 @@
 //!
 //! The sums follow k-NN's AVX2 Faiss library, as its sources and, where
 //! its compiler chose the order, its disassembly give them (see
-//! [`crate::pq`] and the float32 loops in `vector_util`); they have not
-//! been compared with a live cluster's distances. A result
+//! [`crate::pq`] and the float32 loops in `vector_util`): every live
+//! result list the fixtures record is reproduced exactly, doc ids and
+//! k-NN's scores. A result
 //! heap keeps the first of results tied at its worst, and orders ties
 //! within by id, so the order lists are scanned in, and the codes in a
 //! list, decide a tie as they do in Faiss.

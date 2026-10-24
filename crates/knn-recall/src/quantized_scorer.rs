@@ -25,7 +25,7 @@
 //! each sum of the estimate is fused into the product after it, which can
 //! change its last bit, and the Euclidean clamp turns a NaN distance into
 //! 0, where Lucene's keeps it. Every first-pass score of every live result
-//! list the 1-bit fixtures record recomputes bit for bit that way. Other
+//! list the 1-bit fixtures record recomputes to the last bit that way. Other
 //! native builds (AVX-512, Arm) can fuse otherwise.
 
 use knn_format::quantized_vectors::{Record, ScalarEncoding};
