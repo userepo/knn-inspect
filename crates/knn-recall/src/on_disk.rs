@@ -133,10 +133,15 @@ fn field_shape(index: &IdMapIndex<'_>) -> Result<(i32, usize)> {
         Inner::Hnsw(hnsw) if matches!(hnsw.storage, None | Some(Storage::Pq(_))) => {
             Ok((hnsw.header.d, hnsw.graph.node_count()))
         }
-        Inner::Ivf(ivf) if matches!(ivf.encoding, IvfEncoding::Pq { .. }) => Ok((
-            ivf.header.d,
-            usize::try_from(ivf.lists.total).unwrap_or(usize::MAX),
-        )),
+        Inner::Ivf(ivf) if matches!(ivf.encoding, IvfEncoding::Pq { .. }) => {
+            // Row i stands for id i only when the lists hold each id from
+            // 0 to their count less 1 once.
+            crate::ivf::check_list_ids(ivf)?;
+            Ok((
+                ivf.header.d,
+                usize::try_from(ivf.lists.total).unwrap_or(usize::MAX),
+            ))
+        }
         Inner::Hnsw(_) | Inner::Ivf(_) => Err(Error::HasVectors),
     }
 }
@@ -153,9 +158,11 @@ fn field_shape(index: &IdMapIndex<'_>) -> Result<(i32, usize)> {
 ///
 /// # Errors
 ///
-/// Returns an error when the file holds its own exact vectors, its metric is
-/// neither L2 nor inner product, its ID map holds another number of
-/// labels than the graph has nodes or a label that is not a doc id, the
+/// Returns an error when the file holds its own exact vectors, an IVF
+/// index's lists do not hold one code for each id from 0 to their count
+/// less 1, its metric is neither L2 nor inner product, its ID map holds
+/// another number of labels than the graph has nodes or a label that is
+/// not a doc id, the
 /// `.vemf` records no float32 or fp16 vectors, they disagree with the
 /// graph on the dimension or the vector count, the `.vemf` records them
 /// another length than they take, which Lucene's reader refuses, or places

@@ -1221,7 +1221,8 @@ code whose residual left the byte range differs wholly (the scan
 section above). Product-quantized codes hold none: their ground truth
 is the field's vectors in the segment's `.vec`, the field found through
 the `.fnm` (in `NativeEngines990KnnVectorsFormat`, or its half-float
-variant, whose `.vec` holds fp16), row `i` id or node `i`'s. The tie is
+variant, whose `.vec` holds fp16), row `i` id or node `i`'s, an IVF
+index's lists again required to hold each id once. The tie is
 by the native file's name alone: a field built through a model records
 no space type, and Lucene's default similarity, Euclidean, whatever the
 model's metric, so the `.fnm` cannot confirm the file's metric, and a
@@ -1255,8 +1256,8 @@ first 8 entries of each 16, then the next 8) and then the rest in order;
 sums each code the same way.
 
 Every result list the live index returned for the trained fixtures
-(`opensearch-3.9.0-trained/*/*/results*.jsonl`: 100 queries each, IVF
-at `nprobes` 1, 2, and 4 and the 100 nearest at 4, `IHNp` at its
+(`opensearch-3.9.0-trained/*/*/results*.jsonl`: IVF at
+`nprobes` 1, 2, and 4 and the 100 nearest at 4, `IHNp` at its
 `ef_search` and at 16 and the 100 nearest) is reproduced exactly,
 doc ids and scores, k-NN's score of the search's distance
 (`Faiss.SCORE_TRANSLATIONS`: `1 / (1 + d)` for L2 and Hamming, for inner
@@ -1272,11 +1273,11 @@ to float32 rounding only. The live HNSW graphs over PQ codes are not
 the same graph from one extraction to the next (the build is not
 deterministic; the IVF files and every model blob are), so their
 fixtures and their live lists are of one run. Earlier, with scripts
-outside the repository, every own list equalled faiss-cpu's over 200
+outside the repository, every own list equaled faiss-cpu's over 200
 random queries per fixture and `nprobes` up to 1,000; and over IVF
 indexes built with integer vectors and integer queries on lattice
 points (up to 1,257 lists), where every distance is exact and ties are
-everywhere, coarse and in the lists, the lists equalled faiss-cpu's too,
+everywhere, coarse and in the lists, the lists equaled faiss-cpu's too,
 with `nprobes` from 1 to `nlist`, through the reservoir past 100, so the
 tie rules are Faiss's. A heap in place of the reservoir gave the same
 lists there. Where a malformed index
@@ -1412,8 +1413,9 @@ clean with its space, its stats match Faiss Python's (`stats.json`), and
 `scan` finds every vector its lists code in the field's `.vec`, row by
 row, through fp16 residual rounding and the byte truncation above alike.
 The HNSW graph k-NN builds over product-quantized codes for the
-inner-product field leaves 66 of its 500 nodes on level 0, and 3 on
-level 1, that no neighbor list reaches, where the L2 one leaves none.
+inner-product field leaves some nodes, on level 0 and on level 1, that
+no neighbor list reaches, where the L2 one leaves none; how many changes
+with each build, and `stats.json` records it.
 
 ## Real files from OpenSearch 3.9.0
 

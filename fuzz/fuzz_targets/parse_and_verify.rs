@@ -198,6 +198,7 @@ fuzz_target!(|data: &[u8]| {
             // lists hold, with any nprobes.
             if let Ok(searcher) = knn_recall::IvfSearcher::new(ivf) {
                 let _ = searcher.nprobes(None);
+                let _ = searcher.nprobes(Some(3));
                 let floats: Vec<f32> = match &ivf.quantizer {
                     knn_format::faiss::CoarseQuantizer::Flat(q) => q
                         .vector(0)
@@ -221,6 +222,18 @@ fuzz_target!(|data: &[u8]| {
                             assert!(labels.len() <= 3);
                         }
                     }
+                    // As recall searches its queries: all at once.
+                    let queries = match query {
+                        knn_recall::Query::Floats(f) => {
+                            knn_recall::Queries::from_rows(f.len(), f.to_vec())
+                        }
+                        knn_recall::Query::Bits(b) => {
+                            knn_recall::Queries::from_bits(b, searcher.dimension())
+                        }
+                    };
+                    if let Ok(hits) = queries.and_then(|q| searcher.search_all(&q, 3, 2)) {
+                        assert_eq!(hits.len(), 1);
+                    }
                 }
             }
             // The vectors the lists hold, by id, as ground truth takes
@@ -228,6 +241,33 @@ fuzz_target!(|data: &[u8]| {
             if let Ok(vectors) = knn_recall::IvfVectors::of(ivf) {
                 let total = usize::try_from(ivf.lists.total).unwrap_or(usize::MAX);
                 assert_eq!(vectors.storage().row_count(), total);
+            }
+        }
+        // The field's vectors that stand in for a file of product-quantized
+        // codes or a graph without its vectors: here the file's own bytes
+        // as the .vec, as far as they reach.
+        {
+            use knn_format::flat_vectors::{FlatField, VectorEncoding};
+            let dimension = u32::try_from(parsed.index.header.d).unwrap_or(0);
+            let count = u32::try_from(parsed.index.id_map.len()).unwrap_or(u32::MAX);
+            let field = FlatField {
+                field_number: 0,
+                encoding: VectorEncoding::Float32,
+                similarity: None,
+                data_offset: 0,
+                data_length: u64::from(dimension) * u64::from(count) * 4,
+                dimension,
+                count,
+                component_bytes: 4,
+                sparse: false,
+            };
+            if let Ok(storage) = knn_recall::on_disk::field_vectors(
+                &parsed.index,
+                knn_recall::quantizer::Similarity::Euclidean,
+                &field,
+                data,
+            ) {
+                assert_eq!(storage.row_count(), parsed.index.id_map.len());
             }
         }
         if let Some(footer) = parsed.envelope.footer {

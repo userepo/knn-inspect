@@ -165,7 +165,10 @@ pub(crate) fn faiss_sum(
 /// four, and those as `(s1 + s3) + (s0 + s2)`. Where four components or
 /// more remain, they are fused into the four, one multiply-add each, and
 /// the four added the same way; the last few are fused into the sum one by
-/// one, in order. A vector under 8 components starts from four zeros, so
+/// one, in order. The loop is unrolled 8 groups at a time, and where the
+/// whole groups are 7 more than a multiple of 8 its entry takes the first
+/// group's products as the lanes, with no zero added, so a product of -0
+/// stays -0 there. A vector under 8 components starts from four zeros, so
 /// one of 4 to 7 sums its first four by the same rule.
 pub(crate) fn fvec_sum(n: usize, term: impl Fn(usize) -> (f32, f32)) -> f32 {
     let four = |[s0, s1, s2, s3]: [f32; 4]| (s1 + s3) + (s0 + s2);
@@ -173,11 +176,16 @@ pub(crate) fn fvec_sum(n: usize, term: impl Fn(usize) -> (f32, f32)) -> f32 {
     let mut quad = [0.0_f32; 4];
     let mut total = 0.0_f32;
     if whole > 0 {
+        let bare = (whole / LANES) % 8 == 7;
         let mut lanes = [0.0_f32; LANES];
         for i in 0..whole {
             let (a, b) = term(i);
             if let Some(lane) = lanes.get_mut(i % LANES) {
-                *lane += a * b;
+                *lane = if bare && i < LANES {
+                    a * b
+                } else {
+                    *lane + a * b
+                };
             }
         }
         let [l0, l1, l2, l3, l4, l5, l6, l7] = lanes;
@@ -364,6 +372,17 @@ mod tests {
             fvec_sum(8, lanes([4.0, 1e8, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0])),
             1e8 + 8.0
         );
+    }
+
+    #[test]
+    fn fvec_zeros_keep_the_sign_the_loop_entry_gives() {
+        // Products of -0 only: 0 + -0 is +0, so a sum that starts from
+        // zeros is +0, and one that starts from the first group's products
+        // stays -0, as for 7 groups (56 components) and 15.
+        let negative = |_: usize| (-0.0_f32, 1.0);
+        for (n, sign) in [(8, 0), (48, 0), (56, 1), (64, 0), (120, 1), (60, 1)] {
+            assert_eq!(fvec_sum(n, negative).to_bits() >> 31, sign, "{n}");
+        }
     }
 
     #[test]

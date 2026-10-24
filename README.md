@@ -29,7 +29,7 @@ The macOS binary is not notarized; after unpacking, run
 `xattr -d com.apple.quarantine knn-inspect`. Or build from source:
 
 ```
-cargo install --git https://github.com/userepo/knn-inspect --tag v0.14.0 knn-inspect
+cargo install --git https://github.com/userepo/knn-inspect --tag v0.15.0 knn-inspect
 ```
 
 ## Usage
@@ -552,7 +552,7 @@ whose results come from Lucene 10.5.1 itself.
   (`ivf-byte/l2/`), HNSW over product-quantized codes for `l2` and
   `innerproduct` (`hnsw-pq/`), and IVF over a binary field
   (`ivf-binary/hamming/`), each with the model's blob, the trained index
-  k-NN stores, as `model.blob`, and the live index's results for 100
+  k-NN stores, as `model.blob`, and the live index's results for its
   queries (`queries.f32`, or `queries.u8` for the binary field), doc ids
   and scores, in the modes `manifest.json` records: the 10 nearest at
   the stored `nprobes` (`results.jsonl`), at `nprobes` 2 and 4, and the

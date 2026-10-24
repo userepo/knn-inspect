@@ -718,5 +718,13 @@
       }
     },
     "faiss_library": "opensearchknn_faiss_avx2"
+  },
+  "replaces": {
+    "_2_165_vec.faiss": {
+      "same": true
+    },
+    "model.blob": {
+      "same": true
+    }
   }
 }

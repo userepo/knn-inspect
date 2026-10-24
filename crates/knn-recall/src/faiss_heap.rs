@@ -45,7 +45,8 @@ impl Order {
         }
     }
 
-    /// `C::neutral()`: the worst value, which every finite one beats.
+    /// `C::neutral()`: the worst finite value; a distance is kept only
+    /// when it beats it.
     fn neutral(self) -> f32 {
         match self {
             Self::Max => f32::MAX,
@@ -237,7 +238,8 @@ impl Heap {
 /// first of equals, as a heap of 1 does), in a heap below 100
 /// (`distance_compute_min_k_reservoir`), and above that in a reservoir
 /// that a fuzzy partition shrinks, which settles a tie at the `n`-th
-/// place otherwise. Best first; fewer when fewer are finite.
+/// place otherwise. Best first; fewer when fewer beat the heap's neutral
+/// value (`f32::MAX` for L2, `f32::MIN` for inner product), as in Faiss.
 pub(crate) fn select(dis: &[f32], n: usize, order: Order) -> Vec<(f32, i64)> {
     let id = |j: usize| i64::try_from(j).unwrap_or(i64::MAX);
     if n < 100 {

@@ -15,8 +15,9 @@ the file list with each file's size and SHA-256, and `pos_of_doc`, the
 insertion position of each doc). When it replaces a fixture, it says
 whether the new native file, and the model's blob, are the old ones byte
 for byte, and records that in the manifest under `replaces` (`same` per
-file name): k-NN's HNSW build is not deterministic, so a rebuilt graph
-differs, and so do its statistics and live results.
+file name, and `was` for a native file the old fixture named otherwise):
+k-NN's HNSW build is not deterministic, so a rebuilt graph differs, and
+so do its statistics and live results.
 
 `--encoding` picks how the field stores its vectors: `float` (the
 default), `sq-fp16` (the `sq` encoder with `type: fp16`, `bits: 16`),
@@ -588,7 +589,7 @@ def loaded_library(container: str, prefix: str = "opensearchknn_simd") -> str | 
     ).stdout.strip()
     logs = subprocess.run(["docker", "logs", "--since", started, container], capture_output=True, text=True, check=True)
     names = re.findall(rf"Loaded library: ({prefix}\w*)", logs.stdout + logs.stderr)
-    return names[-1] if names else None
+    return names[0] if names else None
 
 
 def record_queries(host: str, index: str, dest: pathlib.Path, dim: int, count: int, pos_of_doc: list[int], modes: list[str], encoding: str, container: str) -> dict:
@@ -605,14 +606,14 @@ def record_queries(host: str, index: str, dest: pathlib.Path, dim: int, count: i
     if encoding == "ivf-binary":
         # The signs, packed as the vectors are.
         packed = np.packbits(draw > 0, axis=1)
-        packed.tofile(dest / "queries.u8")
+        query_array = packed
         query_values = [row.view(np.int8).tolist() for row in packed]
         queries_file = "queries.u8"
     else:
         queries = draw
         if encoding == "ivf-byte":
             queries = np.clip(np.rint(queries * 32), -128, 127).astype(np.float32)
-        queries.astype("<f4").tofile(dest / "queries.f32")
+        query_array = queries.astype("<f4")
         query_values = [q.tolist() for q in queries]
         queries_file = "queries.f32"
         if encoding == "ivf-byte":
@@ -658,6 +659,7 @@ def record_queries(host: str, index: str, dest: pathlib.Path, dim: int, count: i
             sys.exit(f"{index}: the node's log names no Faiss library k-NN loaded since the container started")
         if faiss_library != FAISS_LIBRARY:
             sys.exit(f"{index}: k-NN searched with {faiss_library}, not {FAISS_LIBRARY}, whose sums recall follows")
+    query_array.tofile(dest / queries_file)
     for name, lines in results.items():
         with open(dest / name, "w", encoding="utf-8", newline="\n") as f:
             f.write("\n".join(lines) + "\n")
@@ -871,16 +873,26 @@ def main() -> None:
                 manifest["live_queries"] = record_queries(args.host, index, dest, args.dim, args.queries, pos_of_doc, args.modes, args.encoding, args.container)
             # Whether the native file and the model's blob come back the
             # same as the fixture's this replaces: a rebuilt graph's
-            # statistics and live results change with it.
+            # statistics and live results change with it. Native files are
+            # paired in order, not by name: a rebuilt segment's may carry
+            # another segment or field number.
             replaced = {}
-            compared = [f["name"] for f in files if ".faiss" in f["name"]]
-            if model_record is not None:
-                compared.append("model.blob")
-            for name in compared:
-                if (final / name).exists():
-                    replaced[name] = sha256_of(final / name) == sha256_of(dest / name)
+            if final.exists():
+                old_native = sorted(p for p in final.iterdir() if ".faiss" in p.name)
+                new_native = sorted(f["name"] for f in files if ".faiss" in f["name"])
+                if len(old_native) == len(new_native):
+                    pairs = list(zip(old_native, new_native))
+                else:
+                    pairs = [(None, name) for name in new_native]
+                if model_record is not None and (final / "model.blob").exists():
+                    pairs.append((final / "model.blob", "model.blob"))
+                for old, name in pairs:
+                    record = {"same": old is not None and sha256_of(old) == sha256_of(dest / name)}
+                    if old is not None and old.name != name:
+                        record["was"] = old.name
+                    replaced[name] = record
             if replaced:
-                manifest["replaces"] = {name: {"same": same} for name, same in replaced.items()}
+                manifest["replaces"] = replaced
             with open(dest / "manifest.json", "w", encoding="utf-8", newline="\n") as f:
                 json.dump(manifest, f, indent=2)
                 f.write("\n")
@@ -889,8 +901,8 @@ def main() -> None:
             raise
         native = [f for f in files if ".faiss" in f["name"]]
         drift = "".join(
-            f"; {name} {'unchanged' if same else 'CHANGED from the fixture it replaces'}"
-            for name, same in replaced.items()
+            f"; {name} {'unchanged' if record['same'] else 'CHANGED from the fixture it replaces'}"
+            for name, record in replaced.items()
         )
         if final.exists():
             shutil.rmtree(final)

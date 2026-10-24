@@ -82,10 +82,23 @@ pub struct RecallArgs {
     pub no_rescore: bool,
     /// A JSON array naming node i as `ids[i]`, when --results use ids other
     /// than the file's labels (a stored position field, say).
-    // The conflicts back up `requires`: see the note on --seed. Without
-    // them, `--sample --ids` or `--ef-search --ids` would pass and read the
-    // search's own labels through the map.
-    #[arg(long, requires = "results", conflicts_with_all = ["sample", "ef_search"])]
+    // The conflicts back up `requires`: clap does not enforce it when an
+    // option that conflicts with --results is given. Without them, --ids
+    // beside any of those would pass and read the search's own labels
+    // through the map.
+    #[arg(
+        long,
+        requires = "results",
+        conflicts_with_all = [
+            "sample",
+            "seed",
+            "entry_points",
+            "ef_search",
+            "nprobes",
+            "oversample",
+            "no_rescore",
+        ]
+    )]
     pub ids: Option<PathBuf>,
     /// Print the report as JSON.
     #[arg(long)]

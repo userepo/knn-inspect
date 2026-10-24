@@ -617,21 +617,38 @@ fn recall_rejects_contradictory_options() {
     // efSearch 0 would stop the search after one step; it is never meant.
     let o = run(&["recall", file_s, "--queries", queries_s, "--ef-search", "0"]);
     assert_eq!(o.status.code(), Some(2));
-    // --ids without --results, in the two forms clap would otherwise let
-    // through because --results conflicts with another given option.
-    let o = run(&["recall", file_s, "--sample", "3", "--ids", results_s]);
+}
+
+#[test]
+fn recall_ids_require_results() {
+    // --ids without --results, beside each option that conflicts with
+    // --results, which clap would otherwise let through: the map would
+    // then read the search's own labels.
+    let dir = fixtures().join("synthetic");
+    let file = dir.join("l2-100x4.faiss");
+    let queries = dir.join("l2-100x4.queries.f32");
+    let ids = dir.join("l2-100x4.results.jsonl");
+    let (file_s, queries_s, ids_s) = (
+        file.to_str().unwrap(),
+        queries.to_str().unwrap(),
+        ids.to_str().unwrap(),
+    );
+    let o = run(&["recall", file_s, "--sample", "3", "--ids", ids_s]);
     assert_eq!(o.status.code(), Some(2));
-    let o = run(&[
-        "recall",
-        file_s,
-        "--queries",
-        queries_s,
-        "--ef-search",
-        "5",
-        "--ids",
-        results_s,
-    ]);
-    assert_eq!(o.status.code(), Some(2));
+    for extra in [
+        &["--seed", "5"][..],
+        &["--entry-points", "4"],
+        &["--ef-search", "5"],
+        &["--nprobes", "2"],
+        &["--oversample", "2"],
+        &["--no-rescore"],
+    ] {
+        let mut args = vec!["recall", file_s, "--queries", queries_s];
+        args.extend_from_slice(extra);
+        args.extend_from_slice(&["--ids", ids_s]);
+        let o = run(&args);
+        assert_eq!(o.status.code(), Some(2), "{extra:?}");
+    }
 }
 
 #[test]

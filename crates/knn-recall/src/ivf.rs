@@ -280,8 +280,9 @@ impl<'a> IvfSearcher<'a> {
     ///
     /// # Errors
     ///
-    /// Returns an error when `k` or `nprobes` is 0, or `query` is of the
-    /// other kind or another dimension.
+    /// Returns an error when `k` or `nprobes` is 0, the index is binary
+    /// and its stored `nprobe` 0 (see [`Self::nprobes`]), or `query` is of
+    /// the other kind or another dimension.
     pub fn search<'q>(
         &self,
         query: impl Into<Query<'q>>,
@@ -317,6 +318,11 @@ impl<'a> IvfSearcher<'a> {
         }
         if nprobes == 0 {
             return Err(Error::ZeroNprobes);
+        }
+        // k-NN's patched binary search checks the stored value whatever
+        // nprobes the query gives.
+        if self.kind == Kind::Hamming && self.nprobe == 0 {
+            return Err(Error::BinaryNprobe);
         }
         let own = if self.kind == Kind::Hamming {
             BINARY
@@ -786,6 +792,22 @@ enum Rows {
     Bits(Vec<u8>),
 }
 
+/// `Ok` when the lists of `ivf` hold one code for each id from 0 to the
+/// count of their codes less 1, as every file k-NN writes does: id `i` is
+/// then the vector k-NN added `i`-th, row `i` of the field's vectors.
+pub(crate) fn check_list_ids(ivf: &IvfIndex<'_>) -> Result<()> {
+    let mut seen = vec![false; ivf.lists.lists().map(|l| l.ids.len()).sum()];
+    for id in ivf.lists.lists().flat_map(|l| l.ids).map(|id| id.get()) {
+        let slot = usize::try_from(id)
+            .ok()
+            .and_then(|r| seen.get_mut(r))
+            .filter(|s| !**s)
+            .ok_or(Error::ListIds { id })?;
+        *slot = true;
+    }
+    Ok(())
+}
+
 impl IvfVectors {
     /// Decodes every list of `ivf`.
     ///
@@ -802,7 +824,7 @@ impl IvfVectors {
         let searcher = IvfSearcher::new(ivf)?;
         let width = searcher.width;
         let rows = searcher.total;
-        let mut seen = vec![false; rows];
+        check_list_ids(ivf)?;
         let mut floats = Vec::new();
         let mut bits = Vec::new();
         match searcher.scan {
@@ -816,13 +838,8 @@ impl IvfVectors {
                 .chunks_exact(searcher.code_size)
                 .zip(list.ids.iter().map(|id| id.get()))
             {
-                let row = usize::try_from(id)
-                    .ok()
-                    .filter(|&r| seen.get(r) == Some(&false))
-                    .ok_or(Error::ListIds { id })?;
-                if let Some(s) = seen.get_mut(row) {
-                    *s = true;
-                }
+                // `check_list_ids` placed every id below `rows`, once.
+                let row = usize::try_from(id).unwrap_or(usize::MAX);
                 let start = row.saturating_mul(width);
                 match searcher.scan {
                     Scan::Binary => {

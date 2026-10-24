@@ -366,6 +366,17 @@ fn nprobes_are_what_k_nn_passes() {
         searcher.nprobes(Some(2)),
         Err(Error::BinaryNprobe)
     ));
+    // So do the searches given an nprobes directly.
+    let query = vec![0_u8; searcher.dimension() / 8];
+    assert!(matches!(
+        searcher.search(Query::Bits(&query), 1, 2),
+        Err(Error::BinaryNprobe)
+    ));
+    let queries = Queries::from_bits(&query, searcher.dimension()).unwrap();
+    assert!(matches!(
+        searcher.search_all(&queries, 1, 2),
+        Err(Error::BinaryNprobe)
+    ));
 }
 
 #[test]
@@ -503,6 +514,27 @@ fn product_quantized_ground_truth_is_the_fields_vec() {
     assert!(matches!(
         field_vectors(&own.index, Similarity::Euclidean, &flat.fields[0], &vec),
         Err(Error::HasVectors)
+    ));
+    // Row i stands for id i only when the lists hold each id once.
+    let bytes = fs::read(dir.join("_2_165_vec.faiss")).unwrap();
+    let (first, second) = {
+        let parsed = knn_format::parse(&bytes).unwrap();
+        let mut ids = parsed
+            .index
+            .ivf()
+            .unwrap()
+            .lists
+            .lists()
+            .filter(|l| !l.ids.is_empty())
+            .map(|l| knn_format::view_offset(&bytes, l.ids).unwrap());
+        (ids.next().unwrap(), ids.next().unwrap())
+    };
+    let mut repeated = bytes.clone();
+    repeated.copy_within(first..first + 8, second);
+    let parsed = knn_format::parse(&repeated).unwrap();
+    assert!(matches!(
+        field_vectors(&parsed.index, Similarity::Euclidean, &flat.fields[0], &vec),
+        Err(Error::ListIds { .. })
     ));
 }
 
