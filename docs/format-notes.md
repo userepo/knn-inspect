@@ -694,7 +694,8 @@ GPU, and downloads the file it writes, appending the Lucene footer as the
 local build does. The builder (its `faiss_index_build_service.py`) makes a
 `GpuIndexCagra` of graph degree 4m from the field's `m`
 (`GRAPH_DEGREE_PER_M`), lowered for a small segment so that the
-IVF-PQ search that seeds the graph can supply the neighbors
+IVF-PQ (inverted file over product-quantized codes) search that seeds
+the graph can supply the neighbors
 (`calculate_effective_m`: 56 for the 500-vector fixtures below, from an
 `m` of 16, where a binary field's 64 is not lowered), so Faiss's copy
 records an `M` of half the degree, twice the field's `m` or less; it
@@ -965,6 +966,335 @@ graph fourcc, read at its offset, is the guard). With 2,000 vectors
 both built, so the cosine fixture holds 2,000 (metric type 0 in all
 three headers, unit vectors, a graph of degree 64, `M` 32: the
 builder's cap did not bite). The inner-product build was not kept.
+
+## Trained indexes: IVF and product quantization
+
+An IVF (inverted file) index splits the vector space into `nlist` cells
+by training a coarse quantizer: a flat index of `nlist` centroids, found
+by k-means. Each vector is stored in the inverted list of its nearest
+centroid, as a float32 vector or, quantized, as a code; a search
+compares the query with every centroid and then scans only the `nprobe`
+nearest lists. The name is text search's: an inverted index maps each
+term to the documents that hold it, as these lists map each cell to its
+vectors. Product quantization (PQ) cuts a vector into `m` sub-vectors
+and codes each as the index of the nearest of `2^code_size` centroids
+trained for its position, so a vector takes a few bytes. Both need
+training before any vector is added, which is why k-NN builds them only
+through a model.
+
+k-NN's `ivf` method and its `pq` encoders need a trained model: the
+`_plugins/_knn/models/_train` API samples a training index's vectors,
+and `TrainIndex` (`faiss_wrapper.cpp` at tag 3.9.0.0) builds the
+template with Faiss's `index_factory` from the description the mapping
+resolves to and the field's metric, restates the metric on an HNSW+PQ
+index and its storage (Faiss issue 1621: `index_factory` leaves them at
+L2), sets `nprobe` from the `nprobes` parameter and `efConstruction` and
+`efSearch` from theirs (`SetExtraParameters`), calls `make_direct_map`
+on an IVF index, trains it, and stores it serialized at `ntotal` 0 as
+the model blob. A segment of a field with `model_id` is written by
+`CreateIndexFromTemplate` (`CreateBinaryIndexFromTemplate` for a binary
+field, `CreateByteIndexFromTemplate` for a byte field, which casts the
+int8 values to float): `read_index` of the blob, an `IndexIDMap` around
+it, `add_with_ids` with the doc ids, `write_index`. The ID map's
+`add_with_ids` calls the inner index's `add`, so the inner index
+receives sequential ids 0 to `ntotal - 1`, the doc ids live in the ID
+map alone, and an array direct map stays valid (Faiss refuses
+`add_with_ids` on one). k-NN's memory-optimized search accepts none of
+these indexes (`IndexTypeToFaissIndexMapping` throws), `on_disk` and
+`compression_level` never resolve to them, and the remote build takes no
+PQ, so every such file is a full native file with its vectors.
+
+The descriptions, from `KNNConstants` and the method and encoder classes:
+
+| Mapping | Description | Layout |
+|---|---|---|
+| `ivf`, encoder `flat` (the default) | `IVF{nlist},Flat` | `IxMp` > `IwFl` (`IxF2` or `IxFI` quantizer, `ilar` lists) |
+| `ivf`, encoder `sq` with `type` `fp16` or `bf16` | `IVF{nlist},SQfp16` or `SQbf16` | `IxMp` > `IwSq` |
+| `ivf` on a `byte` field | `IVF{nlist},SQ8_direct_signed` | `IxMp` > `IwSq` |
+| `ivf`, encoder `pq` | `IVF{nlist},PQ{m}x{code_size}` | `IxMp` > `IwPQ` |
+| `hnsw`, encoder `pq` | `HNSW{m},PQ{m}` | `IxMp` > `IHNp` > HNSW block > `IxPq` |
+| `ivf` on a `binary` field | `BIVF{nlist}` | `IBMp` > `IBwF` (`IBxF` quantizer, `ilar` lists) |
+
+Defaults and limits: `nlist` 4 (under 20,000), `nprobes` 1 (under 20,000;
+Faiss caps a search at `nlist`), PQ `m` 1 with the dimension divisible by
+`m`, `code_size` 8 (under 128 under `ivf`, exactly 8 under `hnsw`, so
+`HNSW{m},PQ{m}` leaves Faiss's default of 8 bits), and training needs at
+least `2^code_size` vectors. k-NN overrides the metric of an HNSW+PQ
+index, so `IHNp` and `IxPq` record inner product for `innerproduct` and
+`cosinesimil` fields, where Faiss alone would record L2.
+
+### IVF index
+
+After the fourcc (`IwFl`, `IwSq`, `IwPQ`) and the common header
+(`read_ivf_header`), in order:
+
+| Field | Type | Notes |
+|---|---|---|
+| `nlist` | size_t (uint64) | lists; k-NN's `nlist` |
+| `nprobe` | size_t | lists a search scans; k-NN's `nprobes`, set on the template before training and so stored, overridable per query |
+| quantizer | nested index | `write_index` of the coarse quantizer: `IxF2` or `IxFI`, its header (`ntotal` = `nlist`, the dimension, the metric), and its `nlist x d` float32 centroids as `READXBVECTOR` |
+| `direct_map.type` | char (1 byte) | `DirectMap::Type`: 0 `NoMap`, 1 `Array`, 2 `Hashtable`; k-NN's `make_direct_map` leaves 1 |
+| `direct_map.array` | vector<int64> | for `Array`, one entry per id: `list << 32 \| offset` (`lo_build`), -1 for an id in no list; written for every type, empty for the others |
+| `direct_map.hashtable` | vector<pair<int64, int64>> | for `Hashtable` only: `(id, list << 32 \| offset)` pairs, the count counting pairs; k-NN never writes one |
+
+Then the fields each kind adds:
+
+| Kind | Fields |
+|---|---|
+| `IwFl` | none; the code size is `4 x d` |
+| `IwSq` | the scalar quantizer (`write_ScalarQuantizer`, as under `IHNs`), `code_size` (size_t), `by_residual` (bool) |
+| `IwPQ` | `by_residual` (bool), `code_size` (size_t), the product quantizer (below) |
+
+`by_residual` is true in every file k-NN writes: `index_factory` builds
+`IndexIVFScalarQuantizer` with it, and `IndexIVFPQ` sets it in its
+constructor. The codes then quantize `x - centroid`, the vector's residual
+from its list's centroid.
+
+Then the inverted lists (`write_InvertedLists`), `ArrayInvertedLists`
+being the only kind k-NN's training path accepts (`validateTemplateIndex`
+at tag 3.9.0.0):
+
+| Field | Type | Notes |
+|---|---|---|
+| fourcc | `ilar` | `il00` means the lists were not stored, which k-NN never writes; the parser refuses it |
+| `nlist` | size_t | Faiss requires it to equal the index's |
+| `code_size` | size_t | Faiss requires it to equal the index's |
+| list type | fourcc | `full` when more than half the lists hold something, else `sprs` |
+| sizes | vector<size_t> | `full`: one size per list, exactly `nlist` of them; `sprs`: `(list, size)` pairs for the non-empty lists, in list order, flat, each list below `nlist` |
+| data | raw | for each non-empty list in list order: its codes (`size x code_size` bytes), then its ids (`size` int64s), written with no counts of their own |
+
+The parser reads the sizes, sums them with checked arithmetic, and takes
+the lists' bytes as one region before any list is viewed, so a damaged
+size cannot drive an allocation; a size list that is not `nlist` long, an
+odd pair count (Faiss would read past it), or a listed list at or past
+`nlist` (Faiss asserts) is an error.
+
+### Product quantizer
+
+`write_ProductQuantizer`, as `IwPQ` and `IxPq` store it:
+
+| Field | Type | Notes |
+|---|---|---|
+| `d` | size_t | the dimension |
+| `M` | size_t | sub-quantizers; k-NN's `m` |
+| `nbits` | size_t | bits per sub-vector code; k-NN's `code_size` |
+| `centroids` | vector<float> | `M x 2^nbits x d/M` floats: each sub-quantizer's `2^nbits` centroids, each of `d/M` components |
+
+Faiss derives `dsub = d / M`, `ksub = 2^nbits`, and `code_size = (nbits x
+M + 7) / 8` in `set_derived_values` before it reads the centroids,
+refusing `M` 0, `d % M != 0`, and `nbits > 24`; so does the parser. The
+centroid table is sized from those fields, then overwritten by the stored
+vector, whose length a damaged file can change; the parser keeps what is
+stored and reports the derived size beside it.
+
+### HNSW over product-quantized storage
+
+`IxMp` > `IHNp`, with the same header and HNSW block as `IHNf`, then
+`IxPq` (`IndexPQ`): its header, the product quantizer, the codes as a
+byte vector (`ntotal x code_size` bytes), then `IndexPQ`'s search
+parameters: `search_type` (int32, `Search_type_t`: 0 `ST_PQ`, the
+asymmetric search, in every file k-NN writes), `encode_signs` (bool,
+false), and `polysemous_ht` (int32, `nbits x M + 1` by default; never
+read for `ST_PQ`). Faiss reads any storage under `IHNp`; k-NN writes
+`IxPq` alone (`validateTemplateIndex`), and that is all the parser
+accepts there.
+
+### Binary IVF index
+
+`IBMp` > `IBwF`: the binary header, `nlist` and `nprobe` as above, the
+quantizer as `write_index_binary` writes it (`IBxF`, its binary header
+with `ntotal` = `nlist`, the centroids as a byte vector of `nlist x
+code_size` bytes), the direct map, and the inverted lists, whose
+`code_size` is the header's (`d / 8`).
+
+### What the tool does with them
+
+Every layout above parses (`knn-format`: `IvfIndex`, `InvertedLists`,
+`DirectMap`, `ProductQuantizer`, `PqStorage`), and `info` prints every
+field. The parser refuses inverted lists whose count or code size is not
+the index's, as Faiss's reader does, and sparse sizes whose lists are not
+in ascending order, each once, as Faiss writes them: Faiss's reader
+reads the lists' data in list order whatever the pairs' order, so only
+those read one way.
+
+`verify` holds an IVF index to what k-NN's training path and Faiss's
+reader leave: the three headers (the ID map's, the IVF index's, the
+coarse quantizer's) agree on the dimension, the metric, and for a binary
+index the code size, and the ID map's and the IVF index's on the count;
+the coarse quantizer holds `nlist` centroids; a scalar quantizer fits the index as under
+`IHNs`, and a product quantizer has the index's dimension and holds the
+`M x 2^nbits x d/M` centroid floats its fields size, its code size the
+index's; and `nlist` is not 0, which refuses every search, nor `nprobe`
+0 or negative as the int k-NN casts it to, with which every search that
+gives no `nprobes` fails (a float index throws; a binary one finds
+nothing, or reads past its lists under k-NN's patched search). Each of
+those fails. A header that says untrained, a centroid that is not
+finite, and codes not of residuals warn. Two checks are an IVF index's own: `inverted_lists` (every id in
+the lists is a vector of the index and appears once, the lists holding
+exactly `ntotal` vectors under `vector_count`) and `direct_map` (an
+array, one entry per vector, each naming the list position that holds
+the vector's id; k-NN's search never reads the map, so anything else
+warns). The graph checks are skipped. With `--space cosine`, every
+vector the lists code must be of unit length: float32 codes are the
+vectors, and an fp16 or bf16 code is the vector's residual from its
+list's centroid, rounded, so the vector is the centroid plus the decoded
+residual, within the rounding: the residual's length times the format's
+unit roundoff (2^-11 for fp16, 2^-8 for bf16), plus the float32
+tolerance. On `IHNp` every graph check runs, the codes are counted, and
+the product quantizer is checked as under `IwPQ`.
+
+`stats` reports an IVF index's lists: `nlist`, `nprobe`, the vectors,
+the empty lists, the smallest, mean, and largest list, every list's
+size, and Faiss's `InvertedLists::imbalance_factor`, summed in Faiss's
+order (sizes as doubles, list 0 first) so that it matches Faiss Python's
+to the bit.
+
+`scan` compares the vectors an IVF index's lists code with the field's
+in the `.vec`. k-NN adds a segment's vectors through the ID map, whose
+`add` numbers them 0, 1, 2, ... in the order they come, the order of the
+field's vectors in the `.vec`, so the vector of id `i` is row `i` of the
+field wherever its list put its code. Float32 and binary codes are
+compared byte for byte; an fp16 or bf16 code must be what the row less
+its list's centroid, subtracted in float32 as Faiss's `compute_residual`
+subtracts it, rounds to (either of Faiss's tie rules, as for `IHNs`); a
+byte code, `SQ8_direct_signed`, must be the residual plus 128 converted
+to a byte toward zero, `(uint8_t)(x + 128)` in Faiss (a residual of 0.6
+encodes as 0, of -0.4 as -1). Past the byte range that conversion is
+undefined in C++, and builds differ, by compiler and by whether the
+vectorized loop runs (the faiss-cpu 1.15.1 wheel wraps 200 to -56; a
+clang AVX2 build's vectorized loop saturates it to 127), so a component
+whose residual leaves the range is not compared. A byte field's residuals
+reach about ±255 wherever a centroid lies far from a component. Codes not of
+residuals are compared as the values themselves. An fp16 residual can
+overflow where the vector does not (a vector up to 65,504 from a
+centroid as far the other way), and Faiss then stores an infinity of
+its sign, which both `scan` and the values check accept. The field is
+read only where the `.vemf` puts it; with no `.vemf` this tool reads,
+the comparison is skipped. Product-quantized codes hold no exact
+vectors, so only the labels are compared, against the `.si`.
+`recall` refuses an IVF index and product-quantized storage; their
+search follows in a later release.
+
+### Synthetic IVF and PQ fixtures
+
+`tools/make_synthetic.py --only ivf` writes `fixtures/synthetic-ivf/` with
+faiss-cpu 1.15.1, whose writers for every structure above are byte for
+byte those of Faiss `5616caa`, the commit k-NN 3.9.0 builds (the only
+difference between the two `index_write.cpp` files in this area is a
+list kind, `ilp2`, that 1.15.1 adds). Each case is built as k-NN's
+`TrainIndex` builds the template: `index_factory` with the description
+k-NN would resolve to, the metric restated on an HNSW+PQ index and its
+storage, `nprobe` set, `make_direct_map`, `train` on the vectors (1,000
+of them: training a code size of 8 bits needs at least 256), then an
+`IndexIDMap` and `add_with_ids` with labels offset by 1,000. The sparse
+case trains 16 lists on 100 vectors and indexes the first 5, so Faiss
+writes `sprs` sizes; `ivf-ip-1000x32-flat` sets `nprobe` 2. The
+`.expected.json` beside each file records what Faiss Python reads back
+from the same index, down to the first centroid, the first vector's list
+and offset in the direct map, the sizes, and checksums over the codes and
+ids in list order. The trained template's size and checksum are recorded
+too (`template`), as the blob k-NN would have stored.
+
+`tools/walk_faiss.py fixtures/synthetic-ivf/ivf-l2-100x4-flat.faiss`
+(`IVF4,Flat`, d = 4, n = 100):
+
+```
+offset  size  field                      value
+     0     4  idmap.fourcc               IxMp
+     4    33  idmap header               d 4, ntotal 100, trained, metric 1
+    37     4  ivf.fourcc                 IwFl
+    41    33  ivf header                 (same values)
+    74     8  ivf.nlist                  4
+    82     8  ivf.nprobe                 1
+    90     4  quantizer.fourcc           IxF2
+    94    33  quantizer header           d 4, ntotal 4, trained, metric 1
+   127     8  quantizer.codes.len        16   (float32 elements = 4 x 4)
+   135    64  quantizer.codes.data
+   199     1  direct_map.type            1    (Array)
+   200     8  direct_map.array.len       100
+   208   800  direct_map.array.data      100 x int64: list << 32 | offset
+  1008     4  lists.fourcc               ilar
+  1012     8  lists.nlist                4
+  1020     8  lists.code_size            16
+  1028     4  lists.list_type            full
+  1032     8  lists.sizes.len            4
+  1040    32  lists.sizes.data           [23, 21, 32, 24]
+  1072   368  lists[0].codes             23 x 16 bytes
+  1440   184  lists[0].ids               23 x int64
+  1624   336  lists[1].codes
+  1960   168  lists[1].ids
+  2128   512  lists[2].codes
+  2640   256  lists[2].ids
+  2896   384  lists[3].codes
+  3280   192  lists[3].ids
+  3472     8  idmap.id_map.len           100
+  3480   800  idmap.id_map.data
+  4280        end of file, 0 trailing bytes
+```
+
+The sparse case (`IVF16,Flat`, 5 vectors) stores `sprs` sizes: a flat
+vector of 8 values, `[5, 1, 11, 1, 12, 1, 15, 2]`, and the four lists
+that follow are lists 5, 11, 12, and 15. `IwSq` puts the scalar quantizer
+(`qtype` 4, `rangestat` 0, `rangestat_arg` 0, `d` 32, `code_size` 64, no
+trained values), then `code_size` 64 and `by_residual` 1, between the
+direct map and the lists; `IwPQ` puts `by_residual` 1, `code_size` 4,
+and the product quantizer (`d` 32, `M` 4, `nbits` 8, 8,192 centroid
+floats) there. `IHNp` over `IxPq` ends with the 4,000 code bytes of
+1,000 four-byte codes, then `search_type` 0, `encode_signs` 0, and
+`polysemous_ht` 33 (`8 x 4 + 1`). The binary case (`BIVF4`, 16 bits)
+has binary headers of code size 2, an `IBxF` quantizer of 4 two-byte
+centroids, and lists of code size 2.
+
+Every fixture walks to the end with no trailing bytes, and the parser
+reports every value the `.expected.json` records
+(`crates/knn-format/tests/ivf.rs`). Two things the fixtures showed:
+every header of a trained file says trained, the ID map's included,
+unlike a remote-built CAGRA file's; and the HNSW graph faiss-cpu builds
+over product-quantized codes for the inner-product case leaves 40 of
+its 1,000 nodes on level 0 that no neighbor list reaches (one on level 1
+in the L2 case), where the graphs over exact vectors leave none at that
+size: the asymmetric PQ distances it builds with are coarse, and the
+graph statistics baselines (`hnsw-*.stats.json`) record it.
+
+### Real trained files from OpenSearch 3.9.0
+
+`tools/extract_opensearch.py --encoding ivf-flat` (and `ivf-sq-fp16`,
+`ivf-pq`, `hnsw-pq`, `ivf-byte`, `ivf-binary`) wrote
+`fixtures/opensearch-3.9.0-trained/`: for each, the 500 vectors of the
+16-dimensional draw the other real fixtures use (the byte field's scaled
+and rounded; the binary field's the signs of a 128-dimensional draw, 128
+bits), indexed first into a
+training index of their own, a model trained on them through
+`_plugins/_knn/models/{id}/_train` (`nlist` 4, `nprobes` 1, `pq` with
+`m` 4 and `code_size` 8), and the same vectors indexed into a field that
+names the model. Two things the training API asks that the mapping
+docs do not say: the `sq` encoder needs `bits: 16` under `ivf` too, on
+an index of 3.6.0 or later, and a `pq` encoder that leaves `code_size`
+out needs at least 1,000 training vectors, where one that gives it
+needs at least `2^code_size` (`AbstractFaissPQEncoder.validateEncoderConfig`;
+its message says "greater than").
+The model's blob, the trained index k-NN stores at `ntotal` 0, lies
+beside each segment as `model.blob`.
+
+Every live file has the structure of the synthetic file of the same
+description (`crates/knn-format/tests/ivf.rs`): the same chain, an array
+direct map, codes by residual, every header trained, and under `IHNp`
+`search_type` 0, `encode_signs` 0, and `polysemous_ht` 33. Its coarse
+quantizer's centroids, and under `IwPQ` and `IHNp` its product
+quantizer's, are the blob's byte for byte: the segment's file is the
+template with the vectors added. The one difference from the synthetic
+files is `efSearch`, 256 under `IHNp`, already in the blob: k-NN gives
+the model the `ef_search` it gives binary quantization (`MethodComponent`
+picks `getBinaryQuantizationEFSearchValue` at a compression level of
+8x, 16x, or 32x), since product quantization of 16 float32 dimensions
+into 4 bytes is 16x, where faiss-cpu keeps its own 16, as the synthetic
+HNSW fixtures do. Every live file verifies
+clean with its space, its stats match Faiss Python's (`stats.json`), and
+`scan` finds every vector its lists code in the field's `.vec`, row by
+row, through fp16 residual rounding and the byte truncation above alike.
+The HNSW graph k-NN builds over product-quantized codes for the
+inner-product field leaves 69 of its 500 nodes on level 0, and 3 on
+level 1, that no neighbor list reaches, where the L2 one leaves none.
 
 ## Real files from OpenSearch 3.9.0
 

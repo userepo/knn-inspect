@@ -161,9 +161,15 @@ pub fn run(args: &RecallArgs) -> anyhow::Result<ExitCode> {
         .parse()
         .with_context(|| format!("parsing {}", path.display()))?;
     let index = &parsed.index;
+    let Some(hnsw) = index.hnsw() else {
+        bail!(
+            "{}: the file is an IVF index, whose search recall does not run yet",
+            path.display()
+        );
+    };
     // Clap cannot see the graph kind, so the arguments that steer the
     // random entry draws are checked against the file here.
-    if !index.index.random_entry_points() {
+    if !hnsw.random_entry_points() {
         if args.entry_points.is_some() {
             bail!(
                 "{}: --entry-points applies to a CAGRA graph's own search; this graph is searched from its entry point",
@@ -177,12 +183,18 @@ pub fn run(args: &RecallArgs) -> anyhow::Result<ExitCode> {
             );
         }
     }
-    let Some(storage) = index.index.storage.as_ref() else {
+    let Some(storage) = hnsw.storage.as_ref() else {
         return run_on_disk(args, index);
     };
     if args.oversample.is_some() || args.no_rescore {
         bail!(
             "{}: --oversample and --no-rescore apply to a graph without its vectors",
+            path.display()
+        );
+    }
+    if matches!(storage, Storage::Pq(_)) {
+        bail!(
+            "{}: the file stores product-quantized codes, which hold no exact vectors; recall over them is not implemented yet",
             path.display()
         );
     }
@@ -284,7 +296,7 @@ fn run_on_disk(args: &RecallArgs, index: &IdMapIndex<'_>) -> anyhow::Result<Exit
         let draw = draw_of(args);
         let started = Instant::now();
         let results = on_disk.search_all(&queries, &plan, draw)?;
-        let cagra = index.index.kind.cagra();
+        let cagra = index.hnsw().and_then(|h| h.kind.cagra());
         (
             results,
             Some(OwnSearch {
@@ -463,19 +475,24 @@ fn results_for(
     if let Some(p) = &args.results {
         return Ok((read_results(p)?, None));
     }
+    // `run` has refused an IVF index already; a graph is all that reaches
+    // here.
+    let hnsw = index
+        .hnsw()
+        .ok_or_else(|| anyhow::anyhow!("the file is not a graph"))?;
     let ef_search = args.ef_search.map_or_else(
-        || usize::try_from(index.index.graph.ef_search).unwrap_or(0),
+        || usize::try_from(hnsw.graph.ef_search).unwrap_or(0),
         |ef| usize::try_from(ef).unwrap_or(usize::MAX),
     );
     let draw = draw_of(args);
     let started = Instant::now();
-    let hits = knn_recall::search_all(&index.index, queries, args.k, ef_search, draw)?;
+    let hits = knn_recall::search_all(hnsw, queries, args.k, ef_search, draw)?;
     let search_ms = started.elapsed().as_millis();
     let results = hits
         .iter()
         .map(|h| knn_recall::result_labels(index, h, args.k))
         .collect();
-    let cagra = index.index.kind.cagra();
+    let cagra = hnsw.kind.cagra();
     Ok((
         results,
         Some(OwnSearch {

@@ -89,6 +89,24 @@ pub enum Error {
         value: i64,
     },
 
+    /// A field disagrees with the one Faiss's reader requires it to equal:
+    /// the inverted lists' count or code size against the IVF index's.
+    #[error(
+        "{what} at offset {offset} is {value}, but the index's {of} is {expected}; Faiss refuses the file"
+    )]
+    FieldMismatch {
+        /// Where the field sits.
+        offset: usize,
+        /// The field.
+        what: &'static str,
+        /// The value read.
+        value: u64,
+        /// The value it must equal.
+        expected: u64,
+        /// What that value is.
+        of: &'static str,
+    },
+
     /// Bytes lie where a structure has ended and only the footer may
     /// follow.
     #[error(
@@ -186,6 +204,7 @@ impl Error {
             | Self::UnexpectedQuantizer { offset, .. }
             | Self::CountTooLarge { offset, .. }
             | Self::InvalidValue { offset, .. }
+            | Self::FieldMismatch { offset, .. }
             | Self::TrailingBytes { offset, .. }
             | Self::UnexpectedCodec { offset, .. }
             | Self::UnknownChecksumAlgorithm { offset, .. }

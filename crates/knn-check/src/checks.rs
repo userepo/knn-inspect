@@ -1,11 +1,13 @@
 //! The checks themselves.
 
+mod ivf;
+
 use std::collections::BTreeMap;
 
 use knn_format::envelope::Envelope;
 use knn_format::faiss::{
-    CagraFields, CodeFormat, HeaderKind, HnswGraph, IdMapIndex, IndexHeader, Metric, SqStorage,
-    Storage,
+    CagraFields, CodeFormat, HeaderKind, HnswGraph, HnswIndex, IdMapIndex, IndexHeader, Metric,
+    ScalarQuantizer, Storage,
 };
 use knn_format::{Parsed, view_offset};
 
@@ -34,6 +36,9 @@ const HAMMING_SPACE: &str = "k-NN accepts hamming for binary fields only";
 
 /// Why binary storage can belong to a float field too.
 const BINARY_ENCODER: &str = "k-NN writes it for a float field with the binary encoder too, whose index compares the quantized bits by hamming distance";
+
+/// Why a graph has no inverted lists or direct map to check.
+const NO_LISTS: &str = "the file is a graph, with no inverted lists or direct map";
 
 /// Why a graph without its vectors has none to check.
 const NO_VECTORS: &str =
@@ -80,24 +85,33 @@ pub fn verify(bytes: &[u8], options: &Options) -> Report {
 
     check_trailing(&mut col, &parsed);
     let idx = &parsed.index;
-    check_headers(&mut col, bytes, idx);
-    check_metric(&mut col, idx, options.space);
-    let graph = &idx.index.graph;
+    let Some(hnsw) = idx.hnsw() else {
+        if let Some(index) = idx.ivf() {
+            ivf::check(&mut col, bytes, idx, index, options.space);
+        }
+        return col.finish();
+    };
+    // A graph has no inverted lists or direct map.
+    col.skip(Check::InvertedLists, NO_LISTS);
+    col.skip(Check::DirectMap, NO_LISTS);
+    check_headers(&mut col, bytes, idx, hnsw);
+    check_metric(&mut col, idx, hnsw, options.space);
+    let graph = &hnsw.graph;
     // k-NN searches a CAGRA graph from random entry points on level 0:
     // its entry point, max_level, and upper levels are never read, so
     // what k-NN's builder leaves in them warns when it is not what the
     // builder writes, and never fails.
-    let base_only = idx.index.random_entry_points();
+    let base_only = hnsw.random_entry_points();
     check_offsets(&mut col, bytes, graph);
     check_level_table(&mut col, bytes, graph);
     check_levels(&mut col, bytes, graph, idx.header.ntotal, base_only);
     check_entry_point(&mut col, graph, base_only);
     check_neighbor_ids(&mut col, bytes, graph, base_only);
-    check_vector_count(&mut col, idx);
+    check_vector_count(&mut col, idx, hnsw);
     check_id_map_length(&mut col, bytes, idx);
-    check_vector_values(&mut col, bytes, idx);
+    check_vector_values(&mut col, bytes, hnsw);
     check_neighbor_lists(&mut col, bytes, graph, base_only);
-    check_norms(&mut col, bytes, idx, options.space);
+    check_norms(&mut col, bytes, hnsw, options.space);
     col.finish()
 }
 
@@ -159,8 +173,8 @@ fn check_trailing(col: &mut Collector, parsed: &Parsed<'_>) {
     }
 }
 
-fn check_headers(col: &mut Collector, bytes: &[u8], idx: &IdMapIndex<'_>) {
-    let storage = idx.index.storage.as_ref();
+fn check_headers(col: &mut Collector, bytes: &[u8], idx: &IdMapIndex<'_>, hnsw: &HnswIndex<'_>) {
+    let storage = hnsw.storage.as_ref();
     // How each header's metric type is used. A binary graph without its
     // vectors records the distance it was built for, where binary storage
     // computes hamming distance whatever its headers say; a float one (a
@@ -176,11 +190,11 @@ fn check_headers(col: &mut Collector, bytes: &[u8], idx: &IdMapIndex<'_>) {
     let graph_role = if binary_graph_only {
         MetricRole::Unread
     } else {
-        role(&idx.index.header)
+        role(&hnsw.header)
     };
     let mut headers: Vec<(&str, &IndexHeader, MetricRole)> = vec![
         ("id map", &idx.header, role(&idx.header)),
-        ("hnsw", &idx.index.header, graph_role),
+        ("hnsw", &hnsw.header, graph_role),
     ];
     if let Some(storage) = storage {
         headers.push(("storage", storage.header(), role(storage.header())));
@@ -228,7 +242,7 @@ fn check_headers(col: &mut Collector, bytes: &[u8], idx: &IdMapIndex<'_>) {
         // `add` trains it and never updates the flag, so the ID map
         // header of a CAGRA graph says untrained in every file it writes;
         // k-NN does not read it.
-        let builder_leaves_untrained = name == "id map" && idx.index.kind.cagra().is_some();
+        let builder_leaves_untrained = name == "id map" && hnsw.kind.cagra().is_some();
         if !h.is_trained && !builder_leaves_untrained {
             col.warn(
                 Check::Headers,
@@ -246,17 +260,21 @@ fn check_headers(col: &mut Collector, bytes: &[u8], idx: &IdMapIndex<'_>) {
             None,
         );
     }
-    if let Some(Storage::Sq(storage)) = storage {
-        check_quantizer(col, bytes, storage, first.d);
+    match storage {
+        Some(Storage::Sq(storage)) => {
+            check_quantizer_fields(col, bytes, &storage.quantizer, storage.format, first.d);
+        }
+        Some(Storage::Pq(storage)) => ivf::check_pq(col, &storage.pq, first.d),
+        _ => {}
     }
     if let HeaderKind::Binary { code_size } = first.kind {
         if graph_only {
-            check_graph_code_sizes(col, first, code_size, &idx.index.header);
+            check_graph_code_sizes(col, first, code_size, &hnsw.header);
         } else {
             check_binary_shape(col, first, code_size);
         }
     }
-    if let Some(cagra) = idx.index.kind.cagra() {
+    if let Some(cagra) = hnsw.kind.cagra() {
         check_cagra(
             col,
             cagra,
@@ -470,8 +488,13 @@ fn check_graph_code_sizes(
 
 /// The quantizer's own fields: its dimension and code size must match the
 /// index and the format's component size, and it has nothing to train.
-fn check_quantizer(col: &mut Collector, bytes: &[u8], storage: &SqStorage<'_>, d: i32) {
-    let q = &storage.quantizer;
+fn check_quantizer_fields(
+    col: &mut Collector,
+    bytes: &[u8],
+    q: &ScalarQuantizer<'_>,
+    format: CodeFormat,
+    d: i32,
+) {
     // qtype, rangestat, and rangestat_arg take 4 bytes each.
     let d_at = q.offset.checked_add(12);
     let code_size_at = q.offset.checked_add(20);
@@ -483,7 +506,7 @@ fn check_quantizer(col: &mut Collector, bytes: &[u8], storage: &SqStorage<'_>, d
             None,
         );
     }
-    let size = storage.format.component_size();
+    let size = format.component_size();
     let expected = u64::try_from(d)
         .ok()
         .zip(u64::try_from(size).ok())
@@ -508,7 +531,7 @@ fn check_quantizer(col: &mut Collector, bytes: &[u8], storage: &SqStorage<'_>, d
                 "quantizer holds {} trained value{}; {} uses none",
                 q.trained.len(),
                 if q.trained.len() == 1 { "" } else { "s" },
-                storage.format.name()
+                format.name()
             ),
             view_offset(bytes, q.trained),
             None,
@@ -516,31 +539,13 @@ fn check_quantizer(col: &mut Collector, bytes: &[u8], storage: &SqStorage<'_>, d
     }
 }
 
-fn check_metric(col: &mut Collector, idx: &IdMapIndex<'_>, space: Option<Space>) {
-    let Some(space) = space else {
-        col.skip(Check::Metric, "no --space given");
-        return;
-    };
-    let storage = idx.index.storage.as_ref();
-    // Binary storage belongs to a hamming field of binary vectors, or to a
-    // float field of any other space whose vectors k-NN quantizes to bits
-    // (the binary encoder). Either is valid, and only the field mapping
-    // says which, so a float space is noted, not failed.
-    if let Some(storage @ Storage::Binary(_)) = storage {
-        if space != Space::Hamming {
-            col.info(
-                Check::Metric,
-                format!(
-                    "binary storage in {} {} field: {BINARY_ENCODER}",
-                    article(space),
-                    space.name()
-                ),
-                Some(storage.header().offset),
-                None,
-            );
-        }
-        return;
-    }
+fn check_metric(
+    col: &mut Collector,
+    idx: &IdMapIndex<'_>,
+    hnsw: &HnswIndex<'_>,
+    space: Option<Space>,
+) {
+    let storage = hnsw.storage.as_ref();
     // A graph without its vectors records the metric k-NN built it for,
     // the field's space as Faiss names it, in both headers; k-NN reads the
     // ID map's.
@@ -548,6 +553,63 @@ fn check_metric(col: &mut Collector, idx: &IdMapIndex<'_>, space: Option<Space>)
         Some(storage) => (storage.header().metric(), storage.header().offset),
         None => (idx.metric(), idx.header.offset),
     };
+    check_space(
+        col,
+        space,
+        &Recorded {
+            what: "storage",
+            metric,
+            metric_at,
+            binary_at: match storage {
+                Some(s @ Storage::Binary(_)) => Some(s.header().offset),
+                _ => None,
+            },
+            byte_at: match storage {
+                Some(Storage::Sq(s)) if s.format == CodeFormat::Byte => Some(s.quantizer.offset),
+                _ => None,
+            },
+        },
+    );
+}
+
+/// What a file records that `--space` is checked against.
+struct Recorded {
+    /// `storage` for a graph's, `codes` for an IVF index's lists.
+    what: &'static str,
+    /// The metric the file records, and where.
+    metric: Metric,
+    metric_at: usize,
+    /// Where the binary header is, for binary storage or codes.
+    binary_at: Option<usize>,
+    /// Where the scalar quantizer is, for byte storage or codes.
+    byte_at: Option<usize>,
+}
+
+fn check_space(col: &mut Collector, space: Option<Space>, r: &Recorded) {
+    let Some(space) = space else {
+        col.skip(Check::Metric, "no --space given");
+        return;
+    };
+    let what = r.what;
+    // Binary vectors belong to a hamming field of binary vectors, or to a
+    // float field of any other space whose vectors k-NN quantizes to bits
+    // (the binary encoder). Either is valid, and only the field mapping
+    // says which, so a float space is noted, not failed.
+    if let Some(at) = r.binary_at {
+        if space != Space::Hamming {
+            col.info(
+                Check::Metric,
+                format!(
+                    "binary {what} in {} {} field: {BINARY_ENCODER}",
+                    article(space),
+                    space.name()
+                ),
+                Some(at),
+                None,
+            );
+        }
+        return;
+    }
     let wanted = match space {
         Space::L2 => Metric::L2,
         Space::InnerProduct | Space::Cosine => Metric::InnerProduct,
@@ -556,13 +618,8 @@ fn check_metric(col: &mut Collector, idx: &IdMapIndex<'_>, space: Option<Space>)
     // Faiss has no cosine metric; k-NN serves cosinesimil as inner product
     // over normalized vectors, cannot normalize bytes, and refuses the
     // space for byte fields when the mapping is created.
-    let byte_cosine = match storage {
-        Some(Storage::Sq(s)) if space == Space::Cosine && s.format == CodeFormat::Byte => {
-            Some(s.quantizer.offset)
-        }
-        _ => None,
-    };
-    if metric != wanted {
+    let byte_cosine = r.byte_at.filter(|_| space == Space::Cosine);
+    if r.metric != wanted {
         // One finding, so text output, which shows a check's first, keeps
         // the byte or hamming note with the failure.
         let note = match (byte_cosine, space) {
@@ -574,18 +631,18 @@ fn check_metric(col: &mut Collector, idx: &IdMapIndex<'_>, space: Option<Space>)
             Check::Metric,
             format!(
                 "file records metric {}, but {} {} field needs {}{note}",
-                metric.name(),
+                r.metric.name(),
                 article(space),
                 space.name(),
                 wanted.name()
             ),
-            Some(metric_at),
+            Some(r.metric_at),
             None,
         );
     } else if let Some(at) = byte_cosine {
         col.warn(
             Check::Metric,
-            format!("byte storage in a cosine field: {BYTE_COSINE}"),
+            format!("byte {what} in a cosine field: {BYTE_COSINE}"),
             Some(at),
             None,
         );
@@ -914,42 +971,57 @@ fn node_of_slot(graph: &HnswGraph<'_>, slot: usize) -> Option<usize> {
     idx.checked_sub(1).filter(|&node| node < graph.levels.len())
 }
 
-fn check_vector_count(col: &mut Collector, idx: &IdMapIndex<'_>) {
-    let Some(storage) = &idx.index.storage else {
+fn check_vector_count(col: &mut Collector, idx: &IdMapIndex<'_>, hnsw: &HnswIndex<'_>) {
+    let Some(storage) = &hnsw.storage else {
         col.skip(Check::VectorCount, NO_VECTORS);
         return;
     };
+    let n = usize::try_from(idx.header.ntotal).ok();
+    let d = usize::try_from(idx.header.d).ok();
     // Counted as the file counts them: float32 elements, or bytes of
-    // codes.
-    let (held, per_component, unit) = match storage {
-        Storage::Flat(s) => (s.codes.len(), 1, "floats".to_owned()),
+    // codes, over `count x dimension` components, or for product-quantized
+    // storage `count` codes of the quantizer's size.
+    let (held, expected, unit, shape) = match storage {
+        Storage::Flat(s) => (
+            s.codes.len(),
+            n.zip(d).and_then(|(n, d)| n.checked_mul(d)),
+            "floats".to_owned(),
+            format!("of dimension {}", idx.header.d),
+        ),
         Storage::Sq(s) => (
             s.codes.len(),
-            s.format.component_size(),
+            n.zip(d)
+                .and_then(|(n, d)| n.checked_mul(d)?.checked_mul(s.format.component_size())),
             match s.format {
                 CodeFormat::Byte => "byte codes".to_owned(),
                 CodeFormat::Fp16 | CodeFormat::Bf16 => {
                     format!("bytes of {} codes", s.format.name())
                 }
             },
+            format!("of dimension {}", idx.header.d),
         ),
+        Storage::Pq(s) => {
+            let code_size = s.pq.code_size();
+            (
+                s.codes.len(),
+                n.zip(usize::try_from(code_size).ok())
+                    .and_then(|(n, size)| n.checked_mul(size)),
+                "bytes of product-quantized codes".to_owned(),
+                format!("in codes of {code_size} bytes"),
+            )
+        }
         Storage::Binary(s) => {
             check_binary_count(col, idx, s.header.offset, s.codes.len());
             return;
         }
     };
-    let expected = usize::try_from(idx.header.ntotal)
-        .ok()
-        .zip(usize::try_from(idx.header.d).ok())
-        .and_then(|(n, d)| n.checked_mul(d)?.checked_mul(per_component));
     match expected {
         Some(e) if e == held => {}
         _ => col.fail(
             Check::VectorCount,
             format!(
-                "storage holds {held} {unit}; {} vectors of dimension {} need {}",
+                "storage holds {held} {unit}; {} vectors {shape} need {}",
                 idx.header.ntotal,
-                idx.header.d,
                 expected.map_or_else(|| "more than fit".to_owned(), |e| e.to_string())
             ),
             Some(storage.header().offset),
@@ -996,8 +1068,8 @@ fn check_id_map_length(col: &mut Collector, bytes: &[u8], idx: &IdMapIndex<'_>) 
     }
 }
 
-fn check_vector_values(col: &mut Collector, bytes: &[u8], idx: &IdMapIndex<'_>) {
-    let Some(storage) = &idx.index.storage else {
+fn check_vector_values(col: &mut Collector, bytes: &[u8], hnsw: &HnswIndex<'_>) {
+    let Some(storage) = &hnsw.storage else {
         col.skip(Check::VectorValues, NO_VECTORS);
         return;
     };
@@ -1011,6 +1083,12 @@ fn check_vector_values(col: &mut Collector, bytes: &[u8], idx: &IdMapIndex<'_>) 
                 Check::VectorValues,
                 "binary codes are bits, all of them valid",
             );
+            return;
+        }
+        // The codes are centroid indexes, all of them valid; the
+        // centroids they name are floats.
+        Storage::Pq(s) => {
+            ivf::check_pq_values(col, bytes, &s.pq);
             return;
         }
         Storage::Flat(_) | Storage::Sq(_) => {}
@@ -1111,12 +1189,12 @@ fn check_neighbor_lists(col: &mut Collector, bytes: &[u8], graph: &HnswGraph<'_>
     }
 }
 
-fn check_norms(col: &mut Collector, bytes: &[u8], idx: &IdMapIndex<'_>, space: Option<Space>) {
+fn check_norms(col: &mut Collector, bytes: &[u8], hnsw: &HnswIndex<'_>, space: Option<Space>) {
     if space != Some(Space::Cosine) {
         col.skip(Check::Norms, "only meaningful with --space cosine");
         return;
     }
-    let Some(storage) = &idx.index.storage else {
+    let Some(storage) = &hnsw.storage else {
         col.skip(Check::Norms, NO_VECTORS);
         return;
     };
@@ -1144,6 +1222,15 @@ fn check_norms(col: &mut Collector, bytes: &[u8], idx: &IdMapIndex<'_>, space: O
             col.skip(
                 Check::Norms,
                 "binary codes have no length to check; a cosine field's float32 vectors are in its .vec",
+            );
+            return;
+        }
+        // A code names centroids, not the vector; the vector is in the
+        // field's .vec.
+        Storage::Pq(_) => {
+            col.skip(
+                Check::Norms,
+                "product-quantized codes hold no exact vectors to measure; the field's float32 vectors are in its .vec",
             );
             return;
         }

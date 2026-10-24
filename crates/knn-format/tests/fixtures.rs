@@ -135,7 +135,7 @@ fn synthetic_fixtures_match_faiss_python() {
         assert_eq!(parsed.trailing, 0, "{name}: parses to the end");
 
         let idx = &parsed.index;
-        let hnsw = &idx.index;
+        let hnsw = idx.hnsw().unwrap();
         assert_eq!(hnsw.fourcc, FourCc::HNSW_FLAT, "{name}");
         let storage = *hnsw
             .storage
@@ -253,9 +253,10 @@ fn real_fixtures_parse_and_verify() {
         assert_eq!(parsed.trailing, 0, "{name}");
 
         let idx = &parsed.index;
-        assert_eq!(idx.index.fourcc, FourCc::HNSW_FLAT, "{name}");
+        assert_eq!(idx.index.fourcc(), FourCc::HNSW_FLAT, "{name}");
         let storage = *idx
-            .index
+            .hnsw()
+            .unwrap()
             .storage
             .as_ref()
             .and_then(Storage::flat)
@@ -270,11 +271,12 @@ fn real_fixtures_parse_and_verify() {
         assert_eq!(idx.header.d as usize, m.dimension, "{name}");
         assert_eq!(idx.header.ntotal as usize, m.count, "{name}");
         assert_eq!(
-            idx.index.graph.ef_search, 100,
+            idx.hnsw().unwrap().graph.ef_search,
+            100,
             "{name}: k-NN's default ef_search"
         );
-        assert_eq!(idx.index.graph.ef_construction, 100, "{name}");
-        assert_eq!(idx.index.graph.m(), Some(16), "{name}");
+        assert_eq!(idx.hnsw().unwrap().graph.ef_construction, 100, "{name}");
+        assert_eq!(idx.hnsw().unwrap().graph.m(), Some(16), "{name}");
 
         let ids: Vec<i64> = idx.id_map.iter().map(|v| v.get()).collect();
         let identity: Vec<i64> = (0..m.count as i64).collect();
@@ -389,7 +391,7 @@ fn absurd_count_is_rejected_before_any_allocation() {
 fn neighbors_of_stays_inside_the_node() {
     let bytes = fs::read(fixtures().join("synthetic/l2-100x4.faiss")).unwrap();
     let parsed = knn_format::parse(&bytes).unwrap();
-    let g = &parsed.index.index.graph;
+    let g = &parsed.index.hnsw().unwrap().graph;
     let cum: Vec<usize> = g
         .cum_nneighbor_per_level
         .iter()

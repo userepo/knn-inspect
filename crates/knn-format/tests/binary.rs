@@ -82,7 +82,9 @@ struct Manifest {
 fn binary<'a>(storage: Option<Storage<'a>>, name: &str) -> BinaryStorage<'a> {
     match storage {
         Some(Storage::Binary(s)) => s,
-        Some(Storage::Flat(_) | Storage::Sq(_)) | None => panic!("{name}: expected binary storage"),
+        Some(Storage::Flat(_) | Storage::Sq(_) | Storage::Pq(_)) | None => {
+            panic!("{name}: expected binary storage")
+        }
     }
 }
 
@@ -117,11 +119,11 @@ fn synthetic_fixtures_match_faiss_python() {
         let layout: Vec<String> = idx.layout().iter().map(ToString::to_string).collect();
         assert_eq!(layout, e.layout, "{name}: layout");
         assert_eq!(idx.fourcc, FourCc::BINARY_ID_MAP, "{name}");
-        assert_eq!(idx.index.fourcc, FourCc::BINARY_HNSW, "{name}");
-        let storage = binary(idx.index.storage, name);
+        assert_eq!(idx.index.fourcc(), FourCc::BINARY_HNSW, "{name}");
+        let storage = binary(idx.hnsw().unwrap().storage, name);
         for (what, header) in [
             ("idmap", &idx.header),
-            ("hnsw", &idx.index.header),
+            ("hnsw", &idx.hnsw().unwrap().header),
             ("storage", &storage.header),
         ] {
             assert_eq!(header.d, e.dimension, "{name}: {what} dimension");
@@ -143,7 +145,7 @@ fn synthetic_fixtures_match_faiss_python() {
             assert_eq!(header.metric(), Metric::Hamming, "{name}: {what} metric");
         }
 
-        let g = &idx.index.graph;
+        let g = &idx.hnsw().unwrap().graph;
         assert_eq!(g.m(), Some(e.hnsw.m), "{name}: M");
         assert_eq!(g.ef_construction, e.hnsw.ef_construction, "{name}");
         assert_eq!(g.ef_search, e.hnsw.ef_search, "{name}");
@@ -182,7 +184,7 @@ fn synthetic_fixtures_match_faiss_python() {
 
         // The storage-agnostic accessors agree, counting bytes; bits have
         // no float32 value.
-        let all = &idx.index.storage.unwrap();
+        let all = &idx.hnsw().unwrap().storage.unwrap();
         assert_eq!(all.fourcc(), FourCc::BINARY_FLAT);
         assert_eq!(all.component_size(), 1);
         assert_eq!(all.component_count(), e.codes.bytes);
@@ -221,9 +223,9 @@ fn real_binary_fields_parse_and_match_lucene() {
             FourCc::BINARY_FLAT
         ]
     );
-    let storage = binary(idx.index.storage, &name);
+    let storage = binary(idx.hnsw().unwrap().storage, &name);
     let code_size = m.dimension / 8;
-    for header in [&idx.header, &idx.index.header, &storage.header] {
+    for header in [&idx.header, &idx.hnsw().unwrap().header, &storage.header] {
         assert_eq!(header.d as usize, m.dimension, "{name}");
         assert_eq!(header.ntotal as usize, m.count, "{name}");
         // k-NN leaves Faiss's default metric type, which a binary index
@@ -237,9 +239,9 @@ fn real_binary_fields_parse_and_match_lucene() {
         assert_eq!(header.metric(), Metric::Hamming, "{name}");
     }
     assert_eq!(storage.codes.len(), m.count * code_size, "{name}");
-    assert_eq!(idx.index.graph.ef_search, 100, "{name}");
-    assert_eq!(idx.index.graph.ef_construction, 100, "{name}");
-    assert_eq!(idx.index.graph.m(), Some(16), "{name}");
+    assert_eq!(idx.hnsw().unwrap().graph.ef_search, 100, "{name}");
+    assert_eq!(idx.hnsw().unwrap().graph.ef_construction, 100, "{name}");
+    assert_eq!(idx.hnsw().unwrap().graph.m(), Some(16), "{name}");
     let ids: Vec<i64> = idx.id_map.iter().map(|v| v.get()).collect();
     let identity: Vec<i64> = (0..i64::try_from(m.count).unwrap()).collect();
     assert_eq!(ids, identity, "{name}: labels are doc ids");
@@ -281,7 +283,7 @@ fn a_binary_encoder_field_writes_the_same_layout_over_quantized_bits() {
             FourCc::BINARY_FLAT
         ]
     );
-    let storage = binary(idx.index.storage, "binary-encoder");
+    let storage = binary(idx.hnsw().unwrap().storage, "binary-encoder");
     assert_eq!(storage.header.d as usize, m.dimension);
     assert_eq!(storage.header.code_size(), Some(2));
     assert_eq!(storage.row_count(), m.count);
@@ -313,17 +315,17 @@ fn an_on_disk_graph_parses_without_its_vectors() {
         idx.layout(),
         [FourCc::BINARY_ID_MAP, FourCc::BINARY_HNSW, FourCc::NULL]
     );
-    assert!(idx.index.storage.is_none());
-    for header in [&idx.header, &idx.index.header] {
+    assert!(idx.hnsw().unwrap().storage.is_none());
+    for header in [&idx.header, &idx.hnsw().unwrap().header] {
         assert_eq!(header.d as usize, m.dimension);
         assert_eq!(header.ntotal as usize, m.count);
         assert_eq!(header.metric_type, 1, "l2");
     }
     assert_eq!(idx.header.code_size(), Some(2));
-    assert_eq!(idx.index.header.code_size(), Some(18));
+    assert_eq!(idx.hnsw().unwrap().header.code_size(), Some(18));
     assert_eq!(idx.code_size(), Some(18), "the graph's, not the id map's");
     assert_eq!(idx.metric(), Metric::L2);
-    assert_eq!(idx.index.graph.node_count(), m.count);
+    assert_eq!(idx.hnsw().unwrap().graph.node_count(), m.count);
     assert_eq!(idx.id_map.len(), m.count);
     // A merged segment's labels are its doc ids.
     assert!(
@@ -358,10 +360,13 @@ fn a_graph_without_its_vectors_keeps_the_rest_of_the_file() {
     let graph_only = small_graph_only();
     let full = knn_format::parse(&bytes).unwrap();
     let parsed = knn_format::parse(&graph_only).unwrap();
-    assert!(parsed.index.index.storage.is_none());
+    assert!(parsed.index.hnsw().unwrap().storage.is_none());
     assert_eq!(parsed.index.layout()[2], FourCc::NULL);
     // The graph and the labels are read as they are with the storage.
-    let (a, b) = (&full.index.index.graph, &parsed.index.index.graph);
+    let (a, b) = (
+        &full.index.hnsw().unwrap().graph,
+        &parsed.index.hnsw().unwrap().graph,
+    );
     assert_eq!(a.levels.as_bytes(), b.levels.as_bytes());
     assert_eq!(a.offsets.as_bytes(), b.offsets.as_bytes());
     assert_eq!(a.neighbors.as_bytes(), b.neighbors.as_bytes());
@@ -422,7 +427,7 @@ fn malformed_binary_files_are_errors_not_panics() {
     // Binary and float tags do not mix: each layout is read as k-NN writes
     // it.
     for (at, tag, expected) in [
-        (hnsw, b"IHNf", "IBHf or IBHc"),
+        (hnsw, b"IHNf", "IBHf, IBHc, or IBwF"),
         (storage, b"IxF2", "IBxF or null"),
     ] {
         let mut b = bytes.clone();
@@ -468,7 +473,7 @@ fn malformed_binary_files_are_errors_not_panics() {
         matches!(
             err,
             Error::UnsupportedLayout {
-                expected: "IHNf, IHNs, IHc2, or IHNc",
+                expected: "IHNf, IHNs, IHNp, IHc2, IHNc, IwFl, IwSq, or IwPQ",
                 ..
             }
         ),
@@ -509,7 +514,7 @@ fn a_zero_code_size_holds_no_rows() {
     let (_, storage) = fourcc_offsets(&bytes);
     bytes[storage + 8..storage + 12].copy_from_slice(&0_i32.to_le_bytes());
     let parsed = knn_format::parse(&bytes).unwrap();
-    let s = binary(parsed.index.index.storage, "zero code size");
+    let s = binary(parsed.index.hnsw().unwrap().storage, "zero code size");
     assert_eq!(s.code_size(), None);
     assert_eq!(s.row_count(), 0);
     assert!(s.row(0).is_none());

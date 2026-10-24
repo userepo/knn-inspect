@@ -287,7 +287,7 @@ fn nothing_on_a_cagra_graphs_upper_levels_fails() {
     // the statistics have one layer.
     let bytes = read("cagra-max-level-set.faiss");
     let parsed = knn_format::parse(&bytes).unwrap();
-    let index = &parsed.index.index;
+    let index = parsed.index.hnsw().unwrap();
     assert_eq!(index.graph.max_level, 3);
     assert!(index.graph.searched_levels() > 1);
     assert_eq!(index.level_counts(), vec![100]);
@@ -316,7 +316,7 @@ fn byte_storage_in_a_cosine_field_warns_and_skips_norms() {
         "{metric:#?}"
     );
     let parsed = knn_format::parse(&bytes).unwrap();
-    let knn_format::faiss::Storage::Sq(sq) = parsed.index.index.storage.unwrap() else {
+    let knn_format::faiss::Storage::Sq(sq) = parsed.index.hnsw().unwrap().storage.unwrap() else {
         panic!("byte storage");
     };
     assert_eq!(metric.findings[0].offset, Some(sq.quantizer.offset));
@@ -399,6 +399,12 @@ fn real_fixtures_are_clean_with_their_space() {
         "opensearch-3.9.0-remote/byte",
         "opensearch-3.9.0-remote/binary",
         "opensearch-3.9.0-remote/on-disk",
+        "opensearch-3.9.0-trained/ivf-flat",
+        "opensearch-3.9.0-trained/ivf-sq-fp16",
+        "opensearch-3.9.0-trained/ivf-pq",
+        "opensearch-3.9.0-trained/hnsw-pq",
+        "opensearch-3.9.0-trained/ivf-byte",
+        "opensearch-3.9.0-trained/ivf-binary",
     ] {
         for entry in fs::read_dir(fixtures().join(set)).unwrap() {
             let dir = entry.unwrap().path();
@@ -418,7 +424,10 @@ fn real_fixtures_are_clean_with_their_space() {
             let remote = set.starts_with("opensearch-3.9.0-remote");
             let parsed = knn_format::parse(&bytes).unwrap();
             assert_eq!(
-                parsed.index.index.kind.cagra().is_some(),
+                parsed
+                    .index
+                    .hnsw()
+                    .is_some_and(|h| h.kind.cagra().is_some()),
                 remote,
                 "{}",
                 dir.display()
@@ -436,8 +445,8 @@ fn real_fixtures_are_clean_with_their_space() {
         }
     }
     assert_eq!(
-        seen, 33,
-        "six float, six fp16, three bf16, two byte, one binary, one binary-encoder, eight on_disk, and six remote-built real fixtures"
+        seen, 41,
+        "six float, six fp16, three bf16, two byte, one binary, one binary-encoder, eight on_disk, six remote-built, and eight trained real fixtures"
     );
 }
 
@@ -1113,9 +1122,11 @@ fn scalar_quantized_norms_are_checked_on_the_decoded_codes() {
     ] {
         let bytes = fs::read(fixtures().join(file)).unwrap();
         let parsed = knn_format::parse(&bytes).unwrap();
-        let codes =
-            knn_format::view_offset(&bytes, parsed.index.index.storage.unwrap().code_bytes())
-                .unwrap();
+        let codes = knn_format::view_offset(
+            &bytes,
+            parsed.index.hnsw().unwrap().storage.unwrap().code_bytes(),
+        )
+        .unwrap();
         let row_bytes = 2 * usize::try_from(parsed.index.header.d).unwrap();
 
         let mut scaled = bytes.clone();
@@ -1165,7 +1176,7 @@ fn rows_are_walked_by_the_storage_dimension() {
         let mut bytes = fs::read(fixtures().join(file)).unwrap();
         let (codes, size) = {
             let parsed = knn_format::parse(&bytes).unwrap();
-            let storage = &parsed.index.index.storage.unwrap();
+            let storage = &parsed.index.hnsw().unwrap().storage.unwrap();
             (
                 knn_format::view_offset(&bytes, storage.code_bytes()).unwrap(),
                 storage.component_size(),
@@ -1242,4 +1253,402 @@ fn a_binary_metric_type_only_warns_even_when_headers_disagree() {
         headers.findings[0].message,
         "hnsw header code size 99 differs from the id map's 2"
     );
+}
+
+#[test]
+fn trained_indexes_verify_clean_with_every_check_that_applies() {
+    // The IVF indexes k-NN writes through a model get every check but the
+    // graph's, which say they have no graph; the values check reads the
+    // float centroids and codes, so only binary indexes skip it, and the
+    // norms check runs for cosine over float32, fp16, and bf16 codes. An
+    // HNSW graph over product-quantized codes gets every graph check and
+    // the product quantizer's centroids checked; its codes hold no exact
+    // vectors to measure, and it has no inverted lists.
+    let mut ivf = 0;
+    let mut pq_graphs = 0;
+    for entry in fs::read_dir(fixtures().join("synthetic-ivf")).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_none_or(|e| e != "faiss") {
+            continue;
+        }
+        let name = path.file_name().unwrap().to_str().unwrap().to_owned();
+        let bytes = fs::read(&path).unwrap();
+        let space = if name.contains("hamming") {
+            Some(Space::Hamming)
+        } else if name.starts_with("ivf-ip") || name.starts_with("hnsw-ip") {
+            Some(Space::Cosine)
+        } else {
+            Some(Space::L2)
+        };
+        let report = knn_check::verify(&bytes, &options(space));
+        assert_eq!(report.status, Status::Clean, "{name}: {report:#?}");
+        let parsed = knn_format::parse(&bytes).unwrap();
+        let skipped = |check: Check| report.result(check).unwrap().skipped.clone();
+        if parsed.index.ivf().is_some() {
+            ivf += 1;
+            for r in &report.checks {
+                let graph = matches!(
+                    r.check,
+                    Check::Offsets
+                        | Check::Levels
+                        | Check::EntryPoint
+                        | Check::NeighborIds
+                        | Check::NeighborLevels
+                        | Check::DuplicateNeighbors
+                        | Check::SelfLoops
+                );
+                if graph {
+                    assert_eq!(
+                        r.skipped.as_deref(),
+                        Some("an IVF index has no graph"),
+                        "{name}: {r:#?}"
+                    );
+                }
+            }
+            for check in [
+                Check::Headers,
+                Check::Metric,
+                Check::VectorCount,
+                Check::InvertedLists,
+                Check::DirectMap,
+                Check::IdMapLength,
+            ] {
+                assert_eq!(skipped(check), None, "{name}: {check:?}");
+            }
+            let binary = name.starts_with("bivf");
+            assert_eq!(
+                skipped(Check::VectorValues).is_some(),
+                binary,
+                "{name}: values"
+            );
+            let measured = space == Some(Space::Cosine) && !name.contains("pq");
+            assert_eq!(skipped(Check::Norms).is_none(), measured, "{name}: norms");
+        } else {
+            pq_graphs += 1;
+            assert_eq!(skipped(Check::VectorValues), None, "{name}: centroids");
+            if space == Some(Space::Cosine) {
+                assert!(
+                    skipped(Check::Norms).is_some_and(|why| why.contains("hold no exact vectors")),
+                    "{name}"
+                );
+            }
+            for check in [Check::InvertedLists, Check::DirectMap] {
+                assert!(
+                    skipped(check).is_some_and(|why| why.contains("is a graph")),
+                    "{name}: {check:?}"
+                );
+            }
+            for check in [
+                Check::Headers,
+                Check::Metric,
+                Check::Offsets,
+                Check::Levels,
+                Check::EntryPoint,
+                Check::NeighborIds,
+                Check::NeighborLevels,
+                Check::VectorCount,
+                Check::IdMapLength,
+                Check::DuplicateNeighbors,
+                Check::SelfLoops,
+            ] {
+                let r = report.result(check).unwrap();
+                assert!(r.skipped.is_none() && r.count == 0, "{name}: {r:#?}");
+            }
+        }
+    }
+    assert_eq!((ivf, pq_graphs), (12, 2));
+}
+
+#[test]
+fn product_quantized_codes_are_counted_by_the_code_size() {
+    // `count x code_size` bytes, as Faiss reads them; one code short
+    // fails the count, naming the codes.
+    let path = fixtures().join("synthetic-ivf/hnsw-l2-1000x32-pq4.faiss");
+    let bytes = fs::read(&path).unwrap();
+    let parsed = knn_format::parse(&bytes).unwrap();
+    let knn_format::faiss::Storage::Pq(pq) = parsed.index.hnsw().unwrap().storage.unwrap() else {
+        panic!("product-quantized storage");
+    };
+    let codes = knn_format::view_offset(&bytes, pq.codes).unwrap();
+    assert_eq!(pq.codes.len(), 4000);
+    let mut short = bytes[..codes - 8].to_vec();
+    short.extend_from_slice(&3996_u64.to_le_bytes());
+    short.extend_from_slice(&bytes[codes..codes + 3996]);
+    short.extend_from_slice(&bytes[codes + 4000..]);
+    let report = knn_check::verify(&short, &options(Some(Space::L2)));
+    assert_eq!(report.status, Status::Failed, "{report:#?}");
+    let count = report.result(Check::VectorCount).unwrap();
+    assert_eq!(count.severity, Some(Severity::Failure), "{count:#?}");
+    assert_eq!(
+        count.findings[0].message,
+        "storage holds 3996 bytes of product-quantized codes; 1000 vectors in codes of 4 bytes need 4000"
+    );
+    assert_eq!(count.findings[0].offset, Some(pq.header.offset));
+}
+
+#[test]
+fn an_ivf_index_is_held_to_the_space_it_records() {
+    // The metric is the IVF header's; binary codes compute Hamming
+    // distance and take any space with a note, as binary storage does;
+    // byte codes in a cosine field carry the byte note.
+    let read = |name: &str| fs::read(fixtures().join("synthetic-ivf").join(name)).unwrap();
+    let l2 = read("ivf-l2-1000x32-flat.faiss");
+    let report = knn_check::verify(&l2, &options(Some(Space::InnerProduct)));
+    assert_eq!(report.status, Status::Failed, "{report:#?}");
+    let metric = report.result(Check::Metric).unwrap();
+    assert_eq!(metric.severity, Some(Severity::Failure));
+    assert_eq!(
+        metric.findings[0].message,
+        "file records metric l2, but an innerproduct field needs inner_product"
+    );
+    let parsed = knn_format::parse(&l2).unwrap();
+    assert_eq!(
+        metric.findings[0].offset,
+        Some(parsed.index.ivf().unwrap().header.offset)
+    );
+    assert_eq!(
+        knn_check::verify(&l2, &options(Some(Space::L2))).status,
+        Status::Clean
+    );
+
+    let ip = read("ivf-ip-1000x32-pq8x8.faiss");
+    assert_eq!(
+        knn_check::verify(&ip, &options(Some(Space::Cosine))).status,
+        Status::Clean
+    );
+    let report = knn_check::verify(&ip, &options(Some(Space::Hamming)));
+    let metric = report.result(Check::Metric).unwrap();
+    assert!(
+        metric.findings[0].message.contains("needs hamming"),
+        "{metric:#?}"
+    );
+
+    let binary = read("bivf-hamming-100x16.faiss");
+    let report = knn_check::verify(&binary, &options(Some(Space::L2)));
+    assert_eq!(report.status, Status::Clean, "{report:#?}");
+    let metric = report.result(Check::Metric).unwrap();
+    assert_eq!(metric.severity, Some(Severity::Info), "{metric:#?}");
+    assert!(
+        metric.findings[0]
+            .message
+            .starts_with("binary codes in an l2 field: "),
+        "{metric:#?}"
+    );
+
+    let byte = read("ivf-l2-1000x32-byte.faiss");
+    let report = knn_check::verify(&byte, &options(Some(Space::Cosine)));
+    let metric = report.result(Check::Metric).unwrap();
+    assert_eq!(metric.severity, Some(Severity::Failure), "{metric:#?}");
+    assert!(
+        metric.findings[0]
+            .message
+            .contains("refuses cosinesimil for byte fields"),
+        "{metric:#?}"
+    );
+}
+
+fn put_u64(bytes: &mut [u8], at: usize, value: u64) {
+    bytes[at..at + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+fn first_finding(report: &knn_check::Report, check: Check) -> (Severity, String, Option<usize>) {
+    let r = report.result(check).unwrap();
+    let f = &r.findings[0];
+    (r.severity.unwrap(), f.message.clone(), f.offset)
+}
+
+#[test]
+fn ivf_findings_point_at_their_fields() {
+    // The product-quantized IVF fixture, each field changed in turn: the
+    // finding names it and points at it.
+    let bytes = fs::read(fixtures().join("synthetic-ivf/ivf-l2-1000x32-pq4x8.faiss")).unwrap();
+    let parsed = knn_format::parse(&bytes).unwrap();
+    let ivf = parsed.index.ivf().unwrap();
+    let knn_format::faiss::IvfEncoding::Pq { pq, .. } = ivf.encoding else {
+        panic!("product-quantized lists");
+    };
+    let nprobe = ivf.quantizer.header().offset - 8;
+    let code_size = pq.offset - 8;
+    let residual = pq.offset - 9;
+    let check = |b: &[u8]| knn_check::verify(b, &options(Some(Space::L2)));
+
+    let mut zero = bytes.clone();
+    put_u64(&mut zero, nprobe, 0);
+    let (severity, message, at) = first_finding(&check(&zero), Check::Headers);
+    assert_eq!(severity, Severity::Failure);
+    assert!(
+        message.starts_with("nprobe 0: k-NN searches by it"),
+        "{message}"
+    );
+    assert_eq!(at, Some(nprobe));
+    // k-NN casts it to an int: 2^32 is 0 there too, and 2^31 and 2^32 - 1
+    // negative, which Faiss's float IVF search refuses; 2^32 + 1 is 1.
+    for (value, status) in [
+        (1_u64 << 32, Status::Failed),
+        (1 << 31, Status::Failed),
+        (u64::from(u32::MAX), Status::Failed),
+        ((1 << 32) + 1, Status::Clean),
+    ] {
+        let mut cast = bytes.clone();
+        put_u64(&mut cast, nprobe, value);
+        assert_eq!(check(&cast).status, status, "nprobe {value}");
+    }
+
+    // 8 sub-quantizers of 8 bits take 8-byte codes, where the index and
+    // its lists keep 4: the table still holds 32 x 256 floats, so only
+    // the code size disagrees, and fails at the index's field.
+    let mut sized = bytes.clone();
+    put_u64(&mut sized, pq.offset + 8, 8);
+    let report = check(&sized);
+    let headers = report.result(Check::Headers).unwrap();
+    assert_eq!(headers.severity, Some(Severity::Failure), "{headers:#?}");
+    assert_eq!(headers.count, 1, "{headers:#?}");
+    assert_eq!(
+        headers.findings[0].message,
+        "code size 4 is not its product quantizer's 8: 8 sub-quantizers of 8 bits"
+    );
+    assert_eq!(headers.findings[0].offset, Some(code_size));
+
+    let mut not_residual = bytes.clone();
+    not_residual[residual] = 0;
+    let report = check(&not_residual);
+    assert_eq!(report.status, Status::Warnings, "{report:#?}");
+    let (severity, message, at) = first_finding(&report, Check::Headers);
+    assert_eq!(severity, Severity::Warning);
+    assert!(message.starts_with("by_residual is off"), "{message}");
+    assert_eq!(at, Some(residual));
+
+    // A product quantizer of another dimension than the index: 16 still
+    // divides by its 4 sub-quantizers, and its table is then too large.
+    let mut narrow = bytes.clone();
+    put_u64(&mut narrow, pq.offset, 16);
+    let report = check(&narrow);
+    let headers = report.result(Check::Headers).unwrap();
+    assert_eq!(headers.severity, Some(Severity::Failure));
+    assert_eq!(
+        headers.findings[0].message,
+        "product quantizer dimension 16 differs from the id map's 32"
+    );
+    assert_eq!(headers.findings[0].offset, Some(pq.offset));
+    assert!(
+        headers.findings[1]
+            .message
+            .starts_with("product quantizer holds 8192 centroid floats"),
+        "{headers:#?}"
+    );
+    assert_eq!(headers.findings[1].offset, Some(pq.offset + 24));
+
+    // A direct map entry of -1: a vector in no list.
+    let dm = ivf.direct_map.array;
+    let at = knn_format::view_offset(&bytes, dm).unwrap();
+    let mut unset = bytes.clone();
+    unset[at..at + 8].copy_from_slice(&(-1_i64).to_le_bytes());
+    let (severity, message, offset) = first_finding(&check(&unset), Check::DirectMap);
+    assert_eq!(severity, Severity::Warning);
+    assert_eq!(message, "the direct map puts vector 0 in no list (-1)");
+    assert_eq!(offset, Some(at));
+}
+
+#[test]
+fn a_binary_ivf_nprobe_is_held_to_what_k_nn_reads() {
+    // A binary index, the same: 2^31 is negative as an int.
+    let binary = fs::read(fixtures().join("synthetic-ivf/bivf-hamming-100x16.faiss")).unwrap();
+    let at = {
+        let parsed = knn_format::parse(&binary).unwrap();
+        parsed.index.ivf().unwrap().quantizer.header().offset - 8
+    };
+    for (value, status) in [
+        (1_u64 << 31, Status::Failed),
+        (u64::from(u32::MAX), Status::Failed),
+        (1 << 32, Status::Failed),
+        ((1 << 32) + 1, Status::Clean),
+    ] {
+        let mut cast = binary.clone();
+        put_u64(&mut cast, at, value);
+        let report = knn_check::verify(&cast, &options(Some(Space::Hamming)));
+        assert_eq!(report.status, status, "binary nprobe {value}: {report:#?}");
+        if status == Status::Failed {
+            let (_, message, _) = first_finding(&report, Check::Headers);
+            assert!(
+                message.contains("Faiss's binary IVF search then finds nothing"),
+                "{message}"
+            );
+        }
+    }
+    // A stored 0 fails every search of a binary index, nprobes or not.
+    let mut zero = binary.clone();
+    put_u64(&mut zero, at, 0);
+    let report = knn_check::verify(&zero, &options(Some(Space::Hamming)));
+    let (severity, message, offset) = first_finding(&report, Check::Headers);
+    assert_eq!(severity, Severity::Failure);
+    assert_eq!(
+        message,
+        "nprobe 0: k-NN's binary IVF search requires the stored value above 0, so every search fails, nprobes or not"
+    );
+    assert_eq!(offset, Some(at));
+}
+
+#[test]
+fn a_graphs_product_quantizer_is_checked_as_an_ivf_indexs() {
+    let bytes = fs::read(fixtures().join("synthetic-ivf/hnsw-l2-1000x32-pq4.faiss")).unwrap();
+    let parsed = knn_format::parse(&bytes).unwrap();
+    let Some(knn_format::faiss::Storage::Pq(s)) = parsed.index.hnsw().unwrap().storage else {
+        panic!("product-quantized storage");
+    };
+    let check = |b: &[u8]| knn_check::verify(b, &options(Some(Space::L2)));
+    // 7 bits keep the 4-byte codes and size a table of half the floats.
+    let mut short = bytes.clone();
+    put_u64(&mut short, s.pq.offset + 16, 7);
+    let (severity, message, at) = first_finding(&check(&short), Check::Headers);
+    assert_eq!(severity, Severity::Failure);
+    assert!(
+        message.starts_with(
+            "product quantizer holds 8192 centroid floats; 4 sub-quantizers of 128 centroids"
+        ),
+        "{message}"
+    );
+    assert_eq!(at, Some(s.pq.offset + 24));
+    let centroids = knn_format::view_offset(&bytes, s.pq.centroids).unwrap();
+    let mut nan = bytes.clone();
+    nan[centroids + 4..centroids + 8].copy_from_slice(&f32::NAN.to_le_bytes());
+    let report = check(&nan);
+    assert_eq!(report.status, Status::Warnings, "{report:#?}");
+    let (severity, message, at) = first_finding(&report, Check::VectorValues);
+    assert_eq!(severity, Severity::Warning);
+    assert_eq!(message, "product quantizer centroid 0 component 1 is NaN");
+    assert_eq!(at, Some(centroids + 4));
+}
+
+#[test]
+fn an_ivf_indexs_float_codes_are_held_to_unit_length() {
+    // The inner-product flat fixture holds unit vectors: one set to zeros,
+    // one scaled, each warns, at its code.
+    let bytes = fs::read(fixtures().join("synthetic-ivf/ivf-ip-1000x32-flat.faiss")).unwrap();
+    let parsed = knn_format::parse(&bytes).unwrap();
+    let ivf = parsed.index.ivf().unwrap();
+    let list = ivf.lists.lists().next().unwrap();
+    let codes = knn_format::view_offset(&bytes, list.codes).unwrap();
+    let (first, second) = (list.ids[0].get(), list.ids[1].get());
+    let row = 32 * 4;
+    let mut changed = bytes.clone();
+    changed[codes..codes + row].fill(0);
+    for c in 0..32 {
+        let at = codes + row + 4 * c;
+        let x = f32::from_le_bytes(changed[at..at + 4].try_into().unwrap());
+        changed[at..at + 4].copy_from_slice(&(2.0 * x).to_le_bytes());
+    }
+    let report = knn_check::verify(&changed, &options(Some(Space::Cosine)));
+    let norms = report.result(Check::Norms).unwrap();
+    assert_eq!(norms.severity, Some(Severity::Warning), "{norms:#?}");
+    assert_eq!(norms.count, 2);
+    assert_eq!(
+        norms.findings[0].message,
+        format!("vector {first} is all zeros; cosine distance to it is undefined")
+    );
+    assert_eq!(norms.findings[0].offset, Some(codes));
+    assert_eq!(
+        norms.findings[1].message,
+        format!("vector {second} has length 2.000000, not 1")
+    );
+    assert_eq!(norms.findings[1].offset, Some(codes + row));
 }

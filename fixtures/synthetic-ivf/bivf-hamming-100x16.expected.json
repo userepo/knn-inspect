@@ -1,0 +1,90 @@
+{
+  "file": "bivf-hamming-100x16.faiss",
+  "size": 2788,
+  "faiss_version": "1.15.1",
+  "seed": 20261013,
+  "description": "BIVF4",
+  "layout": [
+    "IBMp",
+    "IBwF",
+    "IBxF",
+    "ilar"
+  ],
+  "method": "ivf",
+  "encoding": "binary",
+  "dimension": 16,
+  "count": 100,
+  "trained_on": 100,
+  "metric": "hamming",
+  "faiss_metric_type": 1,
+  "code_size": 2,
+  "is_trained": true,
+  "template": {
+    "size": 123,
+    "crc32": 2815322996
+  },
+  "ivf": {
+    "nlist": 4,
+    "nprobe": 1,
+    "code_size": 2,
+    "by_residual": null,
+    "quantizer": {
+      "fourcc": "IBxF",
+      "ntotal": 4,
+      "d": 16,
+      "code_size": 2,
+      "metric_type": 1,
+      "is_trained": true,
+      "centroids_crc32": 1037294976,
+      "first_centroid": [
+        149,
+        9
+      ]
+    },
+    "direct_map": {
+      "type": 1,
+      "len": 100,
+      "crc32": 348142692,
+      "first": [
+        0,
+        0
+      ]
+    },
+    "lists": {
+      "encoding": "full",
+      "nlist": 4,
+      "code_size": 2,
+      "sizes": [
+        25,
+        28,
+        21,
+        26
+      ],
+      "total": 100,
+      "non_empty": 4,
+      "codes_bytes": 200,
+      "codes_crc32": 3477761308,
+      "ids_crc32": 769663079,
+      "first_ids": [
+        0,
+        3,
+        9,
+        13,
+        14,
+        28,
+        32,
+        37
+      ]
+    }
+  },
+  "ids": {
+    "len": 100,
+    "first": 1000,
+    "last": 1099,
+    "crc32": 1526159279
+  },
+  "vectors_first": [
+    183,
+    125
+  ]
+}

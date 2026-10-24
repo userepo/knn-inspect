@@ -13,7 +13,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use knn_check::{base_level_stats, graph_stats, index_stats};
+use knn_check::{base_level_stats, graph_stats, index_stats, ivf_stats};
 use knn_format::faiss::HnswGraph;
 use knn_format::{F64, I32, U64};
 
@@ -23,7 +23,7 @@ fn fixtures() -> PathBuf {
 
 /// Every baseline: `<name>.stats.json` beside each synthetic fixture,
 /// `stats.json` beside each real one, float, fp16, bf16, byte, binary,
-/// CAGRA, and a graph without its vectors.
+/// CAGRA, product-quantized, and a graph without its vectors.
 fn baselines() -> Vec<PathBuf> {
     let mut out = Vec::new();
     for synthetic in [
@@ -33,6 +33,7 @@ fn baselines() -> Vec<PathBuf> {
         "synthetic-byte",
         "synthetic-binary",
         "synthetic-cagra",
+        "synthetic-ivf",
     ] {
         for entry in fs::read_dir(fixtures().join(synthetic)).unwrap() {
             let p = entry.unwrap().path();
@@ -59,6 +60,12 @@ fn baselines() -> Vec<PathBuf> {
         "opensearch-3.9.0-remote/byte",
         "opensearch-3.9.0-remote/binary",
         "opensearch-3.9.0-remote/on-disk",
+        "opensearch-3.9.0-trained/ivf-flat",
+        "opensearch-3.9.0-trained/ivf-sq-fp16",
+        "opensearch-3.9.0-trained/ivf-pq",
+        "opensearch-3.9.0-trained/hnsw-pq",
+        "opensearch-3.9.0-trained/ivf-byte",
+        "opensearch-3.9.0-trained/ivf-binary",
     ] {
         for entry in fs::read_dir(fixtures().join(set)).unwrap() {
             out.push(entry.unwrap().path().join("stats.json"));
@@ -71,6 +78,7 @@ fn baselines() -> Vec<PathBuf> {
 #[test]
 fn stats_match_faiss_python() {
     let mut seen = 0;
+    let mut ivf_seen = 0;
     let mut unreachable_seen = 0;
     for baseline in baselines() {
         let mut expected: serde_json::Value =
@@ -85,7 +93,20 @@ fn stats_match_faiss_python() {
 
         let bytes = fs::read(&file).unwrap();
         let parsed = knn_format::parse(&bytes).unwrap();
-        let index = &parsed.index.index;
+        if let Some(ivf) = parsed.index.ivf() {
+            // The lists' statistics, the imbalance factor to the bit.
+            let stats = ivf_stats(ivf);
+            assert_eq!(
+                serde_json::to_value(&stats).unwrap(),
+                expected,
+                "{}",
+                file.display()
+            );
+            assert_eq!(stats.list_sizes.iter().sum::<u64>(), stats.vectors);
+            ivf_seen += 1;
+            continue;
+        }
+        let index = parsed.index.hnsw().unwrap();
         let stats = index_stats(index);
         assert_eq!(
             serde_json::to_value(&stats).unwrap(),
@@ -102,12 +123,19 @@ fn stats_match_faiss_python() {
         unreachable_seen += stats.layers.iter().map(|l| l.unreachable).sum::<usize>();
         seen += 1;
     }
-    assert_eq!(seen, 57, "24 synthetic and 33 real baselines");
+    assert_eq!(seen, 61, "26 synthetic and 35 real graph baselines");
+    assert_eq!(ivf_seen, 18, "12 synthetic and 6 real IVF baselines");
     // l2-4000x64 has unreachable nodes on levels 0 and 1, and the build of
     // on-disk-16x/l2 one on level 1, so the search itself is compared, not
     // only the empty case. Every node of the CAGRA fixtures is listed by
-    // some other node.
-    assert_eq!(unreachable_seen, 9);
+    // some other node. The graphs over product-quantized codes leave more
+    // behind: one node of hnsw-l2-1000x32-pq4 on level 1, and 40 of
+    // hnsw-ip-1000x32-pq4 on level 0, which the inner-product build over
+    // asymmetric PQ distances links to nothing; and so does k-NN's own
+    // build of the live inner-product field,
+    // opensearch-3.9.0-trained/hnsw-pq/innerproduct,
+    // 69 of its 500 nodes on level 0 and 3 on level 1.
+    assert_eq!(unreachable_seen, 122);
 }
 
 #[test]
@@ -123,8 +151,8 @@ fn a_cagra_graph_has_one_level_and_no_fixed_entry() {
     ] {
         let bytes = fs::read(fixtures().join(format!("synthetic-cagra/{name}.faiss"))).unwrap();
         let parsed = knn_format::parse(&bytes).unwrap();
-        let graph = &parsed.index.index.graph;
-        let stats = index_stats(&parsed.index.index);
+        let graph = &parsed.index.hnsw().unwrap().graph;
+        let stats = index_stats(parsed.index.hnsw().unwrap());
         assert_eq!(stats, base_level_stats(graph), "{name}: the flag decides");
         assert_eq!(stats.entry_point, -1, "{name}");
         assert_eq!(stats.max_level, -1, "{name}");
@@ -156,7 +184,7 @@ fn a_node_no_list_leads_to_is_unreached_from_random_entries() {
     // written (it reports [5] too).
     let bytes = fs::read(fixtures().join("synthetic-cagra/ip-100x64-cagra.faiss")).unwrap();
     let parsed = knn_format::parse(&bytes).unwrap();
-    let graph = &parsed.index.index.graph;
+    let graph = &parsed.index.hnsw().unwrap().graph;
     let start = knn_format::view_offset(&bytes, graph.neighbors).unwrap();
     let mut cut = bytes.clone();
     for (i, v) in graph.neighbors.iter().enumerate() {
@@ -167,7 +195,7 @@ fn a_node_no_list_leads_to_is_unreached_from_random_entries() {
     }
     assert_ne!(cut, bytes, "node 5 was listed");
     let parsed = knn_format::parse(&cut).unwrap();
-    let index = &parsed.index.index;
+    let index = parsed.index.hnsw().unwrap();
     assert!(index.random_entry_points());
     let stats = index_stats(index);
     assert_eq!(stats.layers.len(), 1);
@@ -178,18 +206,27 @@ fn a_node_no_list_leads_to_is_unreached_from_random_entries() {
     assert!(stats.layers[0].edges < 3200);
     // The flag off, k-NN's memory-optimized search still draws random
     // entry points on level 0, so the statistics are the same.
-    let flag = parsed.index.index.kind.cagra().unwrap().offset + 1;
+    let flag = parsed.index.hnsw().unwrap().kind.cagra().unwrap().offset + 1;
     let mut off = cut.clone();
     off[flag] = 0;
     let parsed = knn_format::parse(&off).unwrap();
-    assert!(!parsed.index.index.kind.cagra().unwrap().base_level_only);
-    assert!(parsed.index.index.random_entry_points());
-    let stats = index_stats(&parsed.index.index);
+    assert!(
+        !parsed
+            .index
+            .hnsw()
+            .unwrap()
+            .kind
+            .cagra()
+            .unwrap()
+            .base_level_only
+    );
+    assert!(parsed.index.hnsw().unwrap().random_entry_points());
+    let stats = index_stats(parsed.index.hnsw().unwrap());
     assert_eq!(stats.layers.len(), 1);
     assert_eq!(stats.layers[0].unreachable_nodes, vec![5]);
     // The level arrays are untouched by either splice.
     let levels = |g: &HnswGraph<'_>| g.levels.iter().map(|l| l.get()).collect::<Vec<i32>>();
-    assert_eq!(levels(&parsed.index.index.graph), levels(graph));
+    assert_eq!(levels(&parsed.index.hnsw().unwrap().graph), levels(graph));
 }
 
 #[test]
@@ -389,4 +426,34 @@ fn malformed_graphs_yield_statistics() {
     let stats = graph_stats(&b.graph());
     assert_eq!(stats.layers[0].slots, i64::from(i32::MAX));
     assert!(stats.layers[0].degree_histogram.len() <= 3);
+}
+
+#[test]
+fn past_k_nns_nlist_limit_the_sizes_are_summarized_not_listed() {
+    // The sparse fixture's 16 lists made 20,001, in the IVF header and the
+    // lists' own: the four that hold vectors are still summarized.
+    let mut bytes =
+        fs::read(fixtures().join("synthetic-ivf/ivf-l2-5x4-sparse-flat.faiss")).unwrap();
+    let (ivf_nlist, lists_nlist) = {
+        let parsed = knn_format::parse(&bytes).unwrap();
+        let ivf = parsed.index.ivf().unwrap();
+        (ivf.quantizer.header().offset - 16, ivf.lists.offset + 4)
+    };
+    for at in [ivf_nlist, lists_nlist] {
+        assert_eq!(
+            u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()),
+            16
+        );
+        bytes[at..at + 8].copy_from_slice(&20_001_u64.to_le_bytes());
+    }
+    let parsed = knn_format::parse(&bytes).unwrap();
+    let stats = ivf_stats(parsed.index.ivf().unwrap());
+    assert_eq!(stats.nlist, 20_001);
+    assert_eq!(stats.list_sizes, Vec::<u64>::new());
+    assert_eq!(stats.vectors, 5);
+    assert_eq!(stats.empty_lists, 20_001 - 4);
+    assert_eq!(
+        (stats.list_size_min, stats.list_size_max),
+        (Some(0), Some(2))
+    );
 }

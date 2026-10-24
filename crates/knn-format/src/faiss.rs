@@ -12,6 +12,18 @@
 //! random entry points. bf16 storage under a CAGRA graph, which Faiss
 //! reads but the remote build never writes, is refused.
 //!
+//! The trained indexes k-NN writes through a model (its `ivf` method and
+//! `pq` encoders) are read too, every one a full file with its vectors:
+//! `IxMp` wrapping an IVF (inverted file) index ([`IvfIndex`]: `IwFl`
+//! over float32 codes, `IwSq` over fp16, bf16, or byte codes, or `IwPQ`
+//! over product-quantized codes), each holding its coarse quantizer, a nested
+//! `IxF2` or `IxFI` of the centroids, its direct map, and its inverted
+//! lists (`ilar`); `IxMp` wrapping `IHNp`, an HNSW graph over `IxPq`
+//! product-quantized storage; and `IBMp` wrapping `IBwF`, a binary IVF
+//! index over an `IBxF` quantizer. k-NN's memory-optimized search reads
+//! none of these, so none is ever written without its vectors, and a
+//! `null` under them is refused.
+//!
 //! Every array is a view into the file's bytes. Element types are the
 //! unaligned little-endian wrappers from `zerocopy`; call `.get()` on an
 //! element for its native value. Scalar-quantized and binary codes are
@@ -61,6 +73,29 @@ impl FourCc {
     pub const BINARY_HNSW: Self = Self(*b"IBHf");
     /// `IndexBinaryFlat`.
     pub const BINARY_FLAT: Self = Self(*b"IBxF");
+    /// `IndexHNSWPQ`: an HNSW graph over product-quantized storage, k-NN's
+    /// `hnsw` method with the `pq` encoder.
+    pub const HNSW_PQ: Self = Self(*b"IHNp");
+    /// `IndexPQ`: product-quantized storage, under `IHNp`.
+    pub const PQ: Self = Self(*b"IxPq");
+    /// `IndexIVFFlat`: k-NN's `ivf` method with the `flat` encoder.
+    pub const IVF_FLAT: Self = Self(*b"IwFl");
+    /// `IndexIVFScalarQuantizer`: k-NN's `ivf` method with the `sq`
+    /// encoder, or over a byte field.
+    pub const IVF_SQ: Self = Self(*b"IwSq");
+    /// `IndexIVFPQ`: k-NN's `ivf` method with the `pq` encoder.
+    pub const IVF_PQ: Self = Self(*b"IwPQ");
+    /// `IndexBinaryIVF`: k-NN's `ivf` method over a binary field.
+    pub const BINARY_IVF: Self = Self(*b"IBwF");
+    /// `ArrayInvertedLists`, the inverted lists of an IVF index as k-NN
+    /// writes them (its training path allows no other kind, and never
+    /// writes a template without them).
+    pub const INVERTED_LISTS: Self = Self(*b"ilar");
+    /// The list sizes stored one per list.
+    pub const LISTS_FULL: Self = Self(*b"full");
+    /// The list sizes stored as (list, size) pairs for the non-empty
+    /// lists.
+    pub const LISTS_SPARSE: Self = Self(*b"sprs");
     /// What k-NN's patched `write_index_binary` writes in place of the
     /// storage when it leaves the vectors out of the file, and what
     /// [`IdMapIndex::layout`] names for that storage.
@@ -812,6 +847,177 @@ impl<'a> BinaryStorage<'a> {
     }
 }
 
+/// A product quantizer's parameters (`read_ProductQuantizer`), as `IxPq`
+/// storage and `IwPQ` inverted lists store them. Each vector is cut into
+/// `m` sub-vectors of `d / m` components, and each sub-vector is coded as
+/// the index of the nearest of `2^nbits` centroids trained for that
+/// position; a code is the `m` indexes packed into `(nbits x m + 7) / 8`
+/// bytes, low bits first. k-NN's `pq` encoder pins `nbits` to 8 under
+/// `hnsw` (one byte per sub-vector) and takes any `code_size` under 128
+/// under `ivf`; Faiss refuses more than 24.
+#[derive(Debug, Clone, Copy)]
+pub struct ProductQuantizer<'a> {
+    /// File offset of `d`, the first field.
+    pub offset: usize,
+    /// The dimension, as the quantizer stores it.
+    pub d: u64,
+    /// `M`: sub-quantizers, so sub-vectors per vector. k-NN's `m`.
+    pub m: u64,
+    /// Bits per sub-vector code. k-NN's `code_size`.
+    pub nbits: u64,
+    /// `m x 2^nbits x (d / m)` floats in a well-formed file: for each
+    /// sub-quantizer in turn, its `2^nbits` centroids, each of the
+    /// sub-vector's dimension. Faiss sizes the array from the three
+    /// fields before it reads the stored one, which may differ.
+    pub centroids: &'a [F32],
+}
+
+impl<'a> ProductQuantizer<'a> {
+    /// Reads the quantizer. Faiss's `set_derived_values` refuses a
+    /// sub-quantizer count of 0 or one that does not divide the dimension,
+    /// and more than 24 bits per code, before it reads the centroids; so
+    /// does this.
+    fn read(cur: &mut Cursor<'a>) -> Result<Self> {
+        let offset = cur.offset();
+        let d = cur.u64("product quantizer dimension")?;
+        let m_offset = cur.offset();
+        let m = cur.u64("product quantizer sub-quantizer count")?;
+        let nbits_offset = cur.offset();
+        let nbits = cur.u64("product quantizer bits per code")?;
+        if m == 0 || d % m != 0 {
+            return Err(Error::InvalidValue {
+                offset: m_offset,
+                what: "product quantizer sub-quantizer count",
+                value: i64::try_from(m).unwrap_or(i64::MAX),
+            });
+        }
+        if nbits > 24 {
+            return Err(Error::InvalidValue {
+                offset: nbits_offset,
+                what: "product quantizer bits per code",
+                value: i64::try_from(nbits).unwrap_or(i64::MAX),
+            });
+        }
+        Ok(Self {
+            offset,
+            d,
+            m,
+            nbits,
+            centroids: cur.vector("product quantizer centroids")?,
+        })
+    }
+
+    /// `dsub`: components per sub-vector, `d / m`.
+    #[must_use]
+    pub fn sub_dimension(&self) -> u64 {
+        self.d.checked_div(self.m).unwrap_or(0)
+    }
+
+    /// `ksub`: centroids per sub-quantizer, `2^nbits`.
+    #[must_use]
+    pub fn centroids_per_sub(&self) -> u64 {
+        u32::try_from(self.nbits)
+            .ok()
+            .and_then(|bits| 1_u64.checked_shl(bits))
+            .unwrap_or(u64::MAX)
+    }
+
+    /// Bytes per code, `(nbits x m + 7) / 8`, as Faiss derives it.
+    #[must_use]
+    pub fn code_size(&self) -> u64 {
+        self.nbits
+            .saturating_mul(self.m)
+            .saturating_add(7)
+            .checked_div(8)
+            .unwrap_or(0)
+    }
+
+    /// Floats a well-formed centroid table holds: `d x 2^nbits`, which is
+    /// `m x 2^nbits x dsub`; `None` when that overflows.
+    #[must_use]
+    pub fn expected_centroid_floats(&self) -> Option<u64> {
+        self.d.checked_mul(self.centroids_per_sub())
+    }
+
+    /// Centroid `code` of sub-quantizer `sub`, `dsub` floats, or `None`
+    /// when it is not entirely inside [`Self::centroids`].
+    #[must_use]
+    pub fn centroid(&self, sub: usize, code: usize) -> Option<&'a [F32]> {
+        let ksub = usize::try_from(self.centroids_per_sub()).ok()?;
+        let dsub = usize::try_from(self.sub_dimension()).ok()?;
+        let start = sub
+            .checked_mul(ksub)?
+            .checked_add(code)?
+            .checked_mul(dsub)?;
+        self.centroids.get(start..start.checked_add(dsub)?)
+    }
+}
+
+/// The name Faiss gives an `IndexPQ::Search_type_t`, or `None` for a
+/// number it does not define.
+#[must_use]
+pub fn search_type_name(search_type: i32) -> Option<&'static str> {
+    Some(match search_type {
+        0 => "ST_PQ",
+        1 => "ST_HE",
+        2 => "ST_generalized_HE",
+        3 => "ST_SDC",
+        4 => "ST_polysemous",
+        5 => "ST_polysemous_generalize",
+        _ => return None,
+    })
+}
+
+/// Product-quantized storage (`IndexPQ`, `IxPq`), under `IHNp`: each
+/// vector its code, [`ProductQuantizer::code_size`] bytes. The codes
+/// hold no exact vectors: a search decodes a code to the centroids it
+/// names, or scores it against a table of the query's distances to every
+/// centroid, as k-NN's `hnsw` method with the `pq` encoder does.
+#[derive(Debug, Clone, Copy)]
+pub struct PqStorage<'a> {
+    /// The storage index's own header.
+    pub header: IndexHeader,
+    /// The quantizer.
+    pub pq: ProductQuantizer<'a>,
+    /// All codes, row-major, [`ProductQuantizer::code_size`] bytes each.
+    /// Faiss stores their length in bytes, so a damaged file can hold
+    /// part of a code.
+    pub codes: &'a [u8],
+    /// `IndexPQ::Search_type_t` as stored: 0 (`ST_PQ`), the asymmetric
+    /// search, in every file k-NN writes; see [`search_type_name`].
+    pub search_type: i32,
+    /// `encode_signs`, for the Hamming-distance search types; Faiss
+    /// writes false.
+    pub encode_signs: bool,
+    /// `polysemous_ht`, the Hamming threshold of the polysemous search
+    /// types; Faiss writes `nbits x m + 1`. Never read for `ST_PQ`.
+    pub polysemous_ht: i32,
+}
+
+impl<'a> PqStorage<'a> {
+    /// Bytes per row, from the quantizer, or `None` for a code size that
+    /// is not a positive count.
+    fn row_bytes(&self) -> Option<usize> {
+        usize::try_from(self.pq.code_size())
+            .ok()
+            .filter(|&row| row > 0)
+    }
+
+    /// Code `i`, or `None` when it is not entirely inside `codes`.
+    #[must_use]
+    pub fn row(&self, i: usize) -> Option<&'a [u8]> {
+        let row = self.row_bytes()?;
+        let start = i.checked_mul(row)?;
+        self.codes.get(start..start.checked_add(row)?)
+    }
+
+    /// Codes that `codes` holds in full.
+    #[must_use]
+    pub fn row_count(&self) -> usize {
+        self.row_bytes().map_or(0, |row| self.codes.len() / row)
+    }
+}
+
 /// An HNSW index's vectors.
 #[derive(Debug, Clone, Copy)]
 pub enum Storage<'a> {
@@ -821,6 +1027,8 @@ pub enum Storage<'a> {
     Sq(SqStorage<'a>),
     /// Packed bits, under `IBHf`.
     Binary(BinaryStorage<'a>),
+    /// Product-quantized codes, under `IHNp`.
+    Pq(PqStorage<'a>),
 }
 
 impl<'a> Storage<'a> {
@@ -831,6 +1039,7 @@ impl<'a> Storage<'a> {
             Self::Flat(s) => s.fourcc,
             Self::Sq(_) => FourCc::SCALAR_QUANTIZER,
             Self::Binary(_) => FourCc::BINARY_FLAT,
+            Self::Pq(_) => FourCc::PQ,
         }
     }
 
@@ -841,6 +1050,7 @@ impl<'a> Storage<'a> {
             Self::Flat(s) => &s.header,
             Self::Sq(s) => &s.header,
             Self::Binary(s) => &s.header,
+            Self::Pq(s) => &s.header,
         }
     }
 
@@ -849,7 +1059,7 @@ impl<'a> Storage<'a> {
     pub fn flat(&self) -> Option<&FlatStorage<'a>> {
         match self {
             Self::Flat(s) => Some(s),
-            Self::Sq(_) | Self::Binary(_) => None,
+            Self::Sq(_) | Self::Binary(_) | Self::Pq(_) => None,
         }
     }
 
@@ -860,18 +1070,21 @@ impl<'a> Storage<'a> {
             Self::Flat(s) => s.row_count(),
             Self::Sq(s) => s.row_count(),
             Self::Binary(s) => s.row_count(),
+            Self::Pq(s) => s.row_count(),
         }
     }
 
     /// Bytes per stored component: 4 for float32, 2 for fp16 or bf16, 1
     /// for byte. Binary storage counts in bytes too, each holding eight
-    /// dimensions' bits, as Lucene's copy of a binary field does.
+    /// dimensions' bits, as Lucene's copy of a binary field does; so do
+    /// product-quantized codes, whose bytes hold sub-vector indexes, not
+    /// components.
     #[must_use]
     pub fn component_size(&self) -> usize {
         match self {
             Self::Flat(_) => 4,
             Self::Sq(s) => s.format.component_size(),
-            Self::Binary(_) => 1,
+            Self::Binary(_) | Self::Pq(_) => 1,
         }
     }
 
@@ -882,18 +1095,20 @@ impl<'a> Storage<'a> {
             Self::Flat(s) => s.codes.as_bytes(),
             Self::Sq(s) => s.codes,
             Self::Binary(s) => s.codes,
+            Self::Pq(s) => s.codes,
         }
     }
 
     /// Components the storage holds in full, over all rows: for binary
-    /// storage, bytes.
+    /// and product-quantized storage, bytes.
     #[must_use]
     pub fn component_count(&self) -> usize {
         self.code_bytes().len() / self.component_size()
     }
 
     /// Component `i` of the row-major storage, decoded to float32; `None`
-    /// for binary storage, whose bits have no float32 value.
+    /// for binary storage, whose bits have no float32 value, and for
+    /// product-quantized storage, whose codes hold none either.
     #[must_use]
     pub fn component(&self, i: usize) -> Option<f32> {
         match self {
@@ -904,7 +1119,19 @@ impl<'a> Storage<'a> {
                 s.format
                     .decode(s.codes.get(start..start.checked_add(size)?)?)
             }
-            Self::Binary(_) => None,
+            Self::Binary(_) | Self::Pq(_) => None,
+        }
+    }
+
+    /// How the file stores a vector: `float32`, `fp16`, `bf16`, `byte`,
+    /// `binary`, or `pq`.
+    #[must_use]
+    pub fn encoding_name(&self) -> &'static str {
+        match self {
+            Self::Flat(_) => "float32",
+            Self::Sq(s) => s.format.name(),
+            Self::Binary(_) => "binary",
+            Self::Pq(_) => "pq",
         }
     }
 }
@@ -998,10 +1225,10 @@ impl GraphKind {
 /// An HNSW index: the graph plus its storage.
 #[derive(Debug, Clone, Copy)]
 pub struct HnswIndex<'a> {
-    /// `IHNf` over float32 storage, `IHNs` over fp16, bf16, or byte, or
-    /// `IBHf` over binary storage or none; or `IHc2` (or `IHNc`) over
-    /// float32, fp16, or byte storage or none, or `IBHc` over binary
-    /// storage, for a CAGRA graph.
+    /// `IHNf` over float32 storage, `IHNs` over fp16, bf16, or byte,
+    /// `IHNp` over product-quantized storage, or `IBHf` over binary
+    /// storage or none; or `IHc2` (or `IHNc`) over float32, fp16, or byte
+    /// storage or none, or `IBHc` over binary storage, for a CAGRA graph.
     pub fourcc: FourCc,
     /// The HNSW index's own header.
     pub header: IndexHeader,
@@ -1046,6 +1273,660 @@ impl HnswIndex<'_> {
     }
 }
 
+/// `DirectMap::Type`: how an IVF index finds a vector's list from its id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectMapKind {
+    /// `NoMap` (0): Faiss's default; k-NN never leaves it.
+    NoMap,
+    /// `Array` (1): one entry per id, ids being 0 to `ntotal - 1`. What
+    /// k-NN's training path sets (`make_direct_map` before `train`), and
+    /// what its ID map's `add` keeps: the inner index receives
+    /// sequential ids, the doc ids living in the ID map.
+    Array,
+    /// `Hashtable` (2): an entry per id, any ids. Faiss reads it; k-NN
+    /// never writes it.
+    Hashtable,
+    /// A type byte Faiss does not define. Faiss reads the file anyway;
+    /// adding and searching ignore the map, and a lookup through it
+    /// throws.
+    Other(u8),
+}
+
+impl DirectMapKind {
+    /// The kind a type byte names.
+    #[must_use]
+    pub fn of_type(type_byte: u8) -> Self {
+        match type_byte {
+            0 => Self::NoMap,
+            1 => Self::Array,
+            2 => Self::Hashtable,
+            other => Self::Other(other),
+        }
+    }
+
+    /// The type byte.
+    #[must_use]
+    pub fn type_byte(self) -> u8 {
+        match self {
+            Self::NoMap => 0,
+            Self::Array => 1,
+            Self::Hashtable => 2,
+            Self::Other(other) => other,
+        }
+    }
+
+    /// `none`, `array`, `hashtable`, or `unknown`.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::NoMap => "none",
+            Self::Array => "array",
+            Self::Hashtable => "hashtable",
+            Self::Other(_) => "unknown",
+        }
+    }
+}
+
+/// Where a vector lies in the inverted lists, as a direct map entry
+/// encodes it (`lo_build`): the list in the high 32 bits, the offset in
+/// the list in the low 32.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListLocation {
+    /// The inverted list.
+    pub list: u64,
+    /// The vector's position in it.
+    pub offset: u64,
+}
+
+impl ListLocation {
+    /// Decodes an entry; `None` for a negative one, which Faiss writes for
+    /// an id in no list.
+    #[must_use]
+    pub fn decode(entry: i64) -> Option<Self> {
+        let bits = u64::try_from(entry).ok()?;
+        Some(Self {
+            list: bits >> 32,
+            offset: bits & 0xffff_ffff,
+        })
+    }
+}
+
+/// The direct map of an IVF index (`read_direct_map`): the type byte,
+/// the array, and, for a hashtable map, its pairs.
+#[derive(Debug, Clone, Copy)]
+pub struct DirectMap<'a> {
+    /// File offset of the type byte.
+    pub offset: usize,
+    /// The map's kind.
+    pub kind: DirectMapKind,
+    /// For an [`DirectMapKind::Array`] map, entry `i` locates id `i`
+    /// ([`ListLocation::decode`]); `ntotal` entries in a well-formed
+    /// file. Faiss writes it for every kind: empty for the others.
+    pub array: &'a [I64],
+    /// For a [`DirectMapKind::Hashtable`] map, `(id, location)` pairs;
+    /// empty, and absent from the file, for the other kinds.
+    pub hashtable: &'a [[I64; 2]],
+}
+
+impl<'a> DirectMap<'a> {
+    fn read(cur: &mut Cursor<'a>) -> Result<Self> {
+        let offset = cur.offset();
+        let kind = DirectMapKind::of_type(cur.u8("direct map type")?);
+        let array = cur.vector("direct map array")?;
+        let hashtable = if kind == DirectMapKind::Hashtable {
+            cur.vector("direct map hashtable")?
+        } else {
+            &[]
+        };
+        Ok(Self {
+            offset,
+            kind,
+            array,
+            hashtable,
+        })
+    }
+
+    /// The array entry of id `i`, or `None` when the array has none.
+    #[must_use]
+    pub fn entry(&self, i: usize) -> Option<i64> {
+        self.array.get(i).map(|v| v.get())
+    }
+}
+
+/// How `write_InvertedLists` stored the list sizes.
+#[derive(Debug, Clone, Copy)]
+pub enum ListSizes<'a> {
+    /// `full`: one size per list, `nlist` of them. Written when more than
+    /// half the lists hold something.
+    Full(&'a [U64]),
+    /// `sprs`: `(list, size)` pairs for the non-empty lists, in list
+    /// order. Written when half the lists or more are empty, as when a
+    /// small segment is indexed through a model trained with many lists.
+    /// Faiss's reader assigns each pair's size to its list, a later pair
+    /// overriding an earlier one, and then reads the lists' data in list
+    /// order whatever the pairs' order; its writer stores each list once,
+    /// in ascending order. Only such pairs read one way, so the parser
+    /// requires them.
+    Sparse(&'a [[U64; 2]]),
+}
+
+/// One inverted list's contents.
+#[derive(Debug, Clone, Copy)]
+pub struct InvertedList<'a> {
+    /// The list's number, below `nlist`.
+    pub list: u64,
+    /// The codes of its vectors, `size x code_size` bytes.
+    pub codes: &'a [u8],
+    /// Their ids: the inner index's, 0 to `ntotal - 1` in a file k-NN
+    /// writes, each naming a row of the direct map and a label in the ID
+    /// map.
+    pub ids: &'a [I64],
+}
+
+/// The inverted lists of an IVF index (`ArrayInvertedLists`, `ilar`):
+/// `nlist` lists, each holding the codes and ids of the vectors nearest
+/// its centroid, written as the sizes and then every non-empty list's
+/// codes followed by its ids. A file without them (`il00`) is refused:
+/// k-NN's training path allows only these and never writes a template
+/// without them.
+#[derive(Debug, Clone, Copy)]
+pub struct InvertedLists<'a> {
+    /// File offset of the `ilar` fourcc.
+    pub offset: usize,
+    /// Lists, as stored here; the IVF header stores the count too, and
+    /// Faiss refuses a file where they differ, as the parser does.
+    pub nlist: u64,
+    /// Bytes per code, as stored here; Faiss refuses a file where it is
+    /// not the index's ([`IvfIndex::code_size`]), as the parser does.
+    pub code_size: u64,
+    /// The list sizes, as stored.
+    pub sizes: ListSizes<'a>,
+    /// Vectors in all lists: the sum of the sizes.
+    pub total: u64,
+    /// The lists' data, in list order: for each non-empty list its codes
+    /// then its ids. Exactly `total x (code_size + 8)` bytes.
+    pub data: &'a [u8],
+}
+
+impl<'a> InvertedLists<'a> {
+    fn read(cur: &mut Cursor<'a>) -> Result<Self> {
+        let offset = cur.offset();
+        expect_fourcc(cur, &[FourCc::INVERTED_LISTS], "ilar")?;
+        let nlist = cur.u64("inverted list count")?;
+        let code_size = cur.u64("inverted list code size")?;
+        let kind = expect_fourcc(
+            cur,
+            &[FourCc::LISTS_FULL, FourCc::LISTS_SPARSE],
+            "full or sprs",
+        )?;
+        let sizes_offset = cur.offset();
+        let too_large = |count: u64| Error::CountTooLarge {
+            offset: sizes_offset,
+            what: "inverted list vectors",
+            count,
+        };
+        let (sizes, total) = if kind == FourCc::LISTS_FULL {
+            let sizes: &[U64] = cur.vector("inverted list sizes")?;
+            // Faiss requires one size per list.
+            if u64::try_from(sizes.len()).unwrap_or(u64::MAX) != nlist {
+                return Err(Error::InvalidValue {
+                    offset: sizes_offset,
+                    what: "inverted list size count",
+                    value: i64::try_from(sizes.len()).unwrap_or(i64::MAX),
+                });
+            }
+            let mut total = 0_u64;
+            for n in sizes {
+                total = total
+                    .checked_add(n.get())
+                    .ok_or_else(|| too_large(n.get()))?;
+            }
+            (ListSizes::Full(sizes), total)
+        } else {
+            // Faiss reads a flat vector of list, size, list, size, ...
+            // and would read past an odd one.
+            let flat: &[U64] = cur.vector("inverted list index and size pairs")?;
+            let pairs =
+                <[[U64; 2]]>::ref_from_bytes(flat.as_bytes()).map_err(|_| Error::InvalidValue {
+                    offset: sizes_offset,
+                    what: "inverted list index and size count",
+                    value: i64::try_from(flat.len()).unwrap_or(i64::MAX),
+                })?;
+            let mut total = 0_u64;
+            let mut previous: Option<u64> = None;
+            for pair in pairs {
+                let [list, size] = pair;
+                // Below `nlist`, as Faiss asserts, and above the list
+                // before it, as Faiss writes them (see `ListSizes`).
+                if list.get() >= nlist || previous.is_some_and(|p| list.get() <= p) {
+                    return Err(Error::InvalidValue {
+                        offset: sizes_offset,
+                        what: "inverted list index",
+                        value: i64::try_from(list.get()).unwrap_or(i64::MAX),
+                    });
+                }
+                previous = Some(list.get());
+                total = total
+                    .checked_add(size.get())
+                    .ok_or_else(|| too_large(size.get()))?;
+            }
+            (ListSizes::Sparse(pairs), total)
+        };
+        let bytes = code_size
+            .checked_add(8)
+            .and_then(|per| total.checked_mul(per))
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or_else(|| too_large(total))?;
+        let data = cur.take(bytes, "inverted list data")?;
+        Ok(Self {
+            offset,
+            nlist,
+            code_size,
+            sizes,
+            total,
+            data,
+        })
+    }
+
+    /// The size of `list`, or `None` for a list number at or past
+    /// `nlist`. For sparse sizes, a list not listed is empty.
+    #[must_use]
+    pub fn size(&self, list: u64) -> Option<u64> {
+        if list >= self.nlist {
+            return None;
+        }
+        match self.sizes {
+            ListSizes::Full(sizes) => usize::try_from(list)
+                .ok()
+                .and_then(|i| sizes.get(i))
+                .map(|n| n.get()),
+            ListSizes::Sparse(pairs) => Some(
+                pairs
+                    .iter()
+                    .find(|[l, _]| l.get() == list)
+                    .map_or(0, |[_, n]| n.get()),
+            ),
+        }
+    }
+
+    /// Lists that hold at least one vector.
+    #[must_use]
+    pub fn non_empty(&self) -> usize {
+        match self.sizes {
+            ListSizes::Full(sizes) => sizes.iter().filter(|n| n.get() > 0).count(),
+            ListSizes::Sparse(pairs) => pairs.iter().filter(|[_, n]| n.get() > 0).count(),
+        }
+    }
+
+    /// The lists in list order with their codes and ids: every list for
+    /// full sizes, the empty ones with empty slices, and the listed ones
+    /// for sparse sizes.
+    #[must_use]
+    pub fn lists(&self) -> Lists<'a> {
+        Lists {
+            code_size: self.code_size,
+            data: self.data,
+            pos: 0,
+            sizes: self.sizes,
+            next: 0,
+        }
+    }
+
+    /// One list, found by walking the lists before it.
+    #[must_use]
+    pub fn list(&self, list: u64) -> Option<InvertedList<'a>> {
+        self.lists().find(|l| l.list == list)
+    }
+}
+
+/// The iterator of [`InvertedLists::lists`].
+#[derive(Debug, Clone)]
+pub struct Lists<'a> {
+    code_size: u64,
+    data: &'a [u8],
+    pos: usize,
+    sizes: ListSizes<'a>,
+    next: usize,
+}
+
+impl<'a> Iterator for Lists<'a> {
+    type Item = InvertedList<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (list, size) = match self.sizes {
+            ListSizes::Full(sizes) => (u64::try_from(self.next).ok()?, sizes.get(self.next)?.get()),
+            ListSizes::Sparse(pairs) => {
+                let [list, size] = pairs.get(self.next)?;
+                (list.get(), size.get())
+            }
+        };
+        self.next = self.next.checked_add(1)?;
+        let n = usize::try_from(size).ok()?;
+        let code_bytes = n.checked_mul(usize::try_from(self.code_size).ok()?)?;
+        let id_bytes = n.checked_mul(8)?;
+        let codes_end = self.pos.checked_add(code_bytes)?;
+        let ids_end = codes_end.checked_add(id_bytes)?;
+        let codes = self.data.get(self.pos..codes_end)?;
+        let ids = <[I64]>::ref_from_bytes(self.data.get(codes_end..ids_end)?).ok()?;
+        self.pos = ids_end;
+        Some(InvertedList { list, codes, ids })
+    }
+}
+
+/// An IVF index's coarse quantizer: the flat index of its `nlist`
+/// centroids, nested inside the IVF header.
+#[derive(Debug, Clone, Copy)]
+pub enum CoarseQuantizer<'a> {
+    /// `IxF2` or `IxFI`, under a float IVF index.
+    Flat(FlatStorage<'a>),
+    /// `IBxF`, under `IBwF`.
+    Binary(BinaryStorage<'a>),
+}
+
+impl CoarseQuantizer<'_> {
+    /// The quantizer's fourcc.
+    #[must_use]
+    pub fn fourcc(&self) -> FourCc {
+        match self {
+            Self::Flat(q) => q.fourcc,
+            Self::Binary(_) => FourCc::BINARY_FLAT,
+        }
+    }
+
+    /// The quantizer's own header; its `ntotal` is the centroid count.
+    #[must_use]
+    pub fn header(&self) -> &IndexHeader {
+        match self {
+            Self::Flat(q) => &q.header,
+            Self::Binary(q) => &q.header,
+        }
+    }
+
+    /// Centroids the quantizer holds in full.
+    #[must_use]
+    pub fn centroid_count(&self) -> usize {
+        match self {
+            Self::Flat(q) => q.row_count(),
+            Self::Binary(q) => q.row_count(),
+        }
+    }
+}
+
+/// How an IVF index codes the vectors in its lists.
+#[derive(Debug, Clone, Copy)]
+pub enum IvfEncoding<'a> {
+    /// `IwFl`: float32 vectors, `4 x d` bytes each.
+    Flat,
+    /// `IwSq`: scalar-quantized codes, of the vector's residual from its
+    /// centroid when `by_residual` is set, as Faiss's `index_factory`
+    /// sets it.
+    Sq {
+        /// The quantizer, as under `IHNs`.
+        quantizer: ScalarQuantizer<'a>,
+        /// The codes' format, from the quantizer type.
+        format: CodeFormat,
+        /// Bytes per code, as the index stores it; the quantizer's in a
+        /// well-formed file.
+        code_size: u64,
+        /// Whether the codes quantize residuals.
+        by_residual: bool,
+    },
+    /// `IwPQ`: product-quantized codes, of the residual when
+    /// `by_residual` is set, as Faiss's `IndexIVFPQ` always sets it.
+    Pq {
+        /// Whether the codes quantize residuals.
+        by_residual: bool,
+        /// Bytes per code, as the index stores it; the quantizer's in a
+        /// well-formed file.
+        code_size: u64,
+        /// The quantizer.
+        pq: ProductQuantizer<'a>,
+    },
+    /// `IBwF`: packed bits, the header's code size each.
+    Binary,
+}
+
+impl IvfEncoding<'_> {
+    /// How the lists store a vector: `float32`, `fp16`, `bf16`, `byte`,
+    /// `pq`, or `binary`.
+    #[must_use]
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Flat => "float32",
+            Self::Sq { format, .. } => format.name(),
+            Self::Pq { .. } => "pq",
+            Self::Binary => "binary",
+        }
+    }
+
+    /// Whether the codes quantize residuals; `None` where there is
+    /// nothing to quantize.
+    #[must_use]
+    pub fn by_residual(&self) -> Option<bool> {
+        match self {
+            Self::Flat | Self::Binary => None,
+            Self::Sq { by_residual, .. } | Self::Pq { by_residual, .. } => Some(*by_residual),
+        }
+    }
+}
+
+/// An IVF (inverted file) index (`IndexIVF` or `IndexBinaryIVF`): a
+/// coarse quantizer of `nlist` trained centroids, and for each centroid
+/// an inverted list of the vectors nearest it, which a search scans for
+/// the `nprobe` centroids nearest the query. In file order: its header,
+/// `nlist` and `nprobe`, the coarse quantizer, the direct map, the
+/// encoding's own fields, and the inverted lists. k-NN writes one
+/// through a trained model: `IVF{nlist},Flat`, `IVF{nlist},SQfp16` (or
+/// `SQbf16`, or `SQ8_direct_signed` for a byte field),
+/// `IVF{nlist},PQ{m}x{code_size}`, or `BIVF{nlist}` for a binary field,
+/// built by `index_factory`, trained, and then filled through the ID map.
+#[derive(Debug, Clone, Copy)]
+pub struct IvfIndex<'a> {
+    /// `IwFl`, `IwSq`, `IwPQ`, or `IBwF`.
+    pub fourcc: FourCc,
+    /// The IVF index's own header: a float one, or a binary one under
+    /// `IBwF`.
+    pub header: IndexHeader,
+    /// Lists; k-NN's `nlist`, 4 by default.
+    pub nlist: u64,
+    /// Lists a search scans; k-NN's `nprobes`, 1 by default, set on the
+    /// template before training and so stored, and overridable per query.
+    pub nprobe: u64,
+    /// The coarse quantizer.
+    pub quantizer: CoarseQuantizer<'a>,
+    /// The direct map.
+    pub direct_map: DirectMap<'a>,
+    /// How the lists code a vector, with the encoding's own fields.
+    pub encoding: IvfEncoding<'a>,
+    /// The inverted lists.
+    pub lists: InvertedLists<'a>,
+}
+
+impl<'a> IvfIndex<'a> {
+    /// Reads the rest of a float IVF index, its fourcc and header read.
+    fn read_float(cur: &mut Cursor<'a>, fourcc: FourCc, header: IndexHeader) -> Result<Self> {
+        let nlist = cur.u64("nlist")?;
+        let nprobe = cur.u64("nprobe")?;
+        let q_offset = cur.offset();
+        let q_fourcc = expect_fourcc(cur, &[FourCc::FLAT_L2, FourCc::FLAT_IP], "IxF2 or IxFI")?;
+        let q_header = IndexHeader::read(cur, q_offset)?;
+        let quantizer = CoarseQuantizer::Flat(FlatStorage {
+            fourcc: q_fourcc,
+            header: q_header,
+            codes: cur.xb_vector("centroids")?,
+        });
+        let direct_map = DirectMap::read(cur)?;
+        let encoding = if fourcc == FourCc::IVF_FLAT {
+            IvfEncoding::Flat
+        } else if fourcc == FourCc::IVF_SQ {
+            let (quantizer, format) = ScalarQuantizer::read(cur)?;
+            IvfEncoding::Sq {
+                quantizer,
+                format,
+                code_size: cur.u64("code size")?,
+                by_residual: cur.u8("by_residual flag")? != 0,
+            }
+        } else {
+            IvfEncoding::Pq {
+                by_residual: cur.u8("by_residual flag")? != 0,
+                code_size: cur.u64("code size")?,
+                pq: ProductQuantizer::read(cur)?,
+            }
+        };
+        let lists = InvertedLists::read(cur)?;
+        Self {
+            fourcc,
+            header,
+            nlist,
+            nprobe,
+            quantizer,
+            direct_map,
+            encoding,
+            lists,
+        }
+        .checked()
+    }
+
+    /// Reads the rest of a binary IVF index (`IBwF`), its fourcc and
+    /// header read.
+    fn read_binary(cur: &mut Cursor<'a>, header: IndexHeader) -> Result<Self> {
+        let nlist = cur.u64("nlist")?;
+        let nprobe = cur.u64("nprobe")?;
+        let q_offset = cur.offset();
+        expect_fourcc(cur, &[FourCc::BINARY_FLAT], "IBxF")?;
+        let q_header = IndexHeader::read_binary(cur, q_offset)?;
+        let quantizer = CoarseQuantizer::Binary(BinaryStorage {
+            header: q_header,
+            codes: cur.vector("binary centroids")?,
+        });
+        let direct_map = DirectMap::read(cur)?;
+        let lists = InvertedLists::read(cur)?;
+        Self {
+            fourcc: FourCc::BINARY_IVF,
+            header,
+            nlist,
+            nprobe,
+            quantizer,
+            direct_map,
+            encoding: IvfEncoding::Binary,
+            lists,
+        }
+        .checked()
+    }
+
+    /// The index, if its lists agree with it as Faiss's `read_InvertedLists`
+    /// requires: the same list count and the index's code size.
+    fn checked(self) -> Result<Self> {
+        let at = |delta: usize| self.lists.offset.saturating_add(delta);
+        if self.lists.nlist != self.nlist {
+            return Err(Error::FieldMismatch {
+                offset: at(4),
+                what: "inverted list count",
+                value: self.lists.nlist,
+                expected: self.nlist,
+                of: "nlist",
+            });
+        }
+        // A code size that cannot be derived (a negative one) matches
+        // nothing.
+        if self.code_size() != Some(self.lists.code_size) {
+            return Err(Error::FieldMismatch {
+                offset: at(12),
+                what: "inverted list code size",
+                value: self.lists.code_size,
+                expected: self.code_size().unwrap_or(u64::MAX),
+                of: "code size",
+            });
+        }
+        Ok(self)
+    }
+
+    /// Bytes per code as Faiss derives the index's: `4 x d` for float32,
+    /// the stored code size for scalar- and product-quantized codes, the
+    /// header's code size for binary ones; `None` when the dimension or
+    /// code size is negative.
+    #[must_use]
+    pub fn code_size(&self) -> Option<u64> {
+        match self.encoding {
+            IvfEncoding::Flat => u64::try_from(self.header.d).ok()?.checked_mul(4),
+            IvfEncoding::Sq { code_size, .. } | IvfEncoding::Pq { code_size, .. } => {
+                Some(code_size)
+            }
+            IvfEncoding::Binary => self
+                .header
+                .code_size()
+                .and_then(|size| u64::try_from(size).ok()),
+        }
+    }
+}
+
+/// The index the ID map wraps: k-NN's `hnsw` method or its `ivf` method,
+/// each with any of its encoders.
+#[derive(Debug, Clone, Copy)]
+pub enum Inner<'a> {
+    /// An HNSW or CAGRA graph with its storage, or without it.
+    Hnsw(HnswIndex<'a>),
+    /// An IVF index with its inverted lists.
+    Ivf(IvfIndex<'a>),
+}
+
+impl<'a> Inner<'a> {
+    /// The wrapped index's fourcc.
+    #[must_use]
+    pub fn fourcc(&self) -> FourCc {
+        match self {
+            Self::Hnsw(h) => h.fourcc,
+            Self::Ivf(v) => v.fourcc,
+        }
+    }
+
+    /// The wrapped index's own header.
+    #[must_use]
+    pub fn header(&self) -> &IndexHeader {
+        match self {
+            Self::Hnsw(h) => &h.header,
+            Self::Ivf(v) => &v.header,
+        }
+    }
+
+    /// The graph index, when that is what the file holds.
+    #[must_use]
+    pub fn hnsw(&self) -> Option<&HnswIndex<'a>> {
+        match self {
+            Self::Hnsw(h) => Some(h),
+            Self::Ivf(_) => None,
+        }
+    }
+
+    /// The IVF index, when that is what the file holds.
+    #[must_use]
+    pub fn ivf(&self) -> Option<&IvfIndex<'a>> {
+        match self {
+            Self::Hnsw(_) => None,
+            Self::Ivf(v) => Some(v),
+        }
+    }
+
+    /// k-NN's name for the method: `hnsw` or `ivf`.
+    #[must_use]
+    pub fn method_name(&self) -> &'static str {
+        match self {
+            Self::Hnsw(_) => "hnsw",
+            Self::Ivf(_) => "ivf",
+        }
+    }
+
+    /// How the file stores a vector: `float32`, `fp16`, `bf16`, `byte`,
+    /// `binary`, or `pq`; `none` for a graph without its vectors.
+    #[must_use]
+    pub fn encoding_name(&self) -> &'static str {
+        match self {
+            Self::Hnsw(h) => h.storage.as_ref().map_or("none", Storage::encoding_name),
+            Self::Ivf(v) => v.encoding.name(),
+        }
+    }
+}
+
 /// `IndexIDMap` or `IndexBinaryIDMap`: the outermost index, mapping node
 /// ids to labels.
 #[derive(Debug, Clone, Copy)]
@@ -1055,24 +1936,46 @@ pub struct IdMapIndex<'a> {
     /// The ID map's own header.
     pub header: IndexHeader,
     /// The wrapped index.
-    pub index: HnswIndex<'a>,
+    pub index: Inner<'a>,
     /// One label per node. k-NN writes Lucene doc ids.
     pub id_map: &'a [I64],
     /// File offset just past the last byte of the index.
     pub end: usize,
 }
 
-impl IdMapIndex<'_> {
-    /// The three fourccs, outermost first; [`FourCc::NULL`] last for a
-    /// graph without its vectors.
+impl<'a> IdMapIndex<'a> {
+    /// The graph index, when that is what the file holds.
     #[must_use]
-    pub fn layout(&self) -> [FourCc; 3] {
-        let storage = self
-            .index
-            .storage
-            .as_ref()
-            .map_or(FourCc::NULL, Storage::fourcc);
-        [self.fourcc, self.index.fourcc, storage]
+    pub fn hnsw(&self) -> Option<&HnswIndex<'a>> {
+        self.index.hnsw()
+    }
+
+    /// The IVF index, when that is what the file holds.
+    #[must_use]
+    pub fn ivf(&self) -> Option<&IvfIndex<'a>> {
+        self.index.ivf()
+    }
+
+    /// The index fourccs in the file, in order: the ID map's, the wrapped
+    /// index's, then for a graph its storage's, [`FourCc::NULL`] for a
+    /// graph without its vectors, and for an IVF index its coarse
+    /// quantizer's and the inverted lists' `ilar` (not the list-type tag
+    /// after it, `full` or `sprs`, which [`ListSizes`] tells).
+    #[must_use]
+    pub fn layout(&self) -> Vec<FourCc> {
+        match &self.index {
+            Inner::Hnsw(h) => vec![
+                self.fourcc,
+                h.fourcc,
+                h.storage.as_ref().map_or(FourCc::NULL, Storage::fourcc),
+            ],
+            Inner::Ivf(v) => vec![
+                self.fourcc,
+                v.fourcc,
+                v.quantizer.fourcc(),
+                FourCc::INVERTED_LISTS,
+            ],
+        }
     }
 
     /// The distance the index was built for: its storage's, or, for a
@@ -1083,25 +1986,30 @@ impl IdMapIndex<'_> {
     /// headers, and reads it back from the ID map's when it loads the file
     /// (`FaissFlatIndexFactory.maybeSetFlatBinaryIndex` at tag 3.9.0.0).
     /// Its remote build writes the same space in both headers of a CAGRA
-    /// graph without its vectors.
+    /// graph without its vectors. An IVF index's is its own header's:
+    /// Hamming under `IBwF`, else the metric type, which its coarse
+    /// quantizer and lists share.
     #[must_use]
     pub fn metric(&self) -> Metric {
-        match &self.index.storage {
-            Some(storage) => storage.header().metric(),
-            None => Metric::from_type(self.header.metric_type),
+        match &self.index {
+            Inner::Hnsw(h) => match &h.storage {
+                Some(storage) => storage.header().metric(),
+                None => Metric::from_type(self.header.metric_type),
+            },
+            Inner::Ivf(v) => v.header.metric(),
         }
     }
 
-    /// Bytes per vector of a binary layout: over binary storage, the ID
-    /// map header's code size, the dimension / 8 in a well-formed file;
-    /// over none, the graph header's, a quantized vector plus its
-    /// correction factors, since the ID map's then measures nothing
-    /// stored. `None` for a float layout.
+    /// Bytes per vector of a binary layout: over binary storage, or for a
+    /// binary IVF index, the ID map header's code size, the dimension / 8
+    /// in a well-formed file; over none, the graph header's, a quantized
+    /// vector plus its correction factors, since the ID map's then
+    /// measures nothing stored. `None` for a float layout.
     #[must_use]
     pub fn code_size(&self) -> Option<i32> {
-        match self.index.storage {
-            Some(_) => self.header.code_size(),
-            None => self.index.header.code_size(),
+        match &self.index {
+            Inner::Hnsw(h) if h.storage.is_none() => h.header.code_size(),
+            Inner::Hnsw(_) | Inner::Ivf(_) => self.header.code_size(),
         }
     }
 }
@@ -1114,8 +2022,9 @@ impl IdMapIndex<'_> {
 /// the supported layouts, a scalar quantizer type other than `QT_fp16`,
 /// `QT_bf16`, or `QT_8bit_direct_signed`, `QT_bf16` under a CAGRA graph
 /// (which k-NN's remote build never writes), a negative dimension, count,
-/// or code size, a count beyond what Faiss accepts, or a structure running
-/// past the data.
+/// or code size, a count beyond what Faiss accepts, a product quantizer or
+/// inverted lists Faiss would refuse (see [`ProductQuantizer`] and
+/// [`InvertedLists`]), or a structure running past the data.
 pub fn parse(payload: &[u8], base: usize) -> Result<IdMapIndex<'_>> {
     let mut cur = Cursor::new(payload, base);
 
@@ -1130,27 +2039,52 @@ pub fn parse(payload: &[u8], base: usize) -> Result<IdMapIndex<'_>> {
     }
     let header = IndexHeader::read(&mut cur, offset)?;
 
-    let hnsw_offset = cur.offset();
-    let hnsw_fourcc = expect_fourcc(
+    let inner_offset = cur.offset();
+    let inner_fourcc = expect_fourcc(
         &mut cur,
         &[
             FourCc::HNSW_FLAT,
             FourCc::HNSW_SQ,
+            FourCc::HNSW_PQ,
             FourCc::HNSW_CAGRA,
             FourCc::HNSW_CAGRA_OLD,
+            FourCc::IVF_FLAT,
+            FourCc::IVF_SQ,
+            FourCc::IVF_PQ,
         ],
-        "IHNf, IHNs, IHc2, or IHNc",
+        "IHNf, IHNs, IHNp, IHc2, IHNc, IwFl, IwSq, or IwPQ",
     )?;
-    let hnsw_header = IndexHeader::read(&mut cur, hnsw_offset)?;
-    let kind = if hnsw_fourcc == FourCc::HNSW_FLAT || hnsw_fourcc == FourCc::HNSW_SQ {
-        GraphKind::Hnsw
+    let inner_header = IndexHeader::read(&mut cur, inner_offset)?;
+    let index = if [FourCc::IVF_FLAT, FourCc::IVF_SQ, FourCc::IVF_PQ].contains(&inner_fourcc) {
+        Inner::Ivf(IvfIndex::read_float(&mut cur, inner_fourcc, inner_header)?)
     } else {
-        GraphKind::Cagra(CagraFields::read(
-            &mut cur,
-            hnsw_fourcc == FourCc::HNSW_CAGRA,
-        )?)
+        Inner::Hnsw(read_hnsw(&mut cur, inner_fourcc, inner_header)?)
     };
-    let graph = HnswGraph::read(&mut cur)?;
+
+    let id_map = cur.vector("id_map")?;
+
+    Ok(IdMapIndex {
+        fourcc,
+        header,
+        index,
+        id_map,
+        end: cur.offset(),
+    })
+}
+
+/// Reads the rest of a float graph index, its fourcc and header read:
+/// the CAGRA fields under a CAGRA tag, the graph, and the storage.
+fn read_hnsw<'a>(
+    cur: &mut Cursor<'a>,
+    hnsw_fourcc: FourCc,
+    hnsw_header: IndexHeader,
+) -> Result<HnswIndex<'a>> {
+    let kind = if [FourCc::HNSW_CAGRA, FourCc::HNSW_CAGRA_OLD].contains(&hnsw_fourcc) {
+        GraphKind::Cagra(CagraFields::read(cur, hnsw_fourcc == FourCc::HNSW_CAGRA)?)
+    } else {
+        GraphKind::Hnsw
+    };
+    let graph = HnswGraph::read(cur)?;
 
     // Faiss reads any storage under any graph tag; k-NN's local build
     // writes each HNSW tag over one kind only, and only those pairs are
@@ -1160,6 +2094,7 @@ pub fn parse(payload: &[u8], base: usize) -> Result<IdMapIndex<'_>> {
     let storage_offset = cur.offset();
     let accepted: (&[FourCc], &'static str) = match kind {
         GraphKind::Hnsw if hnsw_fourcc == FourCc::HNSW_SQ => (&[FourCc::SCALAR_QUANTIZER], "IxSQ"),
+        GraphKind::Hnsw if hnsw_fourcc == FourCc::HNSW_PQ => (&[FourCc::PQ], "IxPq"),
         GraphKind::Hnsw => (&[FourCc::FLAT_L2, FourCc::FLAT_IP], "IxF2 or IxFI"),
         GraphKind::Cagra(_) => (
             &[
@@ -1171,12 +2106,12 @@ pub fn parse(payload: &[u8], base: usize) -> Result<IdMapIndex<'_>> {
             "IxF2, IxFI, IxSQ, or null",
         ),
     };
-    let storage_fourcc = expect_fourcc(&mut cur, accepted.0, accepted.1)?;
+    let storage_fourcc = expect_fourcc(cur, accepted.0, accepted.1)?;
     let storage = if storage_fourcc == FourCc::NULL {
         None
     } else if storage_fourcc == FourCc::SCALAR_QUANTIZER {
-        let header = IndexHeader::read(&mut cur, storage_offset)?;
-        let (quantizer, format) = ScalarQuantizer::read(&mut cur)?;
+        let header = IndexHeader::read(cur, storage_offset)?;
+        let (quantizer, format) = ScalarQuantizer::read(cur)?;
         // The remote build takes no bf16 field, so it never writes bf16
         // codes under a CAGRA graph.
         if matches!(kind, GraphKind::Cagra(_)) && format == CodeFormat::Bf16 {
@@ -1192,8 +2127,19 @@ pub fn parse(payload: &[u8], base: usize) -> Result<IdMapIndex<'_>> {
             format,
             codes: cur.vector("scalar-quantized codes")?,
         }))
+    } else if storage_fourcc == FourCc::PQ {
+        let header = IndexHeader::read(cur, storage_offset)?;
+        let pq = ProductQuantizer::read(cur)?;
+        Some(Storage::Pq(PqStorage {
+            header,
+            pq,
+            codes: cur.vector("product-quantized codes")?,
+            search_type: cur.i32("search type")?,
+            encode_signs: cur.u8("encode_signs flag")? != 0,
+            polysemous_ht: cur.i32("polysemous_ht")?,
+        }))
     } else {
-        let header = IndexHeader::read(&mut cur, storage_offset)?;
+        let header = IndexHeader::read(cur, storage_offset)?;
         Some(Storage::Flat(FlatStorage {
             fourcc: storage_fourcc,
             header,
@@ -1201,20 +2147,12 @@ pub fn parse(payload: &[u8], base: usize) -> Result<IdMapIndex<'_>> {
         }))
     };
 
-    let id_map = cur.vector("id_map")?;
-
-    Ok(IdMapIndex {
-        fourcc,
-        header,
-        index: HnswIndex {
-            fourcc: hnsw_fourcc,
-            header: hnsw_header,
-            kind,
-            graph,
-            storage,
-        },
-        id_map,
-        end: cur.offset(),
+    Ok(HnswIndex {
+        fourcc: hnsw_fourcc,
+        header: hnsw_header,
+        kind,
+        graph,
+        storage,
     })
 }
 
@@ -1245,17 +2183,33 @@ impl CagraFields {
 /// The rest of a binary layout, `IBMp` read: its header, `IBHf` with its
 /// header and graph, `IBxF` with its header and codes or `null`, then the
 /// labels; or `IBHc` with its header, its CAGRA fields, and graph, then
-/// `IBxF`, which is all k-NN's remote build writes under it.
+/// `IBxF`, which is all k-NN's remote build writes under it; or `IBwF`, a
+/// binary IVF index.
 fn parse_binary(mut cur: Cursor<'_>, offset: usize) -> Result<IdMapIndex<'_>> {
     let header = IndexHeader::read_binary(&mut cur, offset)?;
 
     let hnsw_offset = cur.offset();
     let hnsw_fourcc = expect_fourcc(
         &mut cur,
-        &[FourCc::BINARY_HNSW, FourCc::BINARY_HNSW_CAGRA],
-        "IBHf or IBHc",
+        &[
+            FourCc::BINARY_HNSW,
+            FourCc::BINARY_HNSW_CAGRA,
+            FourCc::BINARY_IVF,
+        ],
+        "IBHf, IBHc, or IBwF",
     )?;
     let hnsw_header = IndexHeader::read_binary(&mut cur, hnsw_offset)?;
+    if hnsw_fourcc == FourCc::BINARY_IVF {
+        let index = Inner::Ivf(IvfIndex::read_binary(&mut cur, hnsw_header)?);
+        let id_map = cur.vector("id_map")?;
+        return Ok(IdMapIndex {
+            fourcc: FourCc::BINARY_ID_MAP,
+            header,
+            index,
+            id_map,
+            end: cur.offset(),
+        });
+    }
     let kind = if hnsw_fourcc == FourCc::BINARY_HNSW_CAGRA {
         GraphKind::Cagra(CagraFields::read(&mut cur, false)?)
     } else {
@@ -1286,13 +2240,13 @@ fn parse_binary(mut cur: Cursor<'_>, offset: usize) -> Result<IdMapIndex<'_>> {
     Ok(IdMapIndex {
         fourcc: FourCc::BINARY_ID_MAP,
         header,
-        index: HnswIndex {
+        index: Inner::Hnsw(HnswIndex {
             fourcc: hnsw_fourcc,
             header: hnsw_header,
             kind,
             graph,
             storage,
-        },
+        }),
         id_map,
         end: cur.offset(),
     })

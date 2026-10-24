@@ -2,7 +2,7 @@
 //! native file, a segment info file, a field infos file, a flat-vectors
 //! metadata file and the rows of a `.vec`, and a scalar-quantized vectors
 //! metadata or data file,
-//! and every check, the graph statistics, and an HNSW search must run
+//! and every check, the graph or list statistics, and an HNSW search must run
 //! over whatever parsed (a graph without its vectors must refuse the
 //! search), as must the search k-NN runs with Lucene's searcher over any
 //! graph, and Lucene's quantizer and scorer over the bytes as float32s. Panics,
@@ -153,7 +153,54 @@ fuzz_target!(|data: &[u8]| {
     // the cosine path has the only float math.
     if let Ok(parsed) = knn_format::parse(data) {
         // Touch the accessors a caller would use.
-        let graph = &parsed.index.index.graph;
+        let _ = parsed.index.metric();
+        let _ = parsed.index.code_size();
+        let _ = parsed.index.layout();
+        let _ = parsed.index.index.method_name();
+        let _ = parsed.index.index.encoding_name();
+        if let Some(ivf) = parsed.index.ivf() {
+            // Every list comes out whole: the data was sized from the
+            // sizes when the file was parsed. The lists' sizes sum to the
+            // total, both for full sizes, which list every list, and for
+            // sparse ones, which list the non-empty lists.
+            let code_size = usize::try_from(ivf.lists.code_size).unwrap_or(usize::MAX);
+            let mut total = 0_u64;
+            for list in ivf.lists.lists() {
+                assert_eq!(list.codes.len(), list.ids.len() * code_size);
+                total += u64::try_from(list.ids.len()).unwrap_or(u64::MAX);
+            }
+            assert_eq!(total, ivf.lists.total);
+            let _ = ivf.lists.non_empty();
+            let _ = ivf.lists.size(0);
+            let _ = ivf.lists.list(ivf.lists.nlist.saturating_sub(1));
+            for i in 0..ivf.direct_map.array.len().min(64) {
+                let _ = ivf
+                    .direct_map
+                    .entry(i)
+                    .and_then(knn_format::faiss::ListLocation::decode);
+            }
+            let _ = ivf.quantizer.centroid_count();
+            // The list statistics, which list every size up to k-NN's
+            // limit on nlist and sum them whatever the count.
+            let stats = knn_check::ivf_stats(ivf);
+            assert_eq!(stats.vectors, ivf.lists.total);
+            if !stats.list_sizes.is_empty() {
+                assert_eq!(stats.list_sizes.iter().sum::<u64>(), stats.vectors);
+            }
+            let _ = ivf.code_size();
+            if let knn_format::faiss::IvfEncoding::Pq { pq, .. } = &ivf.encoding {
+                let _ = pq.centroid(0, 0);
+                let _ = pq.expected_centroid_floats();
+            }
+        }
+        if let Some(footer) = parsed.envelope.footer {
+            let _ = footer.verify(data);
+        }
+    }
+    if let Ok(parsed) = knn_format::parse(data)
+        && let Some(hnsw) = parsed.index.hnsw()
+    {
+        let graph = &hnsw.graph;
         let _ = graph.level_counts();
         let _ = graph.m();
         for node in 0..graph.node_count().min(64) {
@@ -163,15 +210,12 @@ fuzz_target!(|data: &[u8]| {
         }
         // Reachability walks every edge, so a corrupt graph exercises it
         // as much as a clean one.
-        let stats = knn_check::index_stats(&parsed.index.index);
+        let stats = knn_check::index_stats(hnsw);
         assert_eq!(stats.nodes, graph.node_count());
-        assert_eq!(stats.layers.len(), parsed.index.index.level_counts().len());
+        assert_eq!(stats.layers.len(), hnsw.level_counts().len());
         let _ = knn_check::graph_stats(graph);
-        let _ = parsed.index.metric();
-        let _ = parsed.index.code_size();
-        let _ = parsed.index.layout();
-        let _ = parsed.index.index.kind.cagra();
-        let _ = parsed.index.index.random_entry_points();
+        let _ = hnsw.kind.cagra();
+        let _ = hnsw.random_entry_points();
         // The search k-NN runs with Lucene's searcher, over any graph,
         // with or without its vectors: scores from the node ids, many of
         // them tied, for k below, at, and past the node count, with and
@@ -198,19 +242,27 @@ fuzz_target!(|data: &[u8]| {
             }
         }
         'storage: {
-            let Some(storage) = &parsed.index.index.storage else {
+            let Some(storage) = &hnsw.storage else {
                 // A graph without its vectors: nothing to search.
                 let mut searcher = knn_recall::Searcher::new(graph.node_count());
-                let searched = searcher.search(
-                    &parsed.index.index,
-                    &[0.0_f32][..],
-                    3,
-                    5,
-                    knn_recall::Draw::default(),
-                );
+                let searched =
+                    searcher.search(hnsw, &[0.0_f32][..], 3, 5, knn_recall::Draw::default());
                 assert!(matches!(searched, Err(knn_recall::Error::NoVectors)));
                 break 'storage;
             };
+            if let knn_format::faiss::Storage::Pq(s) = storage {
+                // Product-quantized codes hold no vectors to search over:
+                // refused, whatever the query, once the dimension is one.
+                let _ = s.row(0);
+                let _ = s.pq.centroid(0, 0);
+                let mut searcher = knn_recall::Searcher::new(graph.node_count());
+                let searched =
+                    searcher.search(hnsw, &[0.0_f32; 4][..], 3, 5, knn_recall::Draw::default());
+                assert!(matches!(
+                    searched,
+                    Err(knn_recall::Error::ProductQuantized | knn_recall::Error::Dimension { .. })
+                ));
+            }
             // The HNSW search over an arbitrary graph and any storage,
             // with the first stored vector, decoded, or for binary storage
             // its bytes, as the query so the query's size is bounded by the
@@ -228,13 +280,8 @@ fuzz_target!(|data: &[u8]| {
                 // `None` reads the fuzzed file's own entry-point count,
                 // which the search caps, so a huge count stays a search.
                 for count in [None, Some(4)] {
-                    let searched = searcher.search(
-                        &parsed.index.index,
-                        query,
-                        3,
-                        5,
-                        knn_recall::Draw { seed: 7, count },
-                    );
+                    let searched =
+                        searcher.search(hnsw, query, 3, 5, knn_recall::Draw { seed: 7, count });
                     if let Ok(hits) = searched {
                         assert!(hits.len() <= 3);
                         // Padded to k, or to the node count when the graph
@@ -262,10 +309,10 @@ fuzz_target!(|data: &[u8]| {
                     let _ = s.row(0);
                     let _ = s.code_size();
                 }
+                knn_format::faiss::Storage::Pq(s) => {
+                    let _ = s.row_count();
+                }
             }
-        }
-        if let Some(footer) = parsed.envelope.footer {
-            let _ = footer.verify(data);
         }
     }
     for space in [

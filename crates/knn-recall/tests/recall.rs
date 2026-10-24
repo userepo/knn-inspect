@@ -77,7 +77,9 @@ fn baselines() -> Vec<PathBuf> {
 fn load_queries(storage: &Storage<'_>, bytes: &[u8], d: usize) -> Queries {
     match storage {
         Storage::Binary(_) => Queries::from_bits(bytes, d).unwrap(),
-        Storage::Flat(_) | Storage::Sq(_) => Queries::from_bytes(bytes, d).unwrap(),
+        Storage::Flat(_) | Storage::Sq(_) | Storage::Pq(_) => {
+            Queries::from_bytes(bytes, d).unwrap()
+        }
     }
 }
 
@@ -102,7 +104,7 @@ fn recall_matches_faiss_python() {
         let b: Baseline = serde_json::from_slice(&fs::read(&baseline).unwrap()).unwrap();
         let bytes = fs::read(dir.join(&b.file)).unwrap();
         let parsed = knn_format::parse(&bytes).unwrap();
-        let storage = &parsed.index.index.storage.unwrap();
+        let storage = &parsed.index.hnsw().unwrap().storage.unwrap();
         let queries = load_queries(
             storage,
             &fs::read(dir.join(&b.queries_file)).unwrap(),

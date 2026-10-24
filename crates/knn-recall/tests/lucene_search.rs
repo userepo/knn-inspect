@@ -108,7 +108,7 @@ fn searches_are_k_nns_own() {
     for case in &cases {
         let bytes = fs::read(fixtures().join(&case.file)).unwrap();
         let parsed = knn_format::parse(&bytes).unwrap();
-        let graph = &parsed.index.index.graph;
+        let graph = &parsed.index.hnsw().unwrap().graph;
         descended |= graph.max_level >= 2;
         let n = case.docs.len();
         for q in 0..case.queries {

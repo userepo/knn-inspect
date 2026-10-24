@@ -235,3 +235,104 @@ fn slots(graph: &HnswGraph<'_>, level: usize) -> i64 {
         _ => 0,
     }
 }
+
+/// Statistics for an IVF index's inverted lists: how the trained coarse
+/// quantizer split the vectors among its `nlist` lists.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct IvfStats {
+    /// Lists, as the index stores it.
+    pub nlist: u64,
+    /// Lists a search scans, as stored; a query may give another.
+    pub nprobe: u64,
+    /// Vectors in all lists.
+    pub vectors: u64,
+    /// Lists that hold no vector.
+    pub empty_lists: u64,
+    /// The smallest list; `None` without lists.
+    pub list_size_min: Option<u64>,
+    /// The largest list; `None` without lists.
+    pub list_size_max: Option<u64>,
+    /// Vectors per list on average, `vectors / nlist`; `None` without
+    /// lists.
+    pub list_size_mean: Option<f64>,
+    /// Faiss's `InvertedLists::imbalance_factor`: `nlist` times the sum of
+    /// the squared list sizes over the squared total, 1 for lists of one
+    /// size and `nlist` for a single full one; computed in the order Faiss
+    /// computes it, so it matches Faiss to the bit. `None` without vectors.
+    pub imbalance_factor: Option<f64>,
+    /// Every list's size, list 0 first; lists that sparse sizes leave out
+    /// are empty. Left empty at an `nlist` of 20,000 or more, past what
+    /// k-NN takes.
+    pub list_sizes: Vec<u64>,
+}
+
+/// Computes the statistics of `index`'s inverted lists. The sizes are
+/// listed one per list, so the work and the list follow `nlist`; k-NN
+/// takes `nlist` under 20,000, and one of 20,000 or more is not listed (the
+/// sizes are left empty) but still summarized.
+#[must_use]
+pub fn ivf_stats(index: &knn_format::faiss::IvfIndex<'_>) -> IvfStats {
+    /// k-NN's limit on `nlist`, which it takes below this.
+    const LISTED: u64 = 20_000;
+    let lists = &index.lists;
+    let nlist = lists.nlist;
+    let mut sizes = Vec::new();
+    if let Some(n) = usize::try_from(nlist).ok().filter(|_| nlist < LISTED) {
+        sizes = vec![0; n];
+        for list in lists.lists() {
+            if let Some(slot) = usize::try_from(list.list)
+                .ok()
+                .and_then(|l| sizes.get_mut(l))
+            {
+                *slot = u64::try_from(list.ids.len()).unwrap_or(u64::MAX);
+            }
+        }
+    }
+    let non_empty = u64::try_from(lists.non_empty()).unwrap_or(u64::MAX);
+    let listed_min = lists.lists().map(|l| l.ids.len()).min();
+    let listed_max = lists.lists().map(|l| l.ids.len()).max();
+    let walked = u64::try_from(lists.lists().count()).unwrap_or(u64::MAX);
+    let as_u64 = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
+    // Lists the sizes do not name are empty.
+    let list_size_min = if nlist == 0 {
+        None
+    } else if walked < nlist {
+        Some(0)
+    } else {
+        listed_min.map(as_u64)
+    };
+    let list_size_max = if nlist == 0 {
+        None
+    } else {
+        Some(listed_max.map_or(0, as_u64))
+    };
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "Faiss sums the sizes as doubles; the same conversion gives its value"
+    )]
+    let (imbalance_factor, list_size_mean) = {
+        let mut tot = 0.0_f64;
+        let mut uf = 0.0_f64;
+        for list in lists.lists() {
+            let h = list.ids.len() as f64;
+            tot += h;
+            uf += h * h;
+        }
+        let k = nlist as f64;
+        (
+            (tot > 0.0).then(|| uf * k / (tot * tot)),
+            (nlist > 0).then(|| lists.total as f64 / k),
+        )
+    };
+    IvfStats {
+        nlist,
+        nprobe: index.nprobe,
+        vectors: lists.total,
+        empty_lists: nlist.saturating_sub(non_empty),
+        list_size_min,
+        list_size_max,
+        list_size_mean,
+        imbalance_factor,
+        list_sizes: sizes,
+    }
+}

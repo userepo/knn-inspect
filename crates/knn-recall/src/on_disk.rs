@@ -75,8 +75,8 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
 use knn_format::faiss::{
-    CodeFormat, FlatStorage, FourCc, HeaderKind, IdMapIndex, IndexHeader, Metric, QT_FP16,
-    ScalarQuantizer, SqStorage, Storage, f16_to_f32,
+    CodeFormat, FlatStorage, FourCc, HeaderKind, HnswIndex, IdMapIndex, IndexHeader, Metric,
+    QT_FP16, ScalarQuantizer, SqStorage, Storage, f16_to_f32,
 };
 use knn_format::flat_vectors::{FlatField, VectorEncoding};
 use knn_format::quantized_vectors::{QuantizedField, QuantizedVectors, ScalarEncoding};
@@ -113,6 +113,16 @@ pub const UNIT_TOLERANCE: f64 = 2e-4;
 /// 1.1e-3 in all with the 1e-4 above; twice that.
 pub const FP16_UNIT_TOLERANCE: f64 = 2.2e-3;
 
+/// The graph of a file without its vectors. A graph with its storage, and
+/// an IVF index, which is never written without its vectors, hold their
+/// own.
+fn graph_without_vectors<'a>(index: &'a IdMapIndex<'a>) -> Result<&'a HnswIndex<'a>> {
+    index
+        .hnsw()
+        .filter(|hnsw| hnsw.storage.is_none())
+        .ok_or(Error::HasVectors)
+}
+
 /// The vectors of the field of a graph without its vectors, `index`, as
 /// storage of the graph's metric, row `i` node `i`'s: `flat` is the field's
 /// record in the `.vemf`, which places them in `vec`, the `.vec`, as
@@ -138,9 +148,7 @@ pub fn field_vectors<'a>(
     flat: &FlatField,
     vec: &'a [u8],
 ) -> Result<Storage<'a>> {
-    if index.index.storage.is_some() {
-        return Err(Error::HasVectors);
-    }
+    let hnsw = graph_without_vectors(index)?;
     let fourcc = match index.metric() {
         Metric::L2 => FourCc::FLAT_L2,
         Metric::InnerProduct => FourCc::FLAT_IP,
@@ -150,9 +158,9 @@ pub fn field_vectors<'a>(
             });
         }
     };
-    let d = index.index.header.d;
+    let d = hnsw.header.d;
     let dimension = usize::try_from(d).map_err(|_| Error::Dimension { d })?;
-    let nodes = index.index.graph.node_count();
+    let nodes = hnsw.graph.node_count();
     if index.id_map.len() != nodes {
         return Err(Error::LabelCount {
             nodes,
@@ -314,6 +322,8 @@ pub struct Plan {
 #[derive(Debug)]
 pub struct OnDiskField<'a> {
     index: &'a IdMapIndex<'a>,
+    /// The graph `index` wraps.
+    hnsw: &'a HnswIndex<'a>,
     records: QuantizedVectors<'a>,
     centroid: &'a [f32],
     centroid_dot_product: f32,
@@ -342,9 +352,7 @@ impl<'a> OnDiskField<'a> {
         flat: &FlatField,
         vec: &'a [u8],
     ) -> Result<Self> {
-        if index.index.storage.is_some() {
-            return Err(Error::HasVectors);
-        }
+        let hnsw = graph_without_vectors(index)?;
         let encoding = field.scalar_encoding.ok_or(Error::NoQuantizedVectors)?;
         if !encoding.is_knn() {
             return Err(Error::Encoding {
@@ -354,8 +362,8 @@ impl<'a> OnDiskField<'a> {
         let similarity = Similarity::from_ordinal(field.similarity).ok_or(Error::Similarity {
             ordinal: field.similarity,
         })?;
-        let d = index.index.header.d;
-        let nodes = index.index.graph.node_count();
+        let d = hnsw.header.d;
+        let nodes = hnsw.graph.node_count();
         let dimension = usize::try_from(d).map_err(|_| Error::Dimension { d })?;
         shape(
             "dimension",
@@ -367,6 +375,7 @@ impl<'a> OnDiskField<'a> {
         let labels = Labels::from_id_map(index.id_map)?;
         Ok(Self {
             index,
+            hnsw,
             records,
             centroid: &field.centroid,
             centroid_dot_product: field.centroid_dot_product,
@@ -470,7 +479,7 @@ impl<'a> OnDiskField<'a> {
             scorer
         };
         let top = lucene_search::search(
-            &self.index.index.graph,
+            &self.hnsw.graph,
             self.records.len(),
             plan.beam,
             u64::from(i32::MAX.unsigned_abs()),
@@ -536,7 +545,7 @@ impl<'a> OnDiskField<'a> {
     /// The draws run on the seed's entry stream, separated from the
     /// query sampling's ([`Draw::seed`]).
     fn entry_seeds(&self, draw: Draw) -> Option<Vec<usize>> {
-        let cagra = self.index.index.kind.cagra()?;
+        let cagra = self.hnsw.kind.cagra()?;
         let n = self.records.len();
         let count = draw
             .count
@@ -595,7 +604,9 @@ impl<'a> OnDiskField<'a> {
         match self.raw {
             Storage::Flat(s) => Some(exact_score(self.similarity, q, s.vector(node)?)),
             Storage::Sq(s) => Some(fp16_exact_score(self.similarity, q, fp16_row(&s, node)?)),
-            Storage::Binary(_) => None,
+            // The field's vectors are read from its .vec as float32 or
+            // fp16 storage, never as bits or codes.
+            Storage::Binary(_) | Storage::Pq(_) => None,
         }
     }
 }

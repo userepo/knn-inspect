@@ -23,7 +23,11 @@ use knn_format::segment_info::SegmentInfo;
 use knn_format::{NativeFile, view_offset};
 use serde::Serialize;
 
-use self::quantized::{Graph, HOLDS_ITS_VECTORS, LuceneQuantized, lucene_quantized};
+mod ivf;
+
+use self::quantized::{
+    Graph, HOLDS_ITS_VECTORS, IVF_HOLDS_ITS_VECTORS, LuceneQuantized, lucene_quantized,
+};
 use crate::verify::SpaceArg;
 
 /// Arguments of `scan`.
@@ -113,7 +117,14 @@ struct FileReport {
     error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     layout: Option<Vec<String>>,
-    /// `hnsw`, or `cagra` for the graph k-NN's remote index build writes.
+    /// k-NN's method, `hnsw` or `ivf`, and how the file stores a vector,
+    /// as `info` names them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    method: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    encoding: Option<&'static str>,
+    /// `hnsw`, or `cagra` for the graph k-NN's remote index build writes;
+    /// absent for an IVF index, which has no graph.
     #[serde(skip_serializing_if = "Option::is_none")]
     graph: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -382,6 +393,8 @@ fn unopened(path: &Path, e: &knn_format::Error) -> FileReport {
         size: None,
         error: Some(format!("opening {}: {e}", shown(path))),
         layout: None,
+        method: None,
+        encoding: None,
         graph: None,
         dimension: None,
         count: None,
@@ -437,13 +450,19 @@ fn scan_file(path: &Path, options: &Options) -> FileReport {
 
     let (lucene_vectors, lucene_docs, lucene_quantized) = if let Some(p) = &parsed {
         let index = &p.index;
-        let quantized = if index.index.storage.is_some() {
+        // Only a graph is ever written without its vectors.
+        let quantized = if index.ivf().is_some() {
+            LuceneQuantized::skipped(IVF_HOLDS_ITS_VECTORS.to_owned())
+        } else if index.hnsw().is_none_or(|h| h.storage.is_some()) {
             LuceneQuantized::skipped(HOLDS_ITS_VECTORS.to_owned())
         } else {
             lucene_quantized(path, Graph::of(index), options.space)
         };
         (
-            lucene_vectors(path, bytes, p),
+            match index.ivf() {
+                Some(ivf) => ivf::lucene_vectors(path, ivf, index.header.ntotal),
+                None => lucene_vectors(path, bytes, p),
+            },
             lucene_docs(path, p),
             quantized,
         )
@@ -471,7 +490,9 @@ fn scan_file(path: &Path, options: &Options) -> FileReport {
         size: Some(bytes.len()),
         error: None,
         layout: idx.map(|i| i.layout().iter().map(ToString::to_string).collect()),
-        graph: idx.map(|i| i.index.kind.name()),
+        method: idx.map(|i| i.index.method_name()),
+        encoding: idx.map(|i| i.index.encoding_name()),
+        graph: idx.and_then(|i| i.hnsw()).map(|h| h.kind.name()),
         dimension: idx.map(|i| i.header.d),
         count: idx.map(|i| i.header.ntotal),
         metric: idx.map(|i| i.metric().name()),
@@ -605,6 +626,9 @@ fn lucene_footer(bytes: &[u8]) -> Result<(), String> {
 /// Why a graph without its vectors has none to look for in a `.vec`.
 const GRAPH_ONLY: &str = "the native file holds the graph only: k-NN keeps the field's quantized vectors in Lucene's .veq file, checked under lucene_quantized";
 
+/// Why product-quantized codes are not looked for in a `.vec`.
+const PQ_CODES: &str = "the native file stores product-quantized codes, which hold no exact vectors to look for in the .vec";
+
 /// The bytes to look for in a `.vec`, how else the `.vec` may hold them,
 /// and the stored vectors' shape; or why there is nothing to look for.
 fn stored_vectors<'a>(
@@ -636,6 +660,7 @@ fn stored_vectors<'a>(
             CodeFormat::Byte => (sq.codes, Sources::Int8),
         },
         Storage::Binary(binary) => (binary.codes, Sources::Bits),
+        Storage::Pq(_) => return Err(PQ_CODES.to_owned()),
     };
     if storage.is_empty() {
         return Err("the native file holds no vectors".to_owned());
@@ -643,7 +668,9 @@ fn stored_vectors<'a>(
     // Lucene sees a binary field as bytes, its dimension the code size.
     let d = match all {
         Storage::Binary(binary) => binary.code_size().unwrap_or(0),
-        Storage::Flat(_) | Storage::Sq(_) => usize::try_from(all.header().d).unwrap_or(0),
+        Storage::Flat(_) | Storage::Sq(_) | Storage::Pq(_) => {
+            usize::try_from(all.header().d).unwrap_or(0)
+        }
     };
     let shape = Shape {
         rows: all.row_count(),
@@ -658,8 +685,9 @@ fn stored_vectors<'a>(
 fn lucene_vectors(path: &Path, bytes: &[u8], parsed: &knn_format::Parsed<'_>) -> LuceneVectors {
     let skipped = LuceneVectors::skipped;
     // Said first: whatever .vec lies beside it, or none, a graph without
-    // its vectors has nothing to compare with one.
-    let Some(all) = parsed.index.index.storage else {
+    // its vectors has nothing to compare with one. An IVF index's lists
+    // are compared in `ivf::lucene_vectors` instead.
+    let Some(all) = parsed.index.hnsw().and_then(|h| h.storage) else {
         return skipped(GRAPH_ONLY.to_owned());
     };
     let candidates = match segment_files(path, "vec") {
@@ -1457,7 +1485,14 @@ fn shape(r: &FileReport) -> String {
             } else {
                 ""
             };
-            format!("{}  d={d}{bits} n={n} {metric}{cagra}", layout.join(" > "))
+            let stored = match (r.method, r.encoding) {
+                (Some(method), Some(encoding)) => format!("  {method}/{encoding}"),
+                _ => String::new(),
+            };
+            format!(
+                "{}  d={d}{bits} n={n} {metric}{stored}{cagra}",
+                layout.join(" > ")
+            )
         }
         _ if r.status == Verdict::Unsupported && r.refused => {
             "(a scalar quantizer type k-NN never writes under this graph, refused)".to_owned()
@@ -1527,7 +1562,9 @@ fn text(out: &Output) -> String {
         .expect("writing to a String cannot fail");
         // Left out only for a file that holds its own vectors, where it
         // does not apply.
-        if r.lucene_quantized.detail != HOLDS_ITS_VECTORS {
+        if r.lucene_quantized.detail != HOLDS_ITS_VECTORS
+            && r.lucene_quantized.detail != IVF_HOLDS_ITS_VECTORS
+        {
             writeln!(
                 s,
                 "    {:<VERDICT_WIDTH$} {:<20} {}",

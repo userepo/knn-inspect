@@ -1,0 +1,101 @@
+{
+  "file": "ivf-l2-5x4-sparse-flat.faiss",
+  "size": 704,
+  "faiss_version": "1.15.1",
+  "seed": 20261013,
+  "description": "IVF16,Flat",
+  "dimension": 4,
+  "count": 5,
+  "trained_on": 100,
+  "metric": "l2",
+  "faiss_metric_type": 1,
+  "is_trained": true,
+  "template": {
+    "size": 395,
+    "crc32": 1862978799
+  },
+  "ids": {
+    "len": 5,
+    "first": 1000,
+    "last": 1004,
+    "crc32": 1513000472
+  },
+  "vectors_first": [
+    0.27579566836357117,
+    -0.6546063423156738,
+    0.07742086797952652,
+    0.23212121427059174
+  ],
+  "layout": [
+    "IxMp",
+    "IwFl",
+    "IxF2",
+    "ilar"
+  ],
+  "method": "ivf",
+  "encoding": "float32",
+  "ivf": {
+    "nlist": 16,
+    "nprobe": 1,
+    "code_size": 16,
+    "by_residual": null,
+    "quantizer": {
+      "fourcc": "IxF2",
+      "ntotal": 16,
+      "d": 4,
+      "metric_type": 1,
+      "is_trained": true,
+      "centroids_crc32": 2970638155,
+      "first_centroid": [
+        0.29444098472595215,
+        -0.8110248446464539,
+        -1.1504188776016235,
+        -1.48344886302948
+      ]
+    },
+    "direct_map": {
+      "type": 1,
+      "len": 5,
+      "crc32": 323784329,
+      "first": [
+        12,
+        0
+      ]
+    },
+    "lists": {
+      "encoding": "sprs",
+      "nlist": 16,
+      "code_size": 16,
+      "sizes": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        0,
+        0,
+        2
+      ],
+      "total": 5,
+      "non_empty": 4,
+      "codes_bytes": 80,
+      "codes_crc32": 3217568918,
+      "ids_crc32": 473948221,
+      "first_ids": [
+        4,
+        3,
+        0,
+        1,
+        2
+      ]
+    }
+  }
+}

@@ -693,7 +693,7 @@ fn scan_walks_a_directory_and_cross_checks_lucene_vectors() {
         assert_eq!(f["status"], "clean", "{f}");
         assert_eq!(f["count"], 500);
         assert_eq!(f["dimension"], 16);
-        assert_eq!(f["checks"].as_array().unwrap().len(), 17);
+        assert_eq!(f["checks"].as_array().unwrap().len(), 19);
         let name = f["file"].as_str().unwrap();
         let lv = &f["lucene_vectors"];
         if name.ends_with(".faissc") {
@@ -947,7 +947,15 @@ fn scan_searches_zero_filled_vectors_in_linear_time() {
     let mut bytes = std::fs::read(fixtures().join("synthetic/l2-4000x64.faiss")).unwrap();
     let (start, len) = {
         let parsed = knn_format::parse(&bytes).unwrap();
-        let codes = parsed.index.index.storage.unwrap().flat().unwrap().codes;
+        let codes = parsed
+            .index
+            .hnsw()
+            .unwrap()
+            .storage
+            .unwrap()
+            .flat()
+            .unwrap()
+            .codes;
         (
             knn_format::view_offset(&bytes, codes).unwrap(),
             codes.len() * 4,
@@ -1391,7 +1399,7 @@ impl SqSegment {
         let meta = std::fs::read(dir.join(vec_name).with_extension("vemf")).unwrap();
         let codes = {
             let parsed = knn_format::parse(&native).unwrap();
-            let storage = parsed.index.index.storage.unwrap();
+            let storage = parsed.index.hnsw().unwrap().storage.unwrap();
             knn_format::view_offset(&native, storage.code_bytes()).unwrap()
         };
         Self {
@@ -1750,7 +1758,7 @@ fn scan_checks_where_the_vemf_puts_the_vectors() {
         let parsed = knn_format::parse(&seg.native).unwrap();
         knn_format::view_offset(
             &seg.native,
-            parsed.index.index.storage.unwrap().code_bytes(),
+            parsed.index.hnsw().unwrap().storage.unwrap().code_bytes(),
         )
         .unwrap()
     };
@@ -2128,7 +2136,7 @@ fn scan_flags_binary_codes_that_differ_from_the_lucene_copy() {
         let parsed = knn_format::parse(&seg.native).unwrap();
         knn_format::view_offset(
             &seg.native,
-            parsed.index.index.storage.unwrap().code_bytes(),
+            parsed.index.hnsw().unwrap().storage.unwrap().code_bytes(),
         )
         .unwrap()
     };
@@ -2247,7 +2255,7 @@ fn scan_flags_corrupt_bits_beside_float_fields_that_are_not_theirs() {
         let parsed = knn_format::parse(&seg.native).unwrap();
         knn_format::view_offset(
             &seg.native,
-            parsed.index.index.storage.unwrap().code_bytes(),
+            parsed.index.hnsw().unwrap().storage.unwrap().code_bytes(),
         )
         .unwrap()
     };
@@ -2324,7 +2332,7 @@ fn a_mismatch_names_the_field_that_was_compared() {
         let parsed = knn_format::parse(&seg.native).unwrap();
         knn_format::view_offset(
             &seg.native,
-            parsed.index.index.storage.unwrap().code_bytes(),
+            parsed.index.hnsw().unwrap().storage.unwrap().code_bytes(),
         )
         .unwrap()
     };
@@ -2404,7 +2412,7 @@ fn equally_close_fields_report_the_last() {
         let parsed = knn_format::parse(&seg.native).unwrap();
         knn_format::view_offset(
             &seg.native,
-            parsed.index.index.storage.unwrap().code_bytes(),
+            parsed.index.hnsw().unwrap().storage.unwrap().code_bytes(),
         )
         .unwrap()
     };
@@ -2472,7 +2480,7 @@ fn on_disk_graphs_are_read_without_their_vectors() {
                 skipped.is_some_and(|s| s.contains("holds the graph only")),
                 "{check}"
             ),
-            "norms" => assert!(skipped.is_some(), "{check}"),
+            "norms" | "inverted_lists" | "direct_map" => assert!(skipped.is_some(), "{check}"),
             _ => assert!(skipped.is_none(), "{check}"),
         }
     }
@@ -2521,14 +2529,14 @@ fn on_disk_graphs_are_read_without_their_vectors() {
     assert_eq!(f["lucene_docs"]["status"], "match", "{f}");
     let text = stdout(&run(&["scan", dir.to_str().unwrap()]));
     assert!(
-        text.contains("    clean       IBMp > IBHf > null  d=16 n=500 l2\n"),
+        text.contains("    clean       IBMp > IBHf > null  d=16 n=500 l2  hnsw/none\n"),
         "{text}"
     );
     // Nor does a float file's dimension count bits.
     let float = fixtures().join("opensearch-3.9.0/nocfs/l2");
     let text = stdout(&run(&["scan", float.to_str().unwrap()]));
     assert!(
-        text.contains("    clean       IxMp > IHNf > IxF2  d=16 n=500 l2\n"),
+        text.contains("    clean       IxMp > IHNf > IxF2  d=16 n=500 l2  hnsw/float32\n"),
         "{text}"
     );
 
@@ -2587,7 +2595,7 @@ fn scan_reports_a_sound_file_it_cannot_read_as_unsupported() {
     let mut bytes = std::fs::read(&source).unwrap();
     let qtype_at = {
         let parsed = knn_format::parse(&bytes).unwrap();
-        match parsed.index.index.storage {
+        match parsed.index.hnsw().unwrap().storage {
             Some(knn_format::faiss::Storage::Sq(s)) => s.quantizer.offset,
             other => panic!("expected scalar-quantized storage, got {other:?}"),
         }
@@ -3068,7 +3076,7 @@ fn cagra_graphs_scan_clean() {
     );
     let text = stdout(&run(&["scan", scratch.0.to_str().unwrap()]));
     assert!(
-        text.contains("IxMp > IHc2 > null  d=64 n=100 inner_product  cagra\n"),
+        text.contains("IxMp > IHc2 > null  d=64 n=100 inner_product  hnsw/none  cagra\n"),
         "{text}"
     );
     let o = run(&["info", null_path.to_str().unwrap()]);
@@ -3253,7 +3261,7 @@ fn remote_built_from(bytes: &[u8]) -> Vec<u8> {
     let parsed = knn_format::parse(bytes).unwrap();
     let idx = &parsed.index;
     assert_eq!(idx.layout()[2].to_string(), "null");
-    let graph = &idx.index.graph;
+    let graph = &idx.hnsw().unwrap().graph;
     let float_header = |h: &knn_format::faiss::IndexHeader| {
         let mut out = Vec::new();
         out.extend_from_slice(&h.d.to_le_bytes());
@@ -3268,7 +3276,7 @@ fn remote_built_from(bytes: &[u8]) -> Vec<u8> {
     out.extend_from_slice(b"IxMp");
     out.extend_from_slice(&float_header(&idx.header));
     out.extend_from_slice(b"IHc2");
-    out.extend_from_slice(&float_header(&idx.index.header));
+    out.extend_from_slice(&float_header(&idx.hnsw().unwrap().header));
     // keep_max_size_level0, base_level_only, 32 entry points, Float32.
     out.extend_from_slice(&[1, 1]);
     out.extend_from_slice(&32_i32.to_le_bytes());
@@ -3414,7 +3422,7 @@ fn scan_checks_a_remote_built_graph_against_the_fields_quantized_vectors() {
     );
     let text = stdout(&run(&["scan", scratch.0.to_str().unwrap()]));
     assert!(
-        text.contains("    clean       IxMp > IHc2 > null  d=16 n=500 l2  cagra\n"),
+        text.contains("    clean       IxMp > IHc2 > null  d=16 n=500 l2  hnsw/none  cagra\n"),
         "{text}"
     );
 }
@@ -3586,5 +3594,565 @@ fn scan_reads_the_segments_the_remote_build_wrote() {
             .unwrap()
             .starts_with("500 records of 24 bytes"),
         "{q}"
+    );
+}
+
+#[test]
+fn trained_ivf_indexes_are_read_by_info() {
+    // k-NN's ivf method writes an IVF index through a model: info prints
+    // its lists, quantizer, and direct map, for every encoding.
+    let dir = fixtures().join("synthetic-ivf");
+    let file = dir.join("ivf-l2-1000x32-sqfp16.faiss");
+    let path = file.to_str().unwrap();
+
+    let o = run(&["info", "--json", path]);
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(
+        v["layout"],
+        serde_json::json!(["IxMp", "IwSq", "IxF2", "ilar"]),
+        "{v}"
+    );
+    assert_eq!(v["method"], "ivf", "{v}");
+    assert_eq!(v["encoding"], "fp16", "{v}");
+    assert!(v.get("graph").is_none(), "{v}");
+    assert!(v.get("hnsw").is_none(), "{v}");
+    assert!(v.get("cagra").is_none(), "{v}");
+    assert_eq!(v["metric"], "l2", "{v}");
+    assert_eq!(v["quantizer"]["name"], "QT_fp16", "{v}");
+    assert_eq!(
+        v["ivf"],
+        serde_json::json!({
+            "nlist": 4,
+            "nprobe": 1,
+            "code_size": 64,
+            "by_residual": true,
+            "coarse_quantizer": {
+                "fourcc": "IxF2",
+                "count": 4,
+                "dimension": 32,
+                "metric": "l2",
+                "is_trained": true
+            },
+            "direct_map": {"type": 1, "name": "array", "entries": 1000},
+            "lists": {
+                "sizes": "full",
+                "nlist": 4,
+                "code_size": 64,
+                "non_empty": 4,
+                "total": 1000,
+                "min": 232,
+                "max": 265
+            }
+        }),
+        "{v}"
+    );
+    let text = stdout(&run(&["info", path]));
+    for line in [
+        "  layout          IxMp > IwSq > IxF2 > ilar\n",
+        "  method          ivf, vectors stored as fp16\n",
+        "  quantizer       QT_fp16 (type 4), dimension 32, code size 64, trained values 0\n",
+        "  ivf             nlist 4, nprobe 1, code size 64 bytes, codes of the residual from the centroid\n",
+        "  centroids       4 in IxF2, dimension 32, metric l2 (the coarse quantizer)\n",
+        "  direct map      array (type 1), 1000 entries\n",
+        "  inverted lists  4 of 4 non-empty, 1000 vectors, sizes 232 to 265 (full list sizes), code size 64 bytes\n",
+        "  labels          1000 (1000..1999)\n",
+    ] {
+        assert!(text.contains(line), "{text}");
+    }
+    assert!(!text.contains("  hnsw "), "{text}");
+}
+
+#[test]
+fn every_ivf_encoding_is_read_by_info() {
+    // A flat IVF index with sparse list sizes and another nprobe; a
+    // product-quantized one; a binary one.
+    let dir = fixtures().join("synthetic-ivf");
+    let sparse = dir.join("ivf-l2-5x4-sparse-flat.faiss");
+    let text = stdout(&run(&["info", sparse.to_str().unwrap()]));
+    assert!(
+        text.contains("  ivf             nlist 16, nprobe 1, code size 16 bytes\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "  inverted lists  4 of 16 non-empty, 5 vectors, sizes 0 to 2 (sparse list sizes), code size 16 bytes\n"
+        ),
+        "{text}"
+    );
+    let o = run(&[
+        "info",
+        "--json",
+        dir.join("ivf-ip-1000x32-flat.faiss").to_str().unwrap(),
+    ]);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["ivf"]["nprobe"], 2, "{v}");
+    assert_eq!(v["encoding"], "float32", "{v}");
+    assert!(v["ivf"].get("by_residual").is_none(), "{v}");
+    let o = run(&[
+        "info",
+        "--json",
+        dir.join("ivf-l2-1000x32-pq4x8.faiss").to_str().unwrap(),
+    ]);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["encoding"], "pq", "{v}");
+    assert_eq!(
+        v["pq"],
+        serde_json::json!({
+            "dimension": 32,
+            "m": 4,
+            "nbits": 8,
+            "sub_dimension": 8,
+            "centroids_per_sub": 256,
+            "centroid_floats": 8192,
+            "code_size": 4
+        }),
+        "{v}"
+    );
+    let text = stdout(&run(&[
+        "info",
+        dir.join("ivf-l2-1000x32-pq4x8.faiss").to_str().unwrap(),
+    ]));
+    assert!(
+        text.contains(
+            "  pq              M 4, 8 bits per code, 256 centroids per sub-quantizer of dimension 8, 8192 floats stored, code size 4 bytes\n"
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("  pq search "), "{text}");
+    let binary = dir.join("bivf-hamming-100x16.faiss");
+    let o = run(&["info", "--json", binary.to_str().unwrap()]);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(
+        v["layout"],
+        serde_json::json!(["IBMp", "IBwF", "IBxF", "ilar"]),
+        "{v}"
+    );
+    assert_eq!(v["encoding"], "binary", "{v}");
+    assert_eq!(v["metric"], "hamming", "{v}");
+    assert_eq!(v["code_size"], 2, "{v}");
+    assert_eq!(v["ivf"]["coarse_quantizer"]["fourcc"], "IBxF", "{v}");
+    assert_eq!(v["ivf"]["coarse_quantizer"]["metric"], "hamming", "{v}");
+    let text = stdout(&run(&["info", binary.to_str().unwrap()]));
+    assert!(
+        text.contains("  dimension       16 bits, code size 2 bytes\n"),
+        "{text}"
+    );
+}
+
+#[test]
+fn trained_ivf_indexes_are_checked_counted_and_scanned() {
+    // verify runs every check but the graph's on an IVF index; stats
+    // reports its lists; recall, which needs the IVF search, refuses it
+    // with a reason; scan counts every trained fixture clean and names its
+    // method and encoding.
+    let dir = fixtures().join("synthetic-ivf");
+    let file = dir.join("ivf-l2-1000x32-sqfp16.faiss");
+    let path = file.to_str().unwrap();
+
+    let o = run(&["verify", "--space", "l2", path]);
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+    let text = stdout(&o);
+    for line in [
+        "  pass  headers",
+        "  pass  metric",
+        "  pass  vector_count",
+        "  pass  inverted_lists",
+        "  pass  direct_map",
+        "  pass  id_map_length",
+        "  pass  vector_values",
+        "  skip  offsets              an IVF index has no graph\n",
+    ] {
+        assert!(text.contains(line), "{text}");
+    }
+    assert!(text.ends_with("clean; exit code 0\n"), "{text}");
+
+    let o = run(&["stats", path]);
+    assert_eq!(o.status.code(), Some(0));
+    let text = stdout(&o);
+    for line in [
+        "  method          ivf, nlist 4, nprobe 1\n",
+        "  vectors         1000 in 4 of 4 lists, 0 empty\n",
+        "  list sizes      min 232, mean 250.00, max 265\n",
+        "  sizes           241 232 265 262\n",
+    ] {
+        assert!(text.contains(line), "{text}");
+    }
+    let o = run(&["stats", "--json", path]);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["method"], "ivf", "{v}");
+    assert_eq!(
+        v["list_sizes"],
+        serde_json::json!([241, 232, 265, 262]),
+        "{v}"
+    );
+    assert!(v.get("layers").is_none(), "{v}");
+    let graph = fixtures().join("synthetic/l2-100x4.faiss");
+    let o = run(&["stats", "--json", graph.to_str().unwrap()]);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["method"], "hnsw", "{v}");
+
+    let o = run(&["recall", path, "--sample", "3"]);
+    assert_eq!(o.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&o.stderr).into_owned();
+    assert!(err.contains("an IVF index, whose search recall"), "{err}");
+
+    let o = run(&["scan", "--json", dir.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    let files = v["files"].as_array().unwrap();
+    assert_eq!(files.len(), 14, "{v}");
+    for f in files {
+        assert_eq!(f["status"], "clean", "{f}");
+        let name = f["file"].as_str().unwrap();
+        if name.contains("hnsw-") {
+            assert_eq!(f["graph"], "hnsw", "{f}");
+            assert_eq!(f["method"], "hnsw", "{f}");
+        } else {
+            assert!(f.get("graph").is_none(), "{f}");
+            assert_eq!(f["method"], "ivf", "{f}");
+        }
+        assert!(f["encoding"].is_string(), "{f}");
+    }
+    let text = stdout(&run(&["scan", dir.to_str().unwrap()]));
+    assert!(
+        text.contains(
+            "    clean       IxMp > IwPQ > IxFI > ilar  d=32 n=1000 inner_product  ivf/pq\n"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "14 file(s): 14 clean, 0 with warnings, 0 unsupported, 0 failed; exit code 0"
+        ),
+        "{text}"
+    );
+}
+
+#[test]
+fn scan_matches_live_trained_segments_against_their_lucene_files() {
+    // The segments OpenSearch 3.9.0 wrote through trained models: each
+    // verifies clean with its space, and the vectors its lists code are
+    // the field's in the .vec, row by row in the order k-NN added them,
+    // except product-quantized codes, which hold no exact vectors.
+    let root = fixtures().join("opensearch-3.9.0-trained");
+    for (set, space, layout, encoding, how) in [
+        (
+            "ivf-flat/l2",
+            "l2",
+            "IxMp > IwFl > IxF2 > ilar",
+            "float32",
+            "byte for byte, through the inverted lists",
+        ),
+        (
+            "ivf-flat/innerproduct",
+            "innerproduct",
+            "IxMp > IwFl > IxFI > ilar",
+            "float32",
+            "byte for byte, through the inverted lists",
+        ),
+        (
+            "ivf-sq-fp16/l2",
+            "l2",
+            "IxMp > IwSq > IxF2 > ilar",
+            "fp16",
+            "as float32 values whose residuals from their lists' centroids round to the stored codes",
+        ),
+        (
+            "ivf-byte/l2",
+            "l2",
+            "IxMp > IwSq > IxF2 > ilar",
+            "byte",
+            "as int8 values whose residuals from their lists' centroids, plus 128, truncate to the stored codes wherever that conversion is defined",
+        ),
+        (
+            "ivf-binary/hamming",
+            "hamming",
+            "IBMp > IBwF > IBxF > ilar",
+            "binary",
+            "byte for byte, through the inverted lists",
+        ),
+        ("ivf-pq/l2", "l2", "IxMp > IwPQ > IxF2 > ilar", "pq", ""),
+        ("hnsw-pq/l2", "l2", "IxMp > IHNp > IxPq", "pq", ""),
+        (
+            "hnsw-pq/innerproduct",
+            "innerproduct",
+            "IxMp > IHNp > IxPq",
+            "pq",
+            "",
+        ),
+    ] {
+        let dir = root.join(set);
+        let o = run(&["scan", "--space", space, "--json", dir.to_str().unwrap()]);
+        assert_eq!(o.status.code(), Some(0), "{set}: {}", stdout(&o));
+        let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+        let files = v["files"].as_array().unwrap();
+        assert_eq!(
+            files.len(),
+            1,
+            "{set}: the model's blob is not a native file"
+        );
+        let f = &files[0];
+        assert_eq!(f["status"], "clean", "{set}: {f}");
+        assert_eq!(f["encoding"], encoding, "{set}: {f}");
+        assert_eq!(f["count"], 500, "{set}: {f}");
+        assert_eq!(f["lucene_docs"]["status"], "match", "{set}: {f}");
+        let lv = &f["lucene_vectors"];
+        if how.is_empty() {
+            assert_eq!(lv["status"], "skipped", "{set}: {lv}");
+            assert!(
+                lv["detail"]
+                    .as_str()
+                    .unwrap()
+                    .contains("product-quantized codes"),
+                "{set}: {lv}"
+            );
+        } else {
+            assert_eq!(lv["status"], "match", "{set}: {lv}");
+            assert!(
+                lv["detail"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("500 vectors found at offset ")
+                    && lv["detail"].as_str().unwrap().ends_with(how),
+                "{set}: {lv}"
+            );
+            assert!(
+                lv["file"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with("_2_NativeEngines990KnnVectorsFormat_0.vec"),
+                "{set}: {lv}"
+            );
+        }
+        let text = stdout(&run(&["scan", dir.to_str().unwrap()]));
+        assert!(
+            text.contains(&format!("    clean       {layout}  d=")),
+            "{set}: {text}"
+        );
+    }
+}
+
+#[test]
+fn a_graph_over_product_quantized_codes_is_read_by_info_verify_and_stats() {
+    // k-NN's hnsw method with the pq encoder: an HNSW graph over IxPq.
+    // Every graph command runs; recall, which needs exact vectors, refuses
+    // the codes.
+    let dir = fixtures().join("synthetic-ivf");
+    let file = dir.join("hnsw-ip-1000x32-pq4.faiss");
+    let path = file.to_str().unwrap();
+
+    let o = run(&["info", "--json", path]);
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(
+        v["layout"],
+        serde_json::json!(["IxMp", "IHNp", "IxPq"]),
+        "{v}"
+    );
+    assert_eq!(v["method"], "hnsw", "{v}");
+    assert_eq!(v["encoding"], "pq", "{v}");
+    assert_eq!(v["graph"], "hnsw", "{v}");
+    assert_eq!(v["metric"], "inner_product", "{v}");
+    assert_eq!(v["pq"]["m"], 4, "{v}");
+    assert_eq!(v["pq"]["search_type"], 0, "{v}");
+    assert_eq!(v["pq"]["encode_signs"], false, "{v}");
+    assert_eq!(v["pq"]["polysemous_ht"], 33, "{v}");
+    assert_eq!(
+        v["hnsw"]["level_counts"],
+        serde_json::json!([1000, 57, 3]),
+        "{v}"
+    );
+    assert!(v.get("ivf").is_none(), "{v}");
+    let text = stdout(&run(&["info", path]));
+    for line in [
+        "  layout          IxMp > IHNp > IxPq\n",
+        "  method          hnsw, vectors stored as pq\n",
+        "  pq              M 4, 8 bits per code, 256 centroids per sub-quantizer of dimension 8, 8192 floats stored, code size 4 bytes\n",
+        "  pq search       type 0 (ST_PQ), encode_signs 0, polysemous_ht 33\n",
+        "  hnsw            M 16, efConstruction 100, efSearch 16\n",
+    ] {
+        assert!(text.contains(line), "{text}");
+    }
+
+    let o = run(&["verify", "--space", "cosine", path]);
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+    let text = stdout(&o);
+    assert!(text.contains("  pass  vector_count"), "{text}");
+    assert!(text.contains("  pass  vector_values"), "{text}");
+    assert!(
+        text.contains(
+            "  skip  norms                product-quantized codes hold no exact vectors to measure"
+        ),
+        "{text}"
+    );
+
+    let o = run(&["stats", "--json", path]);
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["nodes"], 1000, "{v}");
+    assert_eq!(v["layers"][0]["unreachable"], 40, "{v}");
+
+    let o = run(&["recall", path, "--sample", "3"]);
+    assert_eq!(o.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&o.stderr).into_owned();
+    assert!(err.contains("product-quantized codes"), "{err}");
+
+    // Every other graph names its method and encoding too; a graph
+    // without its vectors stores none.
+    let o = run(&[
+        "info",
+        "--json",
+        fixtures()
+            .join("synthetic-byte/l2-100x4-byte.faiss")
+            .to_str()
+            .unwrap(),
+    ]);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["method"], "hnsw", "{v}");
+    assert_eq!(v["encoding"], "byte", "{v}");
+    let o = run(&[
+        "info",
+        "--json",
+        fixtures()
+            .join("opensearch-3.9.0-binary/on-disk/l2/_2_165_vec.faiss")
+            .to_str()
+            .unwrap(),
+    ]);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["method"], "hnsw", "{v}");
+    assert_eq!(v["encoding"], "none", "{v}");
+    let text = stdout(&run(&[
+        "info",
+        fixtures()
+            .join("synthetic/l2-100x4.faiss")
+            .to_str()
+            .unwrap(),
+    ]));
+    assert!(
+        text.contains("  method          hnsw, vectors stored as float32\n"),
+        "{text}"
+    );
+}
+
+#[test]
+fn scan_reports_a_live_ivf_segment_whose_vec_holds_other_vectors() {
+    // One component of row 7 of each field's .vec moved past any rounding
+    // its code allows, the footer resealed: the vectors the lists code are
+    // no longer the field's, and scan says so. Without the reseal the
+    // .vec is damaged instead.
+    let root = fixtures().join("opensearch-3.9.0-trained");
+    for (set, row_bytes, at, value) in [
+        // float32: component 0 of row 7, any change shows.
+        ("ivf-flat/l2", 16 * 4, 0, 1.0e6_f32.to_le_bytes().to_vec()),
+        // fp16 residuals: a value no centroid brings near its code.
+        (
+            "ivf-sq-fp16/l2",
+            16 * 4,
+            0,
+            1.0e6_f32.to_le_bytes().to_vec(),
+        ),
+        // int8: 127 where the draw rounded to far less.
+        // int8: one step, which keeps the residual inside the byte range,
+        // where its code is defined; the value is set below.
+        ("ivf-byte/l2", 16, 3, vec![0]),
+        // bits: one byte inverted.
+        ("ivf-binary/hamming", 16, 0, Vec::new()),
+    ] {
+        let source = root.join(set);
+        let scratch = Scratch::new(&format!("ivf-mismatch-{}", set.replace('/', "-")));
+        for entry in std::fs::read_dir(&source).unwrap() {
+            let p = entry.unwrap().path();
+            std::fs::copy(&p, scratch.0.join(p.file_name().unwrap())).unwrap();
+        }
+        let vec_path = scratch.0.join("_2_NativeEngines990KnnVectorsFormat_0.vec");
+        let mut vec = std::fs::read(&vec_path).unwrap();
+        let space = set.split('/').nth(1).unwrap();
+        let o = run(&[
+            "scan",
+            "--space",
+            space,
+            "--json",
+            scratch.0.to_str().unwrap(),
+        ]);
+        let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+        let offset =
+            usize::try_from(v["files"][0]["lucene_vectors"]["offset"].as_u64().unwrap()).unwrap();
+        let start = offset + 7 * row_bytes + at;
+        if value.is_empty() {
+            vec[start] = !vec[start];
+        } else if set.starts_with("ivf-byte") {
+            let x = i8::from_ne_bytes([vec[start]]);
+            let stepped = if x < 127 { x + 1 } else { x - 1 };
+            vec[start] = stepped.to_ne_bytes()[0];
+        } else {
+            vec[start..start + value.len()].copy_from_slice(&value);
+        }
+        std::fs::write(&vec_path, &vec).unwrap();
+        let o = run(&[
+            "scan",
+            "--space",
+            space,
+            "--json",
+            scratch.0.to_str().unwrap(),
+        ]);
+        let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+        assert_eq!(
+            v["files"][0]["lucene_vectors"]["status"], "damaged",
+            "{set}: {v}"
+        );
+        reseal(&mut vec);
+        std::fs::write(&vec_path, &vec).unwrap();
+        let o = run(&[
+            "scan",
+            "--space",
+            space,
+            "--json",
+            scratch.0.to_str().unwrap(),
+        ]);
+        assert_eq!(o.status.code(), Some(1), "{set}: {}", stdout(&o));
+        let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+        let lv = &v["files"][0]["lucene_vectors"];
+        assert_eq!(lv["status"], "mismatch", "{set}: {lv}");
+        assert!(
+            lv["detail"].as_str().unwrap().starts_with(
+                "the vectors the inverted lists code appear in none of the segment's .vec files"
+            ),
+            "{set}: {lv}"
+        );
+    }
+}
+
+#[test]
+fn an_ivf_segment_without_its_vemf_is_not_compared() {
+    // Without a .vemf to say where the field lies, the lists are not
+    // searched for in the .vec, as a graph's storage is: the comparison is
+    // skipped, and the file is clean.
+    let source = fixtures().join("opensearch-3.9.0-trained/ivf-flat/l2");
+    let scratch = Scratch::new("ivf-no-vemf");
+    for entry in std::fs::read_dir(&source).unwrap() {
+        let p = entry.unwrap().path();
+        if p.extension().is_some_and(|e| e == "vemf") {
+            continue;
+        }
+        std::fs::copy(&p, scratch.0.join(p.file_name().unwrap())).unwrap();
+    }
+    let o = run(&[
+        "scan",
+        "--space",
+        "l2",
+        "--json",
+        scratch.0.to_str().unwrap(),
+    ]);
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    let lv = &v["files"][0]["lucene_vectors"];
+    assert_eq!(lv["status"], "skipped", "{lv}");
+    assert!(
+        lv["detail"]
+            .as_str()
+            .unwrap()
+            .starts_with("no .vemf this tool reads beside "),
+        "{lv}"
     );
 }

@@ -548,5 +548,195 @@
       "check": "headers",
       "severity": "warning"
     }
+  },
+  {
+    "file": "ivf-quantizer-count.faiss",
+    "source": "fixtures/synthetic-ivf/ivf-l2-100x4-flat.faiss",
+    "mutation": "coarse quantizer header says 5 centroids for nlist 4",
+    "space": null,
+    "expect": {
+      "check": "headers",
+      "severity": "failure"
+    }
+  },
+  {
+    "file": "ivf-quantizer-metric.faiss",
+    "source": "fixtures/synthetic-ivf/ivf-l2-100x4-flat.faiss",
+    "mutation": "coarse quantizer metric type set to 0 (inner product) under an L2 index",
+    "space": null,
+    "expect": {
+      "check": "headers",
+      "severity": "failure"
+    }
+  },
+  {
+    "file": "ivf-untrained.faiss",
+    "source": "fixtures/synthetic-ivf/ivf-l2-100x4-flat.faiss",
+    "mutation": "ivf header is_trained flag cleared",
+    "space": null,
+    "expect": {
+      "check": "headers",
+      "severity": "warning"
+    }
+  },
+  {
+    "file": "ivf-pq-centroid-count.faiss",
+    "source": "fixtures/synthetic-ivf/ivf-l2-1000x32-pq4x8.faiss",
+    "mutation": "product quantizer nbits set to 7; the table holds 8 bits' centroids",
+    "space": null,
+    "expect": {
+      "check": "headers",
+      "severity": "failure"
+    }
+  },
+  {
+    "file": "bivf-quantizer-code-size.faiss",
+    "source": "fixtures/synthetic-ivf/bivf-hamming-100x16.faiss",
+    "mutation": "binary coarse quantizer header code size set to 3; the index's is 2",
+    "space": null,
+    "expect": {
+      "check": "headers",
+      "severity": "failure"
+    }
+  },
+  {
+    "file": "ivf-count-mismatch.faiss",
+    "source": "fixtures/synthetic-ivf/ivf-l2-100x4-flat.faiss",
+    "mutation": "id map and ivf headers say 101 vectors; the lists hold 100",
+    "space": null,
+    "expect": {
+      "check": "vector_count",
+      "severity": "failure"
+    }
+  },
+  {
+    "file": "ivf-list-id-out-of-range.faiss",
+    "source": "fixtures/synthetic-ivf/ivf-l2-100x4-flat.faiss",
+    "mutation": "list 0's first id set to 100, past the 100 vectors",
+    "space": null,
+    "expect": {
+      "check": "inverted_lists",
+      "severity": "failure"
+    }
+  },
+  {
+    "file": "ivf-list-id-repeated.faiss",
+    "source": "fixtures/synthetic-ivf/ivf-l2-100x4-flat.faiss",
+    "mutation": "list 1's first id set to list 0's",
+    "space": null,
+    "expect": {
+      "check": "inverted_lists",
+      "severity": "failure"
+    }
+  },
+  {
+    "file": "ivf-direct-map-entry.faiss",
+    "source": "fixtures/synthetic-ivf/ivf-l2-100x4-flat.faiss",
+    "mutation": "direct map entry of vector 0 set to list 1 position 0",
+    "space": null,
+    "expect": {
+      "check": "direct_map",
+      "severity": "warning"
+    }
+  },
+  {
+    "file": "ivf-direct-map-unset.faiss",
+    "source": "fixtures/synthetic-ivf/ivf-l2-100x4-flat.faiss",
+    "mutation": "direct map entry of vector 1 set to -1, no list",
+    "space": null,
+    "expect": {
+      "check": "direct_map",
+      "severity": "warning"
+    }
+  },
+  {
+    "file": "ivf-nprobe-zero.faiss",
+    "source": "fixtures/synthetic-ivf/ivf-l2-100x4-flat.faiss",
+    "mutation": "nprobe set to 0",
+    "space": null,
+    "expect": {
+      "check": "headers",
+      "severity": "failure"
+    }
+  },
+  {
+    "file": "ivf-nprobe-negative.faiss",
+    "source": "fixtures/synthetic-ivf/ivf-l2-100x4-flat.faiss",
+    "mutation": "nprobe set to 2^31, which k-NN's int cast makes negative",
+    "space": null,
+    "expect": {
+      "check": "headers",
+      "severity": "failure"
+    }
+  },
+  {
+    "file": "bivf-nprobe-negative.faiss",
+    "source": "fixtures/synthetic-ivf/bivf-hamming-100x16.faiss",
+    "mutation": "binary nprobe set to 2^31, which k-NN's int cast makes negative",
+    "space": null,
+    "expect": {
+      "check": "headers",
+      "severity": "failure"
+    }
+  },
+  {
+    "file": "ivf-pq-not-by-residual.faiss",
+    "source": "fixtures/synthetic-ivf/ivf-l2-1000x32-pq4x8.faiss",
+    "mutation": "by_residual flag cleared",
+    "space": null,
+    "expect": {
+      "check": "headers",
+      "severity": "warning"
+    }
+  },
+  {
+    "file": "ivf-direct-map-none.faiss",
+    "source": "fixtures/synthetic-ivf/ivf-l2-100x4-flat.faiss",
+    "mutation": "direct map type set to 0 (none); the array stays",
+    "space": null,
+    "expect": {
+      "check": "direct_map",
+      "severity": "warning"
+    }
+  },
+  {
+    "file": "ivf-nan-centroid.faiss",
+    "source": "fixtures/synthetic-ivf/ivf-l2-100x4-flat.faiss",
+    "mutation": "centroid 0 component 1 set to NaN",
+    "space": null,
+    "expect": {
+      "check": "vector_values",
+      "severity": "warning"
+    }
+  },
+  {
+    "file": "ivf-inf-code.faiss",
+    "source": "fixtures/synthetic-ivf/ivf-l2-100x4-flat.faiss",
+    "mutation": "list 2's first vector, component 2, set to -inf",
+    "space": null,
+    "expect": {
+      "check": "vector_values",
+      "severity": "warning"
+    }
+  },
+  {
+    "file": "ivf-pq-nan-centroid.faiss",
+    "source": "fixtures/synthetic-ivf/ivf-l2-1000x32-pq4x8.faiss",
+    "mutation": "product quantizer centroid 0 component 0 set to NaN",
+    "space": null,
+    "expect": {
+      "check": "vector_values",
+      "severity": "warning"
+    }
+  },
+  {
+    "file": "ivf-bf16-not-unit.faiss",
+    "source": "fixtures/synthetic-ivf/ivf-ip-1000x32-sqbf16.faiss",
+    "mutation": "a residual component of list 0's first vector set to 1.0",
+    "space": "cosinesimil",
+    "expect": {
+      "check": "norms",
+      "severity": "warning"
+    }
   }
 ]

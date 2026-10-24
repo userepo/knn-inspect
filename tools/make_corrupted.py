@@ -21,7 +21,11 @@ mutate it, for the header rules of that layout. The `cagra-` cases
 mutate the smallest float CAGRA file, for the rules of a graph searched
 from random entry points: its entry point, `max_level`, and upper levels
 are never read, so what the builder leaves in them warns rather than
-fails, and its own fields have rules of their own.
+fails, and its own fields have rules of their own. The `ivf-` and `bivf-` cases
+mutate the smallest IVF file (`IVF4,Flat`, 100 vectors of 4
+dimensions), and the product-quantized, bf16, and binary ones where a
+rule is theirs, for the checks of an IVF index's quantizer, lists, and
+direct map.
 
 Usage:
     python tools/make_corrupted.py [--out fixtures/corrupted]
@@ -47,6 +51,10 @@ SYNTHETIC_BYTE = ROOT / "fixtures/synthetic-byte/l2-100x4-byte.faiss"
 SYNTHETIC_BINARY = ROOT / "fixtures/synthetic-binary/hamming-100x16-binary.faiss"
 SYNTHETIC_CAGRA = ROOT / "fixtures/synthetic-cagra/ip-100x64-cagra.faiss"
 REAL_L2 = ROOT / "fixtures/opensearch-3.9.0/nocfs/l2/_2_165_vec.faiss"
+SYNTHETIC_IVF = ROOT / "fixtures/synthetic-ivf/ivf-l2-100x4-flat.faiss"
+SYNTHETIC_IVF_PQ = ROOT / "fixtures/synthetic-ivf/ivf-l2-1000x32-pq4x8.faiss"
+SYNTHETIC_IVF_BF16 = ROOT / "fixtures/synthetic-ivf/ivf-ip-1000x32-sqbf16.faiss"
+SYNTHETIC_BIVF = ROOT / "fixtures/synthetic-ivf/bivf-hamming-100x16.faiss"
 
 
 def fields(data: bytes) -> dict:
@@ -469,6 +477,125 @@ def build() -> Cases:
     c.add("cagra-storage-untrained", SYNTHETIC_CAGRA, "a CAGRA graph's storage header says untrained; only the ID map's header is left so by the builder", "headers", "warning", cagra_storage_untrained)
 
     c.add("cagra-not-base-level-only", SYNTHETIC_CAGRA, "a CAGRA graph's base_level_only flag cleared: k-NN's memory-optimized search still starts from random entry points, Faiss's own from the -1 entry point, finding nothing", "headers", "warning", cagra_not_base_only)
+
+    # --- IVF indexes ---
+    def ivf_quantizer_count(d, f):
+        put(d, f["quantizer.ntotal"]["offset"], "<q", 5)
+        return d
+
+    c.add("ivf-quantizer-count", SYNTHETIC_IVF, "coarse quantizer header says 5 centroids for nlist 4", "headers", "failure", ivf_quantizer_count)
+
+    def ivf_quantizer_metric(d, f):
+        put(d, f["quantizer.metric_type"]["offset"], "<i", 0)
+        return d
+
+    c.add("ivf-quantizer-metric", SYNTHETIC_IVF, "coarse quantizer metric type set to 0 (inner product) under an L2 index", "headers", "failure", ivf_quantizer_metric)
+
+    def ivf_untrained(d, f):
+        put(d, f["ivf.is_trained"]["offset"], "<?", False)
+        return d
+
+    c.add("ivf-untrained", SYNTHETIC_IVF, "ivf header is_trained flag cleared", "headers", "warning", ivf_untrained)
+
+    def ivf_pq_centroid_count(d, f):
+        # 7 bits keep the code size at 4 bytes, so the lists still read,
+        # and size the table at 32 x 128 floats; it holds 32 x 256.
+        put(d, f["ivf.pq.nbits"]["offset"], "<Q", 7)
+        return d
+
+    c.add("ivf-pq-centroid-count", SYNTHETIC_IVF_PQ, "product quantizer nbits set to 7; the table holds 8 bits' centroids", "headers", "failure", ivf_pq_centroid_count)
+
+    def bivf_quantizer_code_size(d, f):
+        put(d, f["quantizer.code_size"]["offset"], "<i", 3)
+        return d
+
+    c.add("bivf-quantizer-code-size", SYNTHETIC_BIVF, "binary coarse quantizer header code size set to 3; the index's is 2", "headers", "failure", bivf_quantizer_code_size)
+
+    def ivf_count(d, f):
+        for h in ("idmap", "ivf"):
+            put(d, f[f"{h}.ntotal"]["offset"], "<q", 101)
+        return d
+
+    c.add("ivf-count-mismatch", SYNTHETIC_IVF, "id map and ivf headers say 101 vectors; the lists hold 100", "vector_count", "failure", ivf_count)
+
+    def ivf_id_out_of_range(d, f):
+        put(d, f["lists[0].ids"]["offset"], "<q", 100)
+        return d
+
+    c.add("ivf-list-id-out-of-range", SYNTHETIC_IVF, "list 0's first id set to 100, past the 100 vectors", "inverted_lists", "failure", ivf_id_out_of_range)
+
+    def ivf_id_repeated(d, f):
+        first = d[f["lists[0].ids"]["offset"] : f["lists[0].ids"]["offset"] + 8]
+        at = f["lists[1].ids"]["offset"]
+        d[at : at + 8] = first
+        return d
+
+    c.add("ivf-list-id-repeated", SYNTHETIC_IVF, "list 1's first id set to list 0's", "inverted_lists", "failure", ivf_id_repeated)
+
+    def ivf_direct_map_entry(d, f):
+        # Vector 0 is in list 0 at position 0; the entry now says list 1.
+        put(d, f["direct_map.array.data"]["offset"], "<q", 1 << 32)
+        return d
+
+    c.add("ivf-direct-map-entry", SYNTHETIC_IVF, "direct map entry of vector 0 set to list 1 position 0", "direct_map", "warning", ivf_direct_map_entry)
+
+    def ivf_direct_map_unset(d, f):
+        put(d, f["direct_map.array.data"]["offset"] + 8, "<q", -1)
+        return d
+
+    c.add("ivf-direct-map-unset", SYNTHETIC_IVF, "direct map entry of vector 1 set to -1, no list", "direct_map", "warning", ivf_direct_map_unset)
+
+    def ivf_nprobe_zero(d, f):
+        put(d, f["ivf.nprobe"]["offset"], "<Q", 0)
+        return d
+
+    c.add("ivf-nprobe-zero", SYNTHETIC_IVF, "nprobe set to 0", "headers", "failure", ivf_nprobe_zero)
+
+    def ivf_nprobe_negative(d, f):
+        put(d, f["ivf.nprobe"]["offset"], "<Q", 0x8000_0000)
+        return d
+
+    c.add("ivf-nprobe-negative", SYNTHETIC_IVF, "nprobe set to 2^31, which k-NN's int cast makes negative", "headers", "failure", ivf_nprobe_negative)
+    c.add("bivf-nprobe-negative", SYNTHETIC_BIVF, "binary nprobe set to 2^31, which k-NN's int cast makes negative", "headers", "failure", ivf_nprobe_negative)
+
+    def ivf_pq_not_by_residual(d, f):
+        put(d, f["ivf.by_residual"]["offset"], "<?", False)
+        return d
+
+    c.add("ivf-pq-not-by-residual", SYNTHETIC_IVF_PQ, "by_residual flag cleared", "headers", "warning", ivf_pq_not_by_residual)
+
+    def ivf_direct_map_none(d, f):
+        put(d, f["direct_map.type"]["offset"], "<b", 0)
+        return d
+
+    c.add("ivf-direct-map-none", SYNTHETIC_IVF, "direct map type set to 0 (none); the array stays", "direct_map", "warning", ivf_direct_map_none)
+
+    def ivf_nan_centroid(d, f):
+        put(d, f["quantizer.codes.data"]["offset"] + 4, "<f", float("nan"))
+        return d
+
+    c.add("ivf-nan-centroid", SYNTHETIC_IVF, "centroid 0 component 1 set to NaN", "vector_values", "warning", ivf_nan_centroid)
+
+    def ivf_inf_code(d, f):
+        put(d, f["lists[2].codes"]["offset"] + 8, "<f", float("-inf"))
+        return d
+
+    c.add("ivf-inf-code", SYNTHETIC_IVF, "list 2's first vector, component 2, set to -inf", "vector_values", "warning", ivf_inf_code)
+
+    def ivf_pq_nan_centroid(d, f):
+        put(d, f["ivf.pq.centroids.data"]["offset"], "<f", float("nan"))
+        return d
+
+    c.add("ivf-pq-nan-centroid", SYNTHETIC_IVF_PQ, "product quantizer centroid 0 component 0 set to NaN", "vector_values", "warning", ivf_pq_nan_centroid)
+
+    def ivf_bf16_long(d, f):
+        # The first residual component of list 0's first vector set to
+        # 1.0 in bf16 (0x3f80): the vector it stands for is no longer of
+        # unit length.
+        put(d, f["lists[0].codes"]["offset"], "<H", 0x3F80)
+        return d
+
+    c.add("ivf-bf16-not-unit", SYNTHETIC_IVF_BF16, "a residual component of list 0's first vector set to 1.0", "norms", "warning", ivf_bf16_long, space="cosinesimil")
 
     return c
 

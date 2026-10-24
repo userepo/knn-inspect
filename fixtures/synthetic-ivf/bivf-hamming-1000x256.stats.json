@@ -1,0 +1,18 @@
+{
+  "file": "bivf-hamming-1000x256.faiss",
+  "faiss_version": "1.15.1",
+  "nlist": 4,
+  "nprobe": 1,
+  "vectors": 1000,
+  "empty_lists": 0,
+  "list_size_min": 241,
+  "list_size_max": 268,
+  "list_size_mean": 250.0,
+  "imbalance_factor": 1.00188,
+  "list_sizes": [
+    268,
+    249,
+    241,
+    242
+  ]
+}

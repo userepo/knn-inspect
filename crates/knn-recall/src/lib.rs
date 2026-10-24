@@ -133,6 +133,12 @@ pub enum Error {
         "the file holds the graph only, no vectors for Faiss's search: k-NN keeps the field's vectors in Lucene's .veq and .vec files, over which recall searches it as k-NN does"
     )]
     NoVectors,
+    /// The file stores product-quantized codes, which hold no exact
+    /// vectors and which no search here reads.
+    #[error(
+        "the file stores its vectors as product-quantized codes, which hold no exact vectors; this search does not read them"
+    )]
+    ProductQuantized,
     /// Two nodes carry the same label, so a result cannot be resolved.
     #[error("label {label} belongs to nodes {first} and {second}")]
     DuplicateLabel {
@@ -906,6 +912,7 @@ impl<'a> Vectors<'a> {
                 CodeFormat::Byte => Codes::Byte(s.codes),
             },
             Storage::Binary(s) => Codes::Bits(s.codes),
+            Storage::Pq(_) => return Err(Error::ProductQuantized),
         };
         Ok(Self { d, codes })
     }

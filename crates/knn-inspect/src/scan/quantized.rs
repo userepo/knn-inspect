@@ -128,6 +128,10 @@ impl LuceneQuantized {
 pub(super) const HOLDS_ITS_VECTORS: &str =
     "the native file holds its own vectors, not a graph over Lucene's quantized ones";
 
+/// Why an IVF index has no quantized vectors to check.
+pub(super) const IVF_HOLDS_ITS_VECTORS: &str =
+    "an IVF index holds its own codes and has no graph over Lucene's quantized vectors";
+
 /// Lucene's `VectorSimilarityFunction` names, by ordinal.
 pub(crate) fn similarity_name(ordinal: i32) -> Option<&'static str> {
     Some(match ordinal {

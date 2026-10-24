@@ -139,7 +139,7 @@ fn synthetic_fixtures_match_faiss_python() {
         assert_eq!(layout, e.layout, "{name}: layout");
         let binary = e.storage == "binary";
         assert_eq!(
-            idx.index.fourcc,
+            idx.index.fourcc(),
             if binary {
                 FourCc::BINARY_HNSW_CAGRA
             } else {
@@ -149,17 +149,17 @@ fn synthetic_fixtures_match_faiss_python() {
         );
 
         // The CAGRA fields, right after the graph's header.
-        let GraphKind::Cagra(cagra) = idx.index.kind else {
+        let GraphKind::Cagra(cagra) = idx.hnsw().unwrap().kind else {
             panic!("{name}: a CAGRA graph");
         };
-        assert_eq!(idx.index.kind.name(), "cagra");
-        assert_eq!(idx.index.kind.cagra(), Some(&cagra));
+        assert_eq!(idx.hnsw().unwrap().kind.name(), "cagra");
+        assert_eq!(idx.hnsw().unwrap().kind.cagra(), Some(&cagra));
         assert_eq!(
             cagra.keep_max_size_level0, e.cagra.keep_max_size_level0,
             "{name}"
         );
         assert_eq!(cagra.base_level_only, e.cagra.base_level_only, "{name}");
-        assert!(idx.index.random_entry_points(), "{name}");
+        assert!(idx.hnsw().unwrap().random_entry_points(), "{name}");
         assert_eq!(
             cagra.search_entry_points, e.cagra.num_base_level_search_entrypoints,
             "{name}"
@@ -169,7 +169,7 @@ fn synthetic_fixtures_match_faiss_python() {
         let header_len = if binary { 21 } else { 33 };
         assert_eq!(
             cagra.offset,
-            idx.index.header.offset + 4 + header_len,
+            idx.hnsw().unwrap().header.offset + 4 + header_len,
             "{name}"
         );
         let fields = &file.bytes()[cagra.offset..];
@@ -181,7 +181,10 @@ fn synthetic_fixtures_match_faiss_python() {
             "{name}"
         );
 
-        for (what, header) in [("idmap", &idx.header), ("hnsw", &idx.index.header)] {
+        for (what, header) in [
+            ("idmap", &idx.header),
+            ("hnsw", &idx.hnsw().unwrap().header),
+        ] {
             assert_eq!(header.d, e.dimension, "{name}: {what} dimension");
             assert_eq!(header.ntotal, e.count, "{name}: {what} count");
             assert_eq!(
@@ -193,7 +196,7 @@ fn synthetic_fixtures_match_faiss_python() {
         }
 
         // The graph: its base level alone is searched, and reported.
-        let g = &idx.index.graph;
+        let g = &idx.hnsw().unwrap().graph;
         assert_eq!(g.m(), Some(e.hnsw.m), "{name}: M");
         assert_eq!(g.ef_construction, e.hnsw.ef_construction, "{name}");
         assert_eq!(g.ef_search, e.hnsw.ef_search, "{name}");
@@ -259,7 +262,11 @@ fn synthetic_fixtures_match_faiss_python() {
         );
 
         // The storage, as the local build's layouts hold it.
-        let storage = idx.index.storage.expect("every fixture holds its vectors");
+        let storage = idx
+            .hnsw()
+            .unwrap()
+            .storage
+            .expect("every fixture holds its vectors");
         assert_eq!(storage.row_count(), e.count as usize, "{name}");
         match (e.storage.as_str(), storage) {
             ("f32", Storage::Flat(flat)) => {
@@ -349,15 +356,18 @@ fn a_graph_without_its_vectors_keeps_the_rest_of_the_file() {
     let full = knn_format::parse(&bytes).unwrap();
     let parsed = knn_format::parse(&graph_only).unwrap();
     let idx = &parsed.index;
-    assert!(idx.index.storage.is_none());
+    assert!(idx.hnsw().unwrap().storage.is_none());
     assert_eq!(
         idx.layout(),
         [FourCc::ID_MAP, FourCc::HNSW_CAGRA, FourCc::NULL]
     );
-    assert_eq!(idx.index.kind, full.index.index.kind);
-    assert!(idx.index.random_entry_points());
+    assert_eq!(idx.hnsw().unwrap().kind, full.index.hnsw().unwrap().kind);
+    assert!(idx.hnsw().unwrap().random_entry_points());
     // The graph and the labels are read as they are with the storage.
-    let (a, b) = (&full.index.index.graph, &idx.index.graph);
+    let (a, b) = (
+        &full.index.hnsw().unwrap().graph,
+        &idx.hnsw().unwrap().graph,
+    );
     assert_eq!(a.levels.as_bytes(), b.levels.as_bytes());
     assert_eq!(a.neighbors.as_bytes(), b.neighbors.as_bytes());
     assert_eq!(full.index.id_map.as_bytes(), idx.id_map.as_bytes());
@@ -397,15 +407,15 @@ fn the_older_cagra_fourcc_reads_without_a_numeric_type() {
     let full = knn_format::parse(&bytes).unwrap();
     let parsed = knn_format::parse(&old).unwrap();
     let idx = &parsed.index;
-    assert_eq!(idx.index.fourcc, FourCc::HNSW_CAGRA_OLD);
+    assert_eq!(idx.index.fourcc(), FourCc::HNSW_CAGRA_OLD);
     assert_eq!(
         idx.layout(),
         [FourCc::ID_MAP, FourCc::HNSW_CAGRA_OLD, FourCc::FLAT_IP]
     );
-    let GraphKind::Cagra(cagra) = idx.index.kind else {
+    let GraphKind::Cagra(cagra) = idx.hnsw().unwrap().kind else {
         panic!("a CAGRA graph");
     };
-    let GraphKind::Cagra(expected) = full.index.index.kind else {
+    let GraphKind::Cagra(expected) = full.index.hnsw().unwrap().kind else {
         panic!("a CAGRA graph");
     };
     assert_eq!(cagra.numeric_type, None);
@@ -422,8 +432,8 @@ fn the_older_cagra_fourcc_reads_without_a_numeric_type() {
         )
     );
     assert_eq!(
-        idx.index.graph.neighbors.as_bytes(),
-        full.index.index.graph.neighbors.as_bytes()
+        idx.hnsw().unwrap().graph.neighbors.as_bytes(),
+        full.index.hnsw().unwrap().graph.neighbors.as_bytes()
     );
     assert_eq!(parsed.trailing, 0);
     for len in 0..old.len() {
@@ -479,7 +489,7 @@ fn cagra_tags_take_only_the_storage_knn_writes_under_them() {
         matches!(
             err,
             Error::UnsupportedLayout {
-                expected: "IBHf or IBHc",
+                expected: "IBHf, IBHc, or IBwF",
                 ..
             }
         ),
@@ -493,7 +503,7 @@ fn cagra_tags_take_only_the_storage_knn_writes_under_them() {
         matches!(
             err,
             Error::UnsupportedLayout {
-                expected: "IHNf, IHNs, IHc2, or IHNc",
+                expected: "IHNf, IHNs, IHNp, IHc2, IHNc, IwFl, IwSq, or IwPQ",
                 ..
             }
         ),
@@ -567,12 +577,12 @@ fn bf16_storage_under_a_cagra_graph_is_refused() {
 fn an_hnsw_graph_is_not_a_cagra_one() {
     let bytes = fs::read(fixtures().join("synthetic/l2-100x4.faiss")).unwrap();
     let parsed = knn_format::parse(&bytes).unwrap();
-    assert_eq!(parsed.index.index.kind, GraphKind::Hnsw);
-    assert_eq!(parsed.index.index.kind.name(), "hnsw");
-    assert!(parsed.index.index.kind.cagra().is_none());
-    assert!(!parsed.index.index.random_entry_points());
+    assert_eq!(parsed.index.hnsw().unwrap().kind, GraphKind::Hnsw);
+    assert_eq!(parsed.index.hnsw().unwrap().kind.name(), "hnsw");
+    assert!(parsed.index.hnsw().unwrap().kind.cagra().is_none());
+    assert!(!parsed.index.hnsw().unwrap().random_entry_points());
     // An HNSW graph of nodes is searched on max_level + 1 levels.
-    let g = &parsed.index.index.graph;
+    let g = &parsed.index.hnsw().unwrap().graph;
     assert_eq!(
         g.searched_levels(),
         usize::try_from(g.max_level).unwrap() + 1
@@ -646,12 +656,12 @@ fn remote_built_fixtures_hold_what_the_builder_writes() {
         let idx = &parsed.index;
         let binary = m.encoding == "binary";
         assert_eq!(
-            idx.index.fourcc.to_string(),
+            idx.index.fourcc().to_string(),
             m.remote_build.native_graph,
             "{name}"
         );
         assert_eq!(
-            idx.index.fourcc,
+            idx.index.fourcc(),
             if binary {
                 FourCc::BINARY_HNSW_CAGRA
             } else {
@@ -659,7 +669,7 @@ fn remote_built_fixtures_hold_what_the_builder_writes() {
             },
             "{name}"
         );
-        let cagra = idx.index.kind.cagra().expect("a CAGRA graph");
+        let cagra = idx.hnsw().unwrap().kind.cagra().expect("a CAGRA graph");
         assert!(cagra.base_level_only, "{name}");
         assert_eq!(cagra.search_entry_points, 32, "{name}");
         // The float copy sets the flag; the binary copy leaves it off.
@@ -674,13 +684,13 @@ fn remote_built_fixtures_hold_what_the_builder_writes() {
         // The builder wraps the GPU index before it is trained and never
         // updates the ID map's flag; the graph's header says trained.
         assert!(!idx.header.is_trained, "{name}: the ID map's flag");
-        assert!(idx.index.header.is_trained, "{name}");
+        assert!(idx.hnsw().unwrap().header.is_trained, "{name}");
         assert_eq!(idx.header.d as usize, m.dimension, "{name}");
         assert_eq!(idx.header.ntotal as usize, m.count, "{name}");
 
         // The graph: level 0 full at the degree the builder derives from
         // m, the upper slots empty, random node levels, no entry point.
-        let g = &idx.index.graph;
+        let g = &idx.hnsw().unwrap().graph;
         assert_eq!(g.entry_point, -1, "{name}");
         assert_eq!(g.max_level, -1, "{name}");
         assert_eq!(g.ef_construction, 100, "{name}");
@@ -693,7 +703,7 @@ fn remote_built_fixtures_hold_what_the_builder_writes() {
         // float vectors, the full 64 (4m) for 2,000 or for a binary field.
         let degree = if binary || m.count == 2000 { 64 } else { 56 };
         assert_eq!(g.m(), Some(i32::try_from(degree / 2).unwrap()), "{name}");
-        assert_eq!(idx.index.level_counts(), vec![m.count], "{name}");
+        assert_eq!(idx.hnsw().unwrap().level_counts(), vec![m.count], "{name}");
         assert!(g.levels.iter().any(|l| l.get() > 1), "{name}");
         for node in 0..g.node_count() {
             let slots = g.neighbors_of(node, 0).unwrap();
@@ -718,7 +728,7 @@ fn remote_built_fixtures_hold_what_the_builder_writes() {
 
         // The storage is what the local build writes for the field.
         let raw = fs::read(dir.join(&m.vectors_file)).unwrap();
-        match (m.encoding.as_str(), idx.index.storage) {
+        match (m.encoding.as_str(), idx.hnsw().unwrap().storage) {
             ("float", Some(Storage::Flat(flat))) => {
                 let fourcc = if m.space_type == "l2" {
                     FourCc::FLAT_L2

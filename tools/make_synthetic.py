@@ -14,7 +14,14 @@ type) in `fixtures/synthetic-byte/`; and, for the `binary` data type, an
 `fixtures/synthetic-binary/`; and, as k-NN's remote index build writes
 them, `IndexHNSWCagra` (`IHc2`) over float32, fp16, and byte storage and
 `IndexBinaryHNSWCagra` (`IBHc`) over binary storage, in
-`fixtures/synthetic-cagra/`.
+`fixtures/synthetic-cagra/`; and the trained indexes k-NN writes through
+a model for its `ivf` method and `pq` encoders, each built as k-NN's
+`TrainIndex` builds the template (`index_factory` with the description
+k-NN resolves the mapping to, `make_direct_map` before `train`) and
+written as `CreateIndexFromTemplate` writes a segment's file (the
+template in an `IndexIDMap`, the vectors added), in
+`fixtures/synthetic-ivf/`: `IwFl`, `IwSq` (fp16, bf16, byte), and `IwPQ`
+under `IxMp`, `IHNp` over `IxPq`, and `IBwF` under `IBMp`.
 Next to every `.faiss` file an `.expected.json` records the values the
 Rust parser must report, read back from the same in-memory index. An
 fp16, bf16, or byte case draws the same vectors as the float case of the
@@ -35,10 +42,11 @@ Usage:
     python tools/make_synthetic.py [--out fixtures/synthetic]
         [--fp16-out fixtures/synthetic-fp16] [--bf16-out fixtures/synthetic-bf16]
         [--byte-out fixtures/synthetic-byte] [--binary-out fixtures/synthetic-binary]
-        [--cagra-out fixtures/synthetic-cagra] [--only SET ...]
+        [--cagra-out fixtures/synthetic-cagra] [--ivf-out fixtures/synthetic-ivf]
+        [--only SET ...]
 
 `--only` names the sets to write (`float`, `fp16`, `bf16`, `byte`,
-`binary`, `cagra`); all of them when absent.
+`binary`, `cagra`, `ivf`); all of them when absent.
 """
 
 from __future__ import annotations
@@ -137,6 +145,48 @@ CAGRA_BINARY_CASES = [
 # faiss-cpu 1.15.1's own default is 256 for IndexHNSWCagra and 32 for
 # IndexBinaryHNSWCagra.
 CAGRA_ENTRY_POINTS = 32
+
+# And the trained indexes k-NN writes through a model (`_train`, then a
+# field with `model_id`): name, vectors indexed, dimension, metric, the
+# Faiss description k-NN resolves the mapping to, the training vector
+# count when it differs from the indexed count, and `nprobe`. k-NN's
+# `ivf` method gives `IVF{nlist},Flat` (`IxMp` > `IwFl`), with the `sq`
+# encoder `IVF{nlist},SQfp16` or `SQbf16` (`IwSq`), for a byte field
+# `IVF{nlist},SQ8_direct_signed` (`IwSq`, the vectors byte-valued, as
+# the byte cases above are), and with the `pq` encoder
+# `IVF{nlist},PQ{m}x{code_size}` (`IwPQ`); its `hnsw` method with the
+# `pq` encoder gives `HNSW{m},PQ{m}` (`IHNp` over `IxPq`, a code size of
+# 8 bits). k-NN's defaults: `nlist` 4, `nprobes` 1, `m` 1, `code_size`
+# 8. The sparse case trains 16 lists on 100 vectors and indexes 5, so
+# fewer than half its lists hold anything and Faiss writes the `sprs`
+# list sizes; every other case writes `full`. Training a code size of 8
+# bits needs 256 or more vectors, which k-NN checks too.
+IVF_CASES = [
+    ("ivf-l2-1000x32-flat", 1000, 32, "l2", "IVF4,Flat", None, 1),
+    ("ivf-ip-1000x32-flat", 1000, 32, "ip", "IVF4,Flat", None, 2),
+    # Small enough for the fuzzer's seeds.
+    ("ivf-l2-100x4-flat", 100, 4, "l2", "IVF4,Flat", None, 1),
+    ("ivf-l2-5x4-sparse-flat", 5, 4, "l2", "IVF16,Flat", 100, 1),
+    ("ivf-l2-1000x32-sqfp16", 1000, 32, "l2", "IVF4,SQfp16", None, 1),
+    # Unit vectors, so verify checks the fp16 residuals' norms as cosine.
+    ("ivf-ip-1000x32-sqfp16", 1000, 32, "ip", "IVF4,SQfp16", None, 1),
+    ("ivf-ip-1000x32-sqbf16", 1000, 32, "ip", "IVF4,SQbf16", None, 1),
+    ("ivf-l2-1000x32-byte", 1000, 32, "l2", "IVF4,SQ8_direct_signed", None, 1),
+    ("ivf-l2-1000x32-pq4x8", 1000, 32, "l2", "IVF4,PQ4x8", None, 1),
+    ("ivf-ip-1000x32-pq8x8", 1000, 32, "ip", "IVF4,PQ8x8", None, 1),
+    ("hnsw-l2-1000x32-pq4", 1000, 32, "l2", "HNSW16,PQ4", None, 1),
+    ("hnsw-ip-1000x32-pq4", 1000, 32, "ip", "HNSW16,PQ4", None, 1),
+]
+
+# A binary field's `ivf` method: `BIVF{nlist}` (`IBMp` > `IBwF` over an
+# `IBxF` quantizer): name, count, and dimension in bits.
+BIVF_CASES = [
+    ("bivf-hamming-1000x256", 1000, 256, "BIVF4"),
+    ("bivf-hamming-100x16", 100, 16, "BIVF4"),
+]
+
+# k-NN's default for the ivf method's `nprobes`.
+NPROBE = 1
 
 # k-NN's defaults for the hnsw method.
 M = 16
@@ -760,7 +810,321 @@ def build_cagra_binary(name: str, count: int, dim: int, out: pathlib.Path) -> di
     return expected
 
 
-SETS = ("float", "fp16", "bf16", "byte", "binary", "cagra")
+def trained_template(index) -> dict:
+    """The trained index as k-NN stores it in its model system index.
+
+    `TrainIndex` serializes the trained index at `ntotal` 0; a segment's
+    file is that template read back, wrapped in an ID map, and added to.
+    """
+    blob = faiss.serialize_index(index)
+    return {"size": int(blob.size), "crc32": crc32_of(blob)}
+
+
+def coarse_quantizer_expected(ivf) -> dict:
+    """The coarse quantizer, a flat index of `nlist` centroids."""
+    q = faiss.downcast_index(ivf.quantizer)
+    codes = faiss.vector_to_array(q.codes)
+    centroids = codes.view(np.float32)
+    return {
+        "fourcc": "IxFI" if q.metric_type == faiss.METRIC_INNER_PRODUCT else "IxF2",
+        "ntotal": int(q.ntotal),
+        "d": int(q.d),
+        "metric_type": int(q.metric_type),
+        "is_trained": bool(q.is_trained),
+        "centroids_crc32": crc32_of(codes),
+        "first_centroid": centroids[: q.d].tolist(),
+    }
+
+
+def direct_map_expected(ivf) -> dict:
+    """The direct map k-NN's `make_direct_map` leaves: one entry per vector."""
+    array = faiss.vector_to_array(ivf.direct_map.array)
+    first = int(array[0]) if array.size else None
+    return {
+        "type": int(ivf.direct_map.type),
+        "len": int(array.size),
+        "crc32": crc32_of(array),
+        # `lo_build(list_no, offset)`: the list in the high 32 bits, the
+        # offset in the list in the low 32.
+        "first": None if first is None else [first >> 32, first & 0xFFFFFFFF],
+    }
+
+
+def inverted_lists_expected(invlists) -> dict:
+    """The inverted lists as Faiss holds them: sizes, and checksums over the
+    codes and ids in list order, the bytes `write_InvertedLists` writes."""
+    nlist = int(invlists.nlist)
+    code_size = int(invlists.code_size)
+    sizes = [int(invlists.list_size(i)) for i in range(nlist)]
+    codes = bytearray()
+    ids: list[int] = []
+    for i, n in enumerate(sizes):
+        if n:
+            codes += bytes(faiss.rev_swig_ptr(invlists.get_codes(i), n * code_size))
+            ids.extend(faiss.rev_swig_ptr(invlists.get_ids(i), n).tolist())
+    non_empty = sum(1 for n in sizes if n)
+    return {
+        # `write_InvertedLists`: `full` when more than half the lists hold
+        # something, else `sprs`.
+        "encoding": "full" if non_empty > nlist // 2 else "sprs",
+        "nlist": nlist,
+        "code_size": code_size,
+        "sizes": sizes,
+        "total": sum(sizes),
+        "non_empty": non_empty,
+        "codes_bytes": len(codes),
+        "codes_crc32": zlib.crc32(bytes(codes)),
+        "ids_crc32": crc32_of(np.array(ids, dtype=np.int64)),
+        "first_ids": ids[:8],
+    }
+
+
+def sq_expected(sq) -> dict:
+    return {
+        "qtype": int(sq.qtype),
+        "qtype_name": QTYPE_NAMES[int(sq.qtype)],
+        "rangestat": int(sq.rangestat),
+        "rangestat_arg": float(sq.rangestat_arg),
+        "d": int(sq.d),
+        "code_size": int(sq.code_size),
+        "trained_len": int(sq.trained.size()),
+    }
+
+
+def pq_expected(pq) -> dict:
+    centroids = faiss.vector_to_array(pq.centroids)
+    return {
+        "d": int(pq.d),
+        "M": int(pq.M),
+        "nbits": int(pq.nbits),
+        "code_size": int(pq.code_size),
+        "ksub": int(pq.ksub),
+        "dsub": int(pq.dsub),
+        "centroids_len": int(centroids.size),
+        "centroids_crc32": crc32_of(centroids),
+        "first_centroid": centroids[: pq.dsub].tolist(),
+    }
+
+
+QTYPE_NAMES = {4: "QT_fp16", 7: "QT_bf16", 8: "QT_8bit_direct_signed"}
+
+
+def trained_vectors(count: int, dim: int, metric: str, train_count: int | None, byte: bool):
+    """The training vectors and the vectors indexed: the first `count` of them."""
+    rng = np.random.default_rng(SEED)
+    train = rng.standard_normal((train_count or count, dim), dtype=np.float32)
+    if metric == "ip":
+        train /= np.linalg.norm(train, axis=1, keepdims=True)
+    if byte:
+        # A byte field's values, as k-NN's `CreateByteIndexFromTemplate`
+        # casts them to float before adding them.
+        train = np.clip(np.rint(train * 32), -128, 127).astype(np.float32)
+    return train, train[:count]
+
+
+def build_trained(name: str, count: int, dim: int, metric: str, description: str, train_count: int | None,
+                  nprobe: int, out: pathlib.Path) -> dict:
+    """A trained index as k-NN's `TrainIndex` and `CreateIndexFromTemplate` write one.
+
+    `TrainIndex`: `index_factory` with the description k-NN resolves the
+    mapping to, the metric restated on an HNSW+PQ index and its storage
+    (Faiss issue 1621, which k-NN works around), `nprobe` from the
+    `nprobes` parameter, `make_direct_map` before `train`. Then the
+    template is wrapped in an `IndexIDMap`, whose `add_with_ids` adds to
+    the inner index with sequential ids, and written.
+    """
+    byte = "SQ8_direct_signed" in description
+    faiss_metric, metric_name = METRICS[metric]
+    train, vectors = trained_vectors(count, dim, metric, train_count, byte)
+
+    index = faiss.index_factory(dim, description, faiss_metric)
+    index.metric_type = faiss_metric
+    inner = faiss.downcast_index(index)
+    is_ivf = isinstance(inner, faiss.IndexIVF)
+    if isinstance(inner, faiss.IndexHNSWPQ):
+        inner.storage.metric_type = faiss_metric
+        inner.hnsw.efConstruction = EF_CONSTRUCTION
+    if is_ivf:
+        inner.nprobe = nprobe
+        inner.make_direct_map()
+    index.train(train)
+    template = trained_template(index)
+
+    idmap = faiss.IndexIDMap(index)
+    labels = np.arange(count, dtype=np.int64) + LABEL_OFFSET
+    idmap.add_with_ids(vectors, labels)
+    path = out / f"{name}.faiss"
+    faiss.write_index(idmap, str(path))
+
+    expected = {
+        "file": path.name,
+        "size": path.stat().st_size,
+        "faiss_version": faiss.__version__,
+        "seed": SEED,
+        "description": description,
+        "dimension": dim,
+        "count": count,
+        "trained_on": int(train.shape[0]),
+        "metric": metric_name,
+        "faiss_metric_type": int(faiss_metric),
+        "is_trained": bool(index.is_trained),
+        "template": template,
+        "ids": {
+            "len": int(count),
+            "first": int(labels[0]),
+            "last": int(labels[-1]),
+            "crc32": crc32_of(faiss.vector_to_array(idmap.id_map)),
+        },
+        "vectors_first": vectors[0].tolist(),
+    }
+    if is_ivf:
+        ivf = inner
+        if isinstance(ivf, faiss.IndexIVFFlat):
+            tag, encoding = "IwFl", "float32"
+        elif isinstance(ivf, faiss.IndexIVFScalarQuantizer):
+            tag, encoding = "IwSq", {4: "fp16", 7: "bf16", 8: "byte"}[int(ivf.sq.qtype)]
+            expected["sq"] = sq_expected(ivf.sq)
+        else:
+            assert isinstance(ivf, faiss.IndexIVFPQ)
+            tag, encoding = "IwPQ", "pq"
+            expected["pq"] = pq_expected(ivf.pq)
+        quantizer = coarse_quantizer_expected(ivf)
+        expected["layout"] = ["IxMp", tag, quantizer["fourcc"], "ilar"]
+        expected["method"] = "ivf"
+        expected["encoding"] = encoding
+        expected["ivf"] = {
+            "nlist": int(ivf.nlist),
+            "nprobe": int(ivf.nprobe),
+            "code_size": int(ivf.code_size),
+            "by_residual": None if isinstance(ivf, faiss.IndexIVFFlat) else bool(ivf.by_residual),
+            "quantizer": quantizer,
+            "direct_map": direct_map_expected(ivf),
+            "lists": inverted_lists_expected(ivf.invlists),
+        }
+        assert expected["ivf"]["lists"]["total"] == count
+        assert expected["ivf"]["direct_map"]["type"] == 1 and expected["ivf"]["direct_map"]["len"] == count
+    else:
+        hnsw = inner
+        assert isinstance(hnsw, faiss.IndexHNSWPQ)
+        storage = faiss.downcast_index(hnsw.storage)
+        graph = hnsw.hnsw
+        levels = faiss.vector_to_array(graph.levels)
+        codes = faiss.vector_to_array(storage.codes)
+        expected["layout"] = ["IxMp", "IHNp", "IxPq"]
+        expected["method"] = "hnsw"
+        expected["encoding"] = "pq"
+        expected["pq"] = pq_expected(storage.pq)
+        expected["storage"] = {
+            "metric_type": int(storage.metric_type),
+            "is_trained": bool(storage.is_trained),
+            "code_size": int(storage.code_size),
+            "codes_bytes": int(codes.size),
+            "codes_crc32": crc32_of(codes),
+            "first_code": codes[: storage.code_size].tolist(),
+            "search_type": int(storage.search_type),
+            "encode_signs": bool(storage.encode_signs),
+            "polysemous_ht": int(storage.polysemous_ht),
+        }
+        expected["hnsw"] = {
+            "m": M,
+            "ef_construction": graph.efConstruction,
+            "ef_search": graph.efSearch,
+            "max_level": graph.max_level,
+            "entry_point": graph.entry_point,
+            "level_counts": level_counts(levels, graph.max_level),
+            "cum_nneighbor_per_level": faiss.vector_to_array(graph.cum_nneighbor_per_level).tolist(),
+            "levels_len": int(graph.levels.size()),
+            "offsets_len": int(graph.offsets.size()),
+            "neighbors_len": int(graph.neighbors.size()),
+            "levels_crc32": crc32_of(levels),
+        }
+
+    back = faiss.read_index(str(path))
+    assert back.ntotal == count and faiss.downcast_index(back.index).is_trained
+    with open(out / f"{name}.expected.json", "w", encoding="utf-8", newline="\n") as f:
+        json.dump(expected, f, indent=2)
+        f.write("\n")
+    return expected
+
+
+def build_trained_binary(name: str, count: int, dim: int, description: str, out: pathlib.Path) -> dict:
+    """A binary IVF index as k-NN's `TrainIndex` and `CreateBinaryIndexFromTemplate` write one."""
+    rng = np.random.default_rng(SEED)
+    vectors = rng.standard_normal((count, dim), dtype=np.float32)
+    codes = np.packbits(vectors > 0, axis=1)
+
+    index = faiss.index_binary_factory(dim, description)
+    ivf = faiss.downcast_IndexBinary(index)
+    assert isinstance(ivf, faiss.IndexBinaryIVF)
+    ivf.nprobe = NPROBE
+    ivf.make_direct_map()
+    index.train(codes)
+    blob = faiss.serialize_index_binary(index)
+    template = {"size": int(blob.size), "crc32": crc32_of(blob)}
+
+    idmap = faiss.IndexBinaryIDMap(index)
+    labels = np.arange(count, dtype=np.int64) + LABEL_OFFSET
+    idmap.add_with_ids(codes, labels)
+    path = out / f"{name}.faiss"
+    faiss.write_index_binary(idmap, str(path))
+
+    q = faiss.downcast_IndexBinary(ivf.quantizer)
+    xb = faiss.vector_to_array(q.xb)
+    for header in (idmap, ivf, q):
+        assert header.code_size == dim // 8 and header.metric_type == faiss.METRIC_L2
+    expected = {
+        "file": path.name,
+        "size": path.stat().st_size,
+        "faiss_version": faiss.__version__,
+        "seed": SEED,
+        "description": description,
+        "layout": ["IBMp", "IBwF", "IBxF", "ilar"],
+        "method": "ivf",
+        "encoding": "binary",
+        "dimension": dim,
+        "count": count,
+        "trained_on": count,
+        "metric": "hamming",
+        "faiss_metric_type": int(idmap.metric_type),
+        "code_size": int(idmap.code_size),
+        "is_trained": bool(index.is_trained),
+        "template": template,
+        "ivf": {
+            "nlist": int(ivf.nlist),
+            "nprobe": int(ivf.nprobe),
+            "code_size": int(ivf.code_size),
+            "by_residual": None,
+            "quantizer": {
+                "fourcc": "IBxF",
+                "ntotal": int(q.ntotal),
+                "d": int(q.d),
+                "code_size": int(q.code_size),
+                "metric_type": int(q.metric_type),
+                "is_trained": bool(q.is_trained),
+                "centroids_crc32": crc32_of(xb),
+                "first_centroid": xb[: q.code_size].tolist(),
+            },
+            "direct_map": direct_map_expected(ivf),
+            "lists": inverted_lists_expected(ivf.invlists),
+        },
+        "ids": {
+            "len": int(count),
+            "first": int(labels[0]),
+            "last": int(labels[-1]),
+            "crc32": crc32_of(faiss.vector_to_array(idmap.id_map)),
+        },
+        "vectors_first": codes[0].tolist(),
+    }
+    assert expected["ivf"]["lists"]["total"] == count
+    back = faiss.read_index_binary(str(path))
+    assert back.ntotal == count
+    with open(out / f"{name}.expected.json", "w", encoding="utf-8", newline="\n") as f:
+        json.dump(expected, f, indent=2)
+        f.write("\n")
+    return expected
+
+
+SETS = ("float", "fp16", "bf16", "byte", "binary", "cagra", "ivf")
 
 
 def main() -> None:
@@ -771,6 +1135,7 @@ def main() -> None:
     parser.add_argument("--byte-out", type=pathlib.Path, default=pathlib.Path("fixtures/synthetic-byte"))
     parser.add_argument("--binary-out", type=pathlib.Path, default=pathlib.Path("fixtures/synthetic-binary"))
     parser.add_argument("--cagra-out", type=pathlib.Path, default=pathlib.Path("fixtures/synthetic-cagra"))
+    parser.add_argument("--ivf-out", type=pathlib.Path, default=pathlib.Path("fixtures/synthetic-ivf"))
     parser.add_argument("--only", nargs="+", choices=SETS, default=list(SETS), help="the sets to write")
     args = parser.parse_args()
 
@@ -785,6 +1150,7 @@ def main() -> None:
         "byte": args.byte_out,
         "binary": args.binary_out,
         "cagra": args.cagra_out,
+        "ivf": args.ivf_out,
     }
     only = set(args.only)
     for name in only:
@@ -803,11 +1169,16 @@ def main() -> None:
     if "cagra" in only:
         built += [build_cagra(n, c, d, m, s, args.cagra_out) for n, c, d, m, s in CAGRA_CASES]
         built += [build_cagra_binary(n, c, d, args.cagra_out) for n, c, d in CAGRA_BINARY_CASES]
+    if "ivf" in only:
+        built += [build_trained(n, c, d, m, desc, t, p, args.ivf_out) for n, c, d, m, desc, t, p in IVF_CASES]
+        built += [build_trained_binary(n, c, d, desc, args.ivf_out) for n, c, d, desc in BIVF_CASES]
     for e in built:
-        print(
-            f"{e['file']:<34} {e['size']:>9} bytes  d={e['dimension']:<4} n={e['count']:<5} "
-            f"{e['metric']:<13} levels={e['hnsw']['level_counts']} entry={e['hnsw']['entry_point']}"
-        )
+        if "ivf" in e:
+            lists = e["ivf"]["lists"]
+            shape = f"lists={lists['sizes']} ({lists['encoding']}) nprobe={e['ivf']['nprobe']}"
+        else:
+            shape = f"levels={e['hnsw']['level_counts']} entry={e['hnsw']['entry_point']}"
+        print(f"{e['file']:<34} {e['size']:>9} bytes  d={e['dimension']:<4} n={e['count']:<5} {e['metric']:<13} {shape}")
 
 
 if __name__ == "__main__":

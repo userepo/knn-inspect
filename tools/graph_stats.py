@@ -1,5 +1,6 @@
 #!/usr/bin/env python
-"""Graph statistics for a native file, from the graph Faiss Python loads.
+"""Graph statistics for a native file, from the graph Faiss Python loads;
+for an IVF index, the statistics of its inverted lists instead.
 
 The reference for `knn-inspect stats`: Faiss reads the file, and the
 statistics are computed here from the arrays it loaded, independently of
@@ -34,7 +35,10 @@ Usage:
 
 The baselines are `<name>.stats.json` next to each synthetic fixture and
 `stats.json` next to each real fixture's manifest, float, fp16, bf16,
-byte, binary, and graphs without their vectors alike.
+byte, binary, and graphs without their vectors alike, and for an IVF
+index, synthetic or trained by k-NN, the statistics of its inverted
+lists: every list's size, the smallest, mean, and largest, the empty
+lists, and Faiss's own imbalance factor.
 Rewrite them whenever the fixtures are regenerated: real fixtures get new
 neighbor arrays on every extraction.
 """
@@ -200,6 +204,58 @@ def graph_stats(path: pathlib.Path) -> dict:
     }
 
 
+def is_ivf(path: pathlib.Path) -> bool:
+    """Whether the file is an IVF index, by the tag the ID map wraps."""
+    data = path.read_bytes()
+    header = parse_header(data)
+    start = header["length"] if header else 0
+    walker = Walker(data[start:])
+    walker.fourcc("idmap.fourcc")
+    if data[start : start + 4] == b"IBMp":
+        walker.binary_header("idmap")
+    else:
+        walker.index_header("idmap")
+    return walker.fourcc("index.fourcc") in ("IwFl", "IwSq", "IwPQ", "IBwF")
+
+
+def ivf_stats(path: pathlib.Path) -> dict:
+    """The statistics of an IVF index's inverted lists, from the lists
+    Faiss loads: each list's size, and Faiss's own imbalance factor."""
+    data = path.read_bytes()
+    header = parse_header(data)
+    footer = parse_footer(data)
+    start = header["length"] if header else 0
+    end = footer["offset"] if footer else len(data)
+    payload = np.frombuffer(data[start:end], dtype=np.uint8)
+    if data[start : start + 4] == b"IBMp":
+        index = faiss.deserialize_index_binary(payload)
+        ivf = faiss.downcast_IndexBinary(faiss.downcast_IndexBinary(index).index)
+    else:
+        index = faiss.deserialize_index(payload)
+        ivf = faiss.downcast_index(faiss.downcast_index(index).index)
+    invlists = ivf.invlists
+    nlist = int(ivf.nlist)
+    sizes = [int(invlists.list_size(i)) for i in range(nlist)]
+    total = sum(sizes)
+    return {
+        "file": path.name,
+        "faiss_version": faiss.__version__,
+        "nlist": nlist,
+        "nprobe": int(ivf.nprobe),
+        "vectors": total,
+        "empty_lists": sum(1 for n in sizes if n == 0),
+        "list_size_min": min(sizes) if sizes else None,
+        "list_size_max": max(sizes) if sizes else None,
+        "list_size_mean": total / nlist if nlist else None,
+        "imbalance_factor": float(invlists.imbalance_factor()) if total else None,
+        "list_sizes": sizes,
+    }
+
+
+def stats_of(path: pathlib.Path) -> dict:
+    return ivf_stats(path) if is_ivf(path) else graph_stats(path)
+
+
 REAL_SETS = (
     "opensearch-3.9.0",
     "opensearch-3.9.0-fp16",
@@ -207,6 +263,7 @@ REAL_SETS = (
     "opensearch-3.9.0-byte",
     "opensearch-3.9.0-binary",
     "opensearch-3.9.0-remote",
+    "opensearch-3.9.0-trained",
 )
 
 
@@ -214,7 +271,10 @@ def write(stats: dict, out: pathlib.Path) -> None:
     with open(out, "w", encoding="utf-8", newline="\n") as f:
         json.dump(stats, f, indent=2)
         f.write("\n")
-    print(f"{out}: {[(l['nodes'], l['unreachable']) for l in stats['layers']]}")
+    if "layers" in stats:
+        print(f"{out}: {[(l['nodes'], l['unreachable']) for l in stats['layers']]}")
+    else:
+        print(f"{out}: lists {stats['list_sizes']}, imbalance {stats['imbalance_factor']}")
 
 
 def main() -> None:
@@ -234,6 +294,10 @@ def main() -> None:
         ):
             for path in sorted((args.fixtures / synthetic).glob("*.faiss")):
                 write(graph_stats(path), path.with_suffix(".stats.json"))
+        # The trained fixtures: list statistics for an IVF index, graph
+        # statistics for a graph over product-quantized codes.
+        for path in sorted((args.fixtures / "synthetic-ivf").glob("*.faiss")):
+            write(stats_of(path), path.with_suffix(".stats.json"))
         for manifest in sorted(
             m
             for real in REAL_SETS
@@ -244,9 +308,9 @@ def main() -> None:
         ):
             files = json.loads(manifest.read_text(encoding="utf-8"))["files"]
             native = next(f["name"] for f in files if f["name"].endswith((".faiss", ".faissc")))
-            write(graph_stats(manifest.parent / native), manifest.parent / "stats.json")
+            write(stats_of(manifest.parent / native), manifest.parent / "stats.json")
     elif args.file:
-        print(json.dumps(graph_stats(args.file), indent=2))
+        print(json.dumps(stats_of(args.file), indent=2))
     else:
         parser.error("give a file or --fixtures")
 

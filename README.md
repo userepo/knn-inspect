@@ -11,9 +11,13 @@ Rust, read-only, and does not link Faiss or talk to a cluster.
 
 Every command reads every layout listed under [Supported
 files](#supported-files), except that `recall` on a graph without its
-vectors needs its segment's files loose, not in a compound file. Each is
-checked against Faiss Python and Lucene's own files on the fixtures,
-real OpenSearch 3.9.0 segments included. The JSON output of each command
+vectors needs its segment's files loose, not in a compound file, and
+that `recall` does not yet search the trained indexes k-NN writes
+through a model (its `ivf` method and `pq` encoders): it refuses an IVF
+(inverted file) index, and a graph over product-quantized codes, with a
+reason. Each is
+checked against Faiss Python and Lucene's own files on the
+fixtures, real OpenSearch 3.9.0 segments included. The JSON output of each command
 is documented in [docs/json.md](docs/json.md) with a stability rule:
 fields are only added. The library crates' APIs may still change between
 minor versions. [docs/format-notes.md](docs/format-notes.md) describes
@@ -28,7 +32,7 @@ The macOS binary is not notarized; after unpacking, run
 `xattr -d com.apple.quarantine knn-inspect`. Or build from source:
 
 ```
-cargo install --git https://github.com/userepo/knn-inspect --tag v0.13.0 knn-inspect
+cargo install --git https://github.com/userepo/knn-inspect --tag v0.14.0 knn-inspect
 ```
 
 ## Usage
@@ -43,9 +47,16 @@ knn-inspect scan <dir> [--space l2|innerproduct|cosine|hamming] [--max-findings 
 ```
 
 `info` prints the envelope (footer offset and whether its CRC32
-verifies), the Faiss layout, dimension, vector count, metric, the scalar
+verifies), the Faiss layout, k-NN's method (`hnsw` or `ivf`) and how the
+file stores a vector, dimension, vector count, metric, the scalar
 quantizer of fp16, bf16, or byte storage, the code size of binary
-storage, HNSW parameters, level sizes, and the label range. Exit code 0
+storage, HNSW parameters, level sizes, and the label range; for a
+product quantizer its `m`, bits per code, centroids, and code size, and
+under `IHNp` the search parameters `IndexPQ` stores; for an IVF index
+its `nlist` and `nprobe`, code size, whether its codes quantize the
+residual from the centroid, the coarse quantizer's centroids, the direct
+map, and the inverted lists (how many hold something, the smallest and
+largest, and how the sizes are stored). Exit code 0
 when the file parsed, 1 otherwise. A cosine field reports
 `inner_product`, because that is what the file records; k-NN normalizes
 the vectors instead. A binary file reports `hamming`, the distance a
@@ -87,6 +98,32 @@ fields, and any other space is noted rather than failed: k-NN writes the
 same binary index for a float field with the binary encoder. A graph
 without its vectors is checked against the metric its ID map records,
 which k-NN reads, and its vector count, values, and norms are skipped.
+A graph over product-quantized codes gets every graph check, its codes
+are counted (`count x code_size` bytes), its product quantizer is held
+to the index's dimension and to the centroid table its fields size, and
+NaN or infinite centroids warn; the codes hold no exact vectors, so the
+norms check is skipped.
+
+An IVF index has no graph, so the graph checks are skipped, and two
+checks are its own. Failures: headers that disagree (the ID map's, the
+IVF index's, the coarse quantizer's), a coarse quantizer of other than
+`nlist` centroids or whose centroid array is another size, a scalar or
+product quantizer that does not fit the index, inverted lists that hold
+another number of vectors than the index, an id in the lists that is not
+a vector of the index or appears twice (`inverted_lists`), and an
+`nprobe` that k-NN, casting it to an int, reads as 0 or negative, with
+which every search that gives no `nprobes` fails (every search of a
+binary index whose stored value is 0), or an `nlist` of 0,
+which refuses every search. Warnings: a header that says untrained,
+codes that do not quantize residuals, a direct map that is not the array
+k-NN's training path makes or whose entry for a vector names no list or
+a list position that does not hold it (`direct_map`; k-NN's search never
+reads the map), and NaN or infinite centroids or codes (an fp16 residual
+that overflows is an infinity Faiss writes for a valid vector, and
+passes). With `--space cosine`, each vector the lists hold must have
+unit length: float32 codes are the vectors, and fp16 and bf16 codes the
+residuals from their lists' centroids, so the vector is the centroid
+plus the decoded residual, within the residual's rounding.
 
 A CAGRA graph is held to what k-NN's search of it reads: level 0 alone,
 from nodes drawn at random. A count of zero random entry points fails,
@@ -111,11 +148,19 @@ searched on level 0 alone, from nodes drawn at random, so `stats`
 reports that level only. A node there is unreachable when no other
 node's neighbor list leads to it, and a search returns it only when it
 starts there: when it draws the node as an entry point and, over the
-file's own vectors, the node is also the nearest of its draws.
+file's own vectors, the node is also the nearest of its draws. A graph
+over product-quantized codes is a graph like any other here. For an IVF
+index, which has no graph, `stats` reports its inverted lists instead:
+`nlist`, `nprobe`, the vectors and the empty lists, the smallest, mean,
+and largest list, every list's size, and Faiss's imbalance factor (`nlist`
+times the sum of the squared sizes over the squared total: 1 for lists
+of one size), which matches Faiss Python's to the bit.
 Exit code 0 when the file parsed, 1 otherwise.
 
 `recall` measures recall@k against exact brute force over the file's own
-vectors. By default it searches the file's HNSW graph itself, following
+vectors. It refuses an IVF index, and a graph over product-quantized
+codes, which hold no exact vectors, each with a reason, until their
+search is written. By default it searches the file's HNSW graph itself, following
 Faiss's search step for step (greedy descent through the upper levels,
 then a best-first search on level 0 with a candidate queue of
 `max(efSearch, k)`) at the Faiss commit k-NN 3.9.0 builds. On the
@@ -218,8 +263,9 @@ finite.
 
 `scan` finds every `.faiss` and `.faissc` file under a directory,
 subdirectories included, and runs `verify` on each, printing one summary
-line per file (layout, dimension, count, metric, verdict, and `cagra` for
-the graph of a remote index build) and the checks
+line per file (layout, dimension, count, metric, k-NN's method and how
+the file stores a vector, as `hnsw/fp16` or `ivf/pq`, verdict, and
+`cagra` for the graph of a remote index build) and the checks
 that failed or warned. For a file in a layout or scalar quantizer type
 this tool does not read, or bf16 storage under a CAGRA graph, which the
 remote build never writes and this tool refuses, it prints the structure
@@ -300,6 +346,20 @@ if any failed (or would not open, a subdirectory could not be read, or
 none was found), 2 if the worst verdict was a warning or an unsupported
 file.
 
+For an IVF index, the vectors its lists code are looked for where the
+`.vemf` puts a field of their shape, row by row in the order k-NN added
+them, which is the order of the field's vectors in the `.vec`: float32
+and binary codes byte for byte, fp16 and bf16 codes as float32 values
+whose residuals from their lists' centroids round to the codes, and a
+byte field's codes as int8 values whose residuals, plus 128, truncate to
+them, as Faiss encodes them. Codes that are not of residuals, which
+`verify` warns of, are compared as the values themselves. The field is
+read where the `.vemf` puts it: with no `.vemf` this tool reads beside
+the `.vec`, the comparison is skipped rather than searched for, and a
+mismatch names the first row that differs. Product-quantized codes hold
+no exact vectors and are not compared; the labels are, against the
+`.si`.
+
 ## Benchmarks
 
 `knn-inspect` 0.2.0 against the equivalent Faiss Python (faiss-cpu
@@ -376,15 +436,27 @@ index build writes in place of the HNSW ones (CAGRA, Cuda Anns
 GRAph-based, is the GPU-built graph index of NVIDIA's cuVS library;
 `IHc2` over float32, fp16, or byte storage or none, `IBHc` over binary
 storage), which k-NN searches on their base level alone, from random
-entry points; with or
-without the Lucene footer. Every command reads all of them, except that
-`recall` on a graph without its vectors needs the segment's `.fnm` and
-the field's `.vemq`, `.veq`, `.vemf`, and `.vec` loose, not in a
-compound file. Fixtures and format notes target
-OpenSearch 3.9.0.
+entry points; with or without the Lucene footer. Every command reads all
+of them, except that `recall` on a graph without its vectors needs the
+segment's `.fnm` and the field's `.vemq`, `.veq`, `.vemf`, and `.vec`
+loose, not in a compound file. It also reads the trained indexes k-NN
+writes through a model (`_plugins/_knn/models/_train`, then a field with
+`model_id`). An IVF (inverted file) index clusters the vectors around
+`nlist` trained centroids and keeps each vector in the inverted list of
+its nearest centroid; a search compares the query with the centroids and
+scans only the `nprobe` nearest lists. The trained indexes are an ID map
+wrapping an IVF index over float32 codes (the `ivf` method with the
+`flat` encoder), fp16, bf16, or byte codes (its `sq` encoder, or a
+`byte` field), or product-quantized codes (its `pq` encoder), each
+holding its coarse quantizer, direct map, and inverted lists; an ID map
+wrapping HNSW over product-quantized storage (the `hnsw` method with the
+`pq` encoder); and a binary ID map wrapping a binary IVF index (a
+`binary` field's `ivf` method). Every command but `recall` reads these;
+see [Status](#status). Fixtures and format notes target OpenSearch
+3.9.0.
 
-Not yet: other scalar-quantized storage, product quantization, and IVF.
-Files in
+Not yet: other scalar-quantized storage, and `recall`'s search of the
+trained indexes. Files in
 another layout or scalar quantizer type are refused rather than misread:
 `verify` fails them, and `scan` reports those whose footer verifies as
 `unsupported`. NMSLIB and Lucene-engine fields write no `.faiss` file,
@@ -429,6 +501,22 @@ whose results come from Lucene 10.5.1 itself.
   an `.expected.json`; faiss-cpu builds the base level as an HNSW graph,
   then the file is cut to what the GPU copy leaves (see
   `docs/format-notes.md`)
+- `fixtures/synthetic-ivf/` - the trained indexes k-NN writes through a
+  model, each built as k-NN's `TrainIndex` builds the template
+  (`index_factory` with the description k-NN resolves the mapping to,
+  `make_direct_map`, `train`) and filled as a segment's file is: IVF
+  over float32 (one with sparse list sizes, one with an `nprobe` of 2),
+  fp16, bf16, byte, and product-quantized codes, HNSW over
+  product-quantized codes, and binary IVF, each with an `.expected.json`
+- `fixtures/opensearch-3.9.0-trained/` - real segments of fields that
+  name a model k-NN trained on the same vectors, 500 of 16 dimensions
+  (binary: 128 bits): IVF over float32 codes for `l2` and `innerproduct`
+  (`ivf-flat/`), over fp16 codes (`ivf-sq-fp16/l2/`), over
+  product-quantized codes (`ivf-pq/l2/`), and over a byte field's codes
+  (`ivf-byte/l2/`), HNSW over product-quantized codes for `l2` and
+  `innerproduct` (`hnsw-pq/`), and IVF over a binary field
+  (`ivf-binary/hamming/`), each with the model's blob, the trained index
+  k-NN stores, as `model.blob`
 - `fixtures/opensearch-3.9.0-binary/` - real segments of a binary field
   of 128 bits, the signs of the `l2` vectors (`binary/hamming/`); of a
   float field with the binary encoder, one bit per component
@@ -464,7 +552,8 @@ whose results come from Lucene 10.5.1 itself.
 - `*.stats.json` beside each synthetic fixture and `stats.json` beside
   each real one - the graph statistics Faiss Python computes from the
   same file (for a graph without its vectors, from a copy Faiss can
-  read), the baseline `stats` must match
+  read; for an IVF index, the statistics of the lists Faiss loads), the
+  baseline `stats` must match
 - `*.queries.f32`, `*.results.jsonl`, and `*.recall.json` beside each
   synthetic fixture (`queries.f32`, `results.jsonl`, `recall.json`
   beside each real one that holds vectors) - 100 fixed queries, the
@@ -553,6 +642,12 @@ docker compose -f tools\docker-compose.yml up -d
 .venv\Scripts\python tools\extract_opensearch.py --out fixtures\opensearch-3.9.0-binary\on-disk-16x --encoding on-disk --compression 16x --spaces l2 --queries 100
 .venv\Scripts\python tools\extract_opensearch.py --out fixtures\opensearch-3.9.0-binary\on-disk-8x --encoding on-disk --compression 8x --spaces l2 --queries 100
 .venv\Scripts\python tools\extract_opensearch.py --out fixtures\opensearch-3.9.0-binary\on-disk-half-float --encoding on-disk-half-float --queries 100 --modes results.jsonl results-no-rescore.jsonl results-oversample-30.jsonl
+.venv\Scripts\python tools\extract_opensearch.py --out fixtures\opensearch-3.9.0-trained\ivf-flat --encoding ivf-flat --spaces l2 innerproduct
+.venv\Scripts\python tools\extract_opensearch.py --out fixtures\opensearch-3.9.0-trained\ivf-sq-fp16 --encoding ivf-sq-fp16 --spaces l2
+.venv\Scripts\python tools\extract_opensearch.py --out fixtures\opensearch-3.9.0-trained\ivf-pq --encoding ivf-pq --spaces l2
+.venv\Scripts\python tools\extract_opensearch.py --out fixtures\opensearch-3.9.0-trained\hnsw-pq --encoding hnsw-pq --spaces l2 innerproduct
+.venv\Scripts\python tools\extract_opensearch.py --out fixtures\opensearch-3.9.0-trained\ivf-byte --encoding ivf-byte --spaces l2
+.venv\Scripts\python tools\extract_opensearch.py --out fixtures\opensearch-3.9.0-trained\ivf-binary --encoding ivf-binary --dim 128
 docker compose -f tools\docker-compose.yml down -v
 ```
 

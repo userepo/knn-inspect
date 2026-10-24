@@ -2,7 +2,8 @@
 """Index vectors into a running OpenSearch and copy the segment files out.
 
 For each space type, the script creates a one-shard index with a k-NN
-HNSW field on the Faiss engine, bulk-indexes random vectors, force-merges
+field on the Faiss engine (an HNSW one, or one that names a trained
+model), bulk-indexes random vectors, force-merges
 to one segment, and copies that shard's Lucene directory from the
 container with `docker cp`. Every document also stores its position in
 `pos`, so a live query's hits can be mapped back to vector labels.
@@ -20,14 +21,30 @@ type), `binary-encoder` (a float field with the `binary` encoder,
 `bits: 1`), `on-disk` (a float field in `on_disk` mode, at its default
 32x compression, or the `--compression` given: 32x, 16x, or 8x), or
 `on-disk-half-float` (a `half_float` field in `on_disk` mode, which k-NN
-writes in its own quantized format, its `.vec` in fp16).
+writes in its own quantized format, its `.vec` in fp16), or one of the
+trained encodings, which k-NN writes through a model: `ivf-flat` (the
+`ivf` method, its default `flat` encoder), `ivf-sq-fp16` (the `ivf`
+method with the `sq` encoder, `type: fp16`), `ivf-pq` (the `ivf` method
+with the `pq` encoder), `hnsw-pq` (the `hnsw` method with the `pq`
+encoder), `ivf-byte` (the `ivf` method over a `byte` field), and
+`ivf-binary` (the `ivf` method over a `binary` field). For these the
+script indexes the vectors into a training index first, trains a model
+on them with `_plugins/_knn/models/{id}/_train` (`TRAIN_PARAMETERS`
+lists each method's parameters), waits for it, and then creates the
+index with a field that names the model (`model_id`). The model's blob,
+the trained index k-NN stores at `ntotal` 0, is written beside the
+segment as `model.blob` (not `.faiss`, which `scan` would read as a native
+file), and the training request and the model's record, blob left out,
+under `model.request` and `model.record` in the manifest, with
+`model.blob_file` and `model.blob_size`.
 The vectors indexed are the same for every encoding, except that `byte`
-scales them by 32, rounds them, and clips them to [-128, 127], the only
-values a byte field takes, and `binary` keeps one bit per component of
-the `l2` draw, set where the value is positive, packed eight to a byte;
-`--dim` counts bits for `binary`. k-NN's Faiss engine refuses
-`cosinesimil` for byte fields, so `byte` indexes `l2` and `innerproduct`
-only, and accepts only `hamming` for binary fields.
+and `ivf-byte` scale them by 32, round them, and clip them to
+[-128, 127], the only values a byte field takes, and `binary` and
+`ivf-binary` keep one bit per component of the `l2` draw, set where the
+value is positive, packed eight to a byte; `--dim` counts bits for
+those two. k-NN's Faiss engine refuses `cosinesimil` for byte fields, so
+`byte` and `ivf-byte` index `l2` and `innerproduct` only, and accepts
+only `hamming` for binary fields.
 
 Next to a binary field's segment, `vectors.u8` holds the packed bits in
 place of `vectors.f32`, the bytes of row i the bits of document i.
@@ -92,6 +109,12 @@ Usage:
     python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-binary/on-disk-16x --encoding on-disk --compression 16x --spaces l2 --queries 100
     python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-binary/on-disk-8x --encoding on-disk --compression 8x --spaces l2 --queries 100
     python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-binary/on-disk-half-float --encoding on-disk-half-float --queries 100 --modes results.jsonl results-no-rescore.jsonl results-oversample-30.jsonl
+    python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-trained/ivf-flat --encoding ivf-flat --spaces l2 innerproduct
+    python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-trained/ivf-sq-fp16 --encoding ivf-sq-fp16 --spaces l2
+    python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-trained/ivf-pq --encoding ivf-pq --spaces l2
+    python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-trained/hnsw-pq --encoding hnsw-pq --spaces l2 innerproduct
+    python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-trained/ivf-byte --encoding ivf-byte --spaces l2
+    python tools/extract_opensearch.py --out fixtures/opensearch-3.9.0-trained/ivf-binary --encoding ivf-binary --dim 128
 
     docker compose -f tools/docker-compose.remote.yml up -d
     python tools/extract_opensearch.py --remote --dim 64 --out fixtures/opensearch-3.9.0-remote/float --spaces l2
@@ -105,6 +128,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import pathlib
 import re
@@ -125,12 +149,45 @@ BYTE_SPACES = ["l2", "innerproduct"]
 # k-NN accepts only hamming for binary fields, and hamming for nothing
 # else.
 BINARY_SPACES = ["hamming"]
-ENCODINGS = ["float", "sq-fp16", "sq-bf16", "half-float", "byte", "binary", "binary-encoder", "on-disk", "on-disk-half-float"]
+ENCODINGS = [
+    "float",
+    "sq-fp16",
+    "sq-bf16",
+    "half-float",
+    "byte",
+    "binary",
+    "binary-encoder",
+    "on-disk",
+    "on-disk-half-float",
+    "ivf-flat",
+    "ivf-sq-fp16",
+    "ivf-pq",
+    "hnsw-pq",
+    "ivf-byte",
+    "ivf-binary",
+]
+M = 16
+EF_CONSTRUCTION = 100
+# The trained encodings: the method each trains, with its parameters, and
+# the field's data type. `nlist` 4 and `nprobes` 1 are k-NN's defaults;
+# `m` 4 cuts the default 16 dimensions into four sub-vectors, and a PQ
+# code size of 8 bits, the default and the only one `hnsw` takes, needs at
+# least 256 training vectors, which the default 500 are; it is given, since
+# k-NN asks for at least 1,000 when a `pq` encoder leaves it out. The
+# `sq` encoder takes `bits` here too, on indices of 3.6.0 or later.
+TRAIN_PARAMETERS: dict[str, tuple[str, dict, str | None]] = {
+    "ivf-flat": ("ivf", {"nlist": 4, "nprobes": 1}, None),
+    "ivf-sq-fp16": ("ivf", {"nlist": 4, "nprobes": 1, "encoder": {"name": "sq", "parameters": {"type": "fp16", "bits": 16}}}, None),
+    "ivf-pq": ("ivf", {"nlist": 4, "nprobes": 1, "encoder": {"name": "pq", "parameters": {"m": 4, "code_size": 8}}}, None),
+    "hnsw-pq": ("hnsw", {"m": M, "ef_construction": EF_CONSTRUCTION, "encoder": {"name": "pq", "parameters": {"m": 4, "code_size": 8}}}, None),
+    "ivf-byte": ("ivf", {"nlist": 4, "nprobes": 1}, "byte"),
+    "ivf-binary": ("ivf", {"nlist": 4, "nprobes": 1}, "binary"),
+}
+# How long a model may take to train before the script gives up.
+TRAIN_TIMEOUT = 300
 # The compression levels at which an on_disk Faiss field quantizes to 1,
 # 2, or 4 bits a component; 32x is its default.
 COMPRESSIONS = ["32x", "16x", "8x"]
-M = 16
-EF_CONSTRUCTION = 100
 SEED = 20261013
 DATA_ROOT = "/usr/share/opensearch/data/nodes/0/indices"
 MAX_RESULT_WINDOW = 10_000  # OpenSearch default for index.max_result_window
@@ -271,7 +328,17 @@ def plugin_version(host: str, name: str) -> str | None:
     return None
 
 
-def create_index(host: str, index: str, space: str, dim: int, compound: bool, encoding: str, compression: str | None, remote: bool = False) -> dict:
+def create_index(
+    host: str,
+    index: str,
+    space: str,
+    dim: int,
+    compound: bool,
+    encoding: str,
+    compression: str | None,
+    remote: bool = False,
+    model_id: str | None = None,
+) -> dict:
     parameters: dict = {"m": M, "ef_construction": EF_CONSTRUCTION}
     if encoding in ("sq-fp16", "sq-bf16"):
         # Indexes created by 3.6.0 or later must give the encoder's bits;
@@ -295,6 +362,9 @@ def create_index(host: str, index: str, space: str, dim: int, compound: bool, en
             field["compression_level"] = compression
     field["space_type"] = space
     field["method"] = {"name": "hnsw", "engine": "faiss", "parameters": parameters}
+    if model_id is not None:
+        # The model carries the dimension, data type, space, and method.
+        field = {"type": "knn_vector", "model_id": model_id}
     body = {
         "settings": {
             "index": {
@@ -320,16 +390,73 @@ def create_index(host: str, index: str, space: str, dim: int, compound: bool, en
     return body
 
 
+def train_model(host: str, model_id: str, training_index: str, space: str, dim: int, encoding: str) -> tuple[dict, dict, bytes]:
+    """Trains `model_id` on the `vec` field of `training_index` and waits
+    for it; returns the training request, the model's record without its
+    blob, and the blob: the trained index serialized by Faiss."""
+    method, parameters, data_type = TRAIN_PARAMETERS[encoding]
+    body: dict = {
+        "training_index": training_index,
+        "training_field": "vec",
+        "dimension": dim,
+        "description": f"knn-inspect fixture: {encoding} {space}",
+        "method": {"name": method, "engine": "faiss", "space_type": space, "parameters": parameters},
+    }
+    if data_type is not None:
+        body["data_type"] = data_type
+    # A model in use by an index, or still training, cannot be deleted:
+    # the caller deletes the index that names it first.
+    r = requests.delete(f"{host}/_plugins/_knn/models/{model_id}", timeout=30)
+    if r.status_code not in (200, 404):
+        sys.exit(f"the earlier model {model_id} could not be deleted: {r.status_code} {r.text[:500]}")
+    r = requests.post(f"{host}/_plugins/_knn/models/{model_id}/_train", json=body, timeout=60)
+    if not r.ok:
+        sys.exit(f"training {model_id} was refused: {r.status_code} {r.text[:500]}")
+    deadline = time.monotonic() + TRAIN_TIMEOUT
+    while True:
+        r = requests.get(f"{host}/_plugins/_knn/models/{model_id}", timeout=30)
+        r.raise_for_status()
+        model = r.json()
+        state = model.get("state")
+        if state == "created":
+            break
+        if state == "failed":
+            sys.exit(f"training {model_id} failed: {model.get('error')}")
+        if time.monotonic() > deadline:
+            sys.exit(f"training {model_id} did not finish in {TRAIN_TIMEOUT} s (state {state})")
+        time.sleep(1)
+    blob = base64.b64decode(model.pop("model_blob"))
+    return body, model, blob
+
+
+def create_training_index(host: str, index: str, dim: int, encoding: str) -> dict:
+    """An index whose `vec` field holds the training vectors: a plain
+    `knn_vector` field of the dimension and data type, with no method."""
+    field: dict = {"type": "knn_vector", "dimension": dim}
+    data_type = TRAIN_PARAMETERS[encoding][2]
+    if data_type is not None:
+        field["data_type"] = data_type
+    body = {
+        "settings": {"index": {"number_of_shards": 1, "number_of_replicas": 0, "knn": True}},
+        "mappings": {"properties": {"vec": field}},
+    }
+    requests.delete(f"{host}/{index}", timeout=30)
+    r = requests.put(f"{host}/{index}", json=body, timeout=60)
+    r.raise_for_status()
+    return body
+
+
 def segment_names(host: str, index: str) -> list[str]:
     r = requests.get(f"{host}/_cat/segments/{index}", params={"format": "json"}, timeout=30)
     r.raise_for_status()
     return [row["segment"] for row in r.json()]
 
 
-def bulk_index(host: str, index: str, vectors: np.ndarray, batches: int) -> None:
+def bulk_index(host: str, index: str, vectors: np.ndarray, batches: int, merge_check: bool = True) -> None:
     """Index in several refreshed batches so the force merge below has
     segments to merge: the native file then comes from the merge path, as
-    in production, instead of from a single flush."""
+    in production, instead of from a single flush. A training index needs
+    no merge (`merge_check` off)."""
     for batch in np.array_split(np.arange(len(vectors)), batches):
         lines = []
         for pos in batch:
@@ -341,6 +468,8 @@ def bulk_index(host: str, index: str, vectors: np.ndarray, batches: int) -> None
         if r.json().get("errors"):
             sys.exit(f"bulk indexing into {index} reported errors: {r.text[:500]}")
         requests.post(f"{host}/{index}/_refresh", timeout=60).raise_for_status()
+    if not merge_check:
+        return
     before = segment_names(host, index)
     if len(before) < 2:
         sys.exit(f"{index}: expected at least two segments before the merge, found {before}")
@@ -492,7 +621,10 @@ def main() -> None:
             parser.error("--remote: live queries are not recorded for a CAGRA graph, which k-NN searches from random entry points")
     if args.count > MAX_RESULT_WINDOW:
         parser.error(f"--count above {MAX_RESULT_WINDOW} exceeds index.max_result_window, which doc_order reads in one page")
-    allowed = {"byte": BYTE_SPACES, "binary": BINARY_SPACES}.get(args.encoding, SPACES)
+    allowed = {"byte": BYTE_SPACES, "binary": BINARY_SPACES, "ivf-byte": BYTE_SPACES, "ivf-binary": BINARY_SPACES}.get(args.encoding, SPACES)
+    trained = args.encoding in TRAIN_PARAMETERS
+    if trained and args.remote:
+        parser.error("--remote: k-NN builds a model's fields locally")
     spaces = args.spaces or allowed
     if refused := [s for s in spaces if s not in allowed]:
         parser.error(f"k-NN's Faiss engine refuses {', '.join(refused)} for {args.encoding} fields")
@@ -504,7 +636,7 @@ def main() -> None:
         parser.error("--modes applies with --queries only")
     if args.modes is None:
         args.modes = list(QUERY_MODES)
-    if args.encoding == "binary" and args.dim % 8:
+    if args.encoding in ("binary", "ivf-binary") and args.dim % 8:
         parser.error("--dim counts bits for binary fields, and k-NN requires a multiple of 8")
 
     info = wait_for_cluster(args.host, timeout=180)
@@ -525,14 +657,15 @@ def main() -> None:
     rng = np.random.default_rng(SEED)
     draws = {space: rng.standard_normal((args.count, args.dim), dtype=np.float32) for space in SPACES}
     for space in spaces:
-        if args.encoding == "binary":
+        binary = args.encoding in ("binary", "ivf-binary")
+        if binary:
             # The l2 draw's signs, one bit per component, packed as k-NN
             # receives a binary vector: eight bits to a signed byte, most
             # significant first.
             vectors = np.packbits(draws["l2"] > 0, axis=1).view(np.int8)
         else:
             vectors = draws[space]
-        if args.encoding == "byte":
+        if args.encoding in ("byte", "ivf-byte"):
             # The same draw as the other encodings, scaled, rounded, and
             # clipped to the byte range: a byte field takes integers only.
             vectors = np.clip(np.rint(vectors * 32), -128, 127).astype(np.int8)
@@ -553,7 +686,22 @@ def main() -> None:
             if args.remote:
                 index += "-remote"
             successes_before = remote_build_successes(args.host) if args.remote else None
-            body = create_index(args.host, index, space, args.dim, args.compound, args.encoding, compression, args.remote)
+            model_record = None
+            model_id = None
+            if trained:
+                # Trained on the same vectors, from an index of their own.
+                # An earlier run's index names the model, which k-NN then
+                # refuses to delete, so it goes first.
+                requests.delete(f"{args.host}/{index}", timeout=30)
+                training_index = f"{index}-training"
+                create_training_index(args.host, training_index, args.dim, args.encoding)
+                bulk_index(args.host, training_index, vectors, 1, merge_check=False)
+                model_id = f"{index}-model"
+                train_request, model, blob = train_model(args.host, model_id, training_index, space, args.dim, args.encoding)
+                requests.delete(f"{args.host}/{training_index}", timeout=30)
+                (dest / "model.blob").write_bytes(blob)
+                model_record = {"request": train_request, "record": model, "blob_file": "model.blob", "blob_size": len(blob)}
+            body = create_index(args.host, index, space, args.dim, args.compound, args.encoding, compression, args.remote, model_id)
             bulk_index(args.host, index, vectors, args.batches)
             segment = force_merge(args.host, index)
             pos_of_doc = doc_order(args.host, index, args.count)
@@ -593,7 +741,7 @@ def main() -> None:
                 }
 
             # Row i is document i, which is also Faiss label i in the native file.
-            if args.encoding == "binary":
+            if binary:
                 vectors_file = "vectors.u8"
                 vectors[pos_of_doc].view(np.uint8).tofile(dest / vectors_file)
                 vectors_note = f"{args.dim // 8} bytes of packed bits per row, as the binary field received them (most significant bit first), in doc-id order: row i is document i, the Faiss label i; pos_of_doc[i] is its insertion position and its _id"
@@ -601,7 +749,7 @@ def main() -> None:
                 vectors_file = "vectors.f32"
                 vectors[pos_of_doc].astype(np.float32).tofile(dest / vectors_file)
                 vectors_note = "row-major little-endian float32 in doc-id order: row i is document i, the Faiss label i; pos_of_doc[i] is its insertion position and its _id"
-            if args.encoding == "byte":
+            if args.encoding in ("byte", "ivf-byte"):
                 vectors_note += "; every value is an integer in [-128, 127], as the byte field received it"
             manifest = {
                 "opensearch_version": os_version,
@@ -625,6 +773,8 @@ def main() -> None:
                 manifest["compression_level"] = args.compression or "32x"
             if args.remote:
                 manifest["remote_build"] = remote_record
+            if model_record is not None:
+                manifest["model"] = model_record
             if args.queries:
                 simd_container = args.container if args.encoding == "on-disk-half-float" else None
                 manifest["live_queries"] = record_queries(args.host, index, dest, args.dim, args.queries, pos_of_doc, args.modes, simd_container)

@@ -20,7 +20,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Describe a native file: layout, dimensions, HNSW parameters, envelope.
+    /// Describe a native file: layout, dimensions, HNSW parameters or IVF lists, envelope.
     Info {
         /// A `.faiss` or `.faissc` file.
         file: PathBuf,
@@ -43,7 +43,7 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Per-level graph statistics: node counts, out-degrees, unreachable nodes.
+    /// Per-level graph statistics: node counts, out-degrees, unreachable nodes; or an IVF index's list sizes.
     Stats {
         /// A `.faiss` or `.faissc` file.
         file: PathBuf,

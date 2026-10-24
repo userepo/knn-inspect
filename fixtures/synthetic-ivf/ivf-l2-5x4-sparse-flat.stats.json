@@ -1,0 +1,30 @@
+{
+  "file": "ivf-l2-5x4-sparse-flat.faiss",
+  "faiss_version": "1.15.1",
+  "nlist": 16,
+  "nprobe": 1,
+  "vectors": 5,
+  "empty_lists": 12,
+  "list_size_min": 0,
+  "list_size_max": 2,
+  "list_size_mean": 0.3125,
+  "imbalance_factor": 4.48,
+  "list_sizes": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    1,
+    0,
+    0,
+    0,
+    0,
+    0,
+    1,
+    1,
+    0,
+    0,
+    2
+  ]
+}

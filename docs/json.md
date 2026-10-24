@@ -19,15 +19,19 @@ map's values, which k-NN sets to Lucene doc ids.
 | `envelope.footer` | object, nullable | Lucene footer: `offset`, `algorithm`, `checksum` (hex string), `verified` (whether the CRC32 matches) |
 | `payload.offset`, `payload.length` | integer | Where the Faiss payload lies |
 | `payload.trailing_bytes` | integer | Bytes between the end of the index and the footer; 0 in a well-formed file |
-| `layout` | array of strings | The Faiss fourccs, outermost first: `IxMp`, then `IHNf` and `IxF2` or `IxFI` (float32 storage), or `IHNs` and `IxSQ` (fp16, bf16, or byte storage); or `IBMp`, `IBHf`, and `IBxF` (binary storage, since 0.7.0); or `IBMp`, `IBHf`, and `null` (a graph without its vectors, as k-NN writes an `on_disk` field's, since 0.8.0). For the CAGRA graph k-NN's remote index build writes (since 0.12.0): `IxMp`, `IHc2` (or Faiss's older `IHNc`), and `IxF2`, `IxFI`, `IxSQ`, or `null`; or `IBMp`, `IBHc`, and `IBxF` |
-| `graph` | string | `hnsw`, or `cagra` for the graph k-NN's remote index build writes (CAGRA, Cuda Anns GRAph-based: the GPU-built graph index of NVIDIA's cuVS library), which k-NN searches on its base level alone, from random entry points. Since 0.12.0 |
+| `layout` | array of strings | The Faiss index fourccs in the file, in order (an IVF index's inverted lists also hold a list-type tag, `full` or `sprs`, which is left out): `IxMp`, then `IHNf` and `IxF2` or `IxFI` (float32 storage), or `IHNs` and `IxSQ` (fp16, bf16, or byte storage); or `IBMp`, `IBHf`, and `IBxF` (binary storage, since 0.7.0); or `IBMp`, `IBHf`, and `null` (a graph without its vectors, as k-NN writes an `on_disk` field's, since 0.8.0). For the CAGRA graph k-NN's remote index build writes (since 0.12.0): `IxMp`, `IHc2` (or Faiss's older `IHNc`), and `IxF2`, `IxFI`, `IxSQ`, or `null`; or `IBMp`, `IBHc`, and `IBxF`. For the trained indexes k-NN writes through a model (since 0.14.0): `IxMp`, `IHNp`, and `IxPq` (an HNSW graph over product-quantized codes); `IxMp`, then `IwFl`, `IwSq`, or `IwPQ` (an IVF, inverted file, index over float32, scalar-quantized, or product-quantized codes), its coarse quantizer `IxF2` or `IxFI`, and its inverted lists `ilar`; or `IBMp`, `IBwF`, `IBxF`, and `ilar` (a binary IVF index) |
+| `method` | string | k-NN's method: `hnsw` (a graph, HNSW or CAGRA) or `ivf`. Since 0.14.0 |
+| `encoding` | string | How the file stores a vector: `float32`, `fp16`, `bf16`, `byte`, `binary` (packed bits), `pq` (product-quantized codes), or `none` for a graph without its vectors. Since 0.14.0 |
+| `graph` | string, optional | `hnsw`, or `cagra` for the graph k-NN's remote index build writes (CAGRA, Cuda Anns GRAph-based: the GPU-built graph index of NVIDIA's cuVS library), which k-NN searches on its base level alone, from random entry points. Since 0.12.0; absent for an IVF index, which has no graph (since 0.14.0) |
 | `cagra` | object, optional | For a CAGRA graph, the fields after its header: `keep_max_size_level0` and `base_level_only` (booleans; k-NN's remote build sets `base_level_only`, which only Faiss's own search reads, and sets `keep_max_size_level0` for a float graph only), `search_entry_points` (nodes a search draws at random to start from), and `numeric_type` (integer, optional: as stored under `IHc2`, absent under `IHNc` and `IBHc`; Faiss's `NumericType`, 0 `Float32`, 1 `Float16`, 2 `UInt8`, 3 `Int8`, which k-NN discards). Since 0.12.0 |
-| `dimension` | integer | Vector dimension; bits for binary storage, components for a graph without its vectors |
+| `dimension` | integer | Vector dimension; bits for binary storage and a binary IVF index, components for a graph without its vectors |
 | `count` | integer | Vector count from the ID map's header |
 | `metric` | string | `l2` or `inner_product` as the file records it; a cosine field reads `inner_product`. `hamming` for binary storage, which computes Hamming distance whatever metric type its headers record (since 0.7.0). A graph without its vectors reads `l2` or `inner_product`, the metric k-NN built it for, as its ID map's header records it and k-NN reads it (since 0.8.0). Any other metric type `n` reads `metric_n` |
-| `code_size` | integer, optional | For binary storage, the bytes per vector the ID map's header records: the dimension / 8 in a well-formed file. Since 0.7.0. For a graph without its vectors under `IBHf`, the bytes per vector the graph's header records: a quantized vector plus 16 bytes of correction factors (since 0.8.0); absent under `IHc2`, whose float headers record none (since 0.12.0) |
-| `quantizer` | object, optional | For scalar-quantized storage, the quantizer as stored: `qtype` (4, 7, or 8), `name` (`QT_fp16`, `QT_bf16`, or `QT_8bit_direct_signed`), `dimension`, `code_size` (bytes per vector: twice the dimension for fp16 and bf16, the dimension for byte), `trained` (number of trained values; none of the three formats uses any). Since 0.4.0; bf16 since 0.5.0; byte since 0.6.0 |
-| `hnsw.m` | integer, nullable | Neighbor slots per node on the upper levels; `null` if the level table is too short to say |
+| `code_size` | integer, optional | For binary storage, the bytes per vector the ID map's header records: the dimension / 8 in a well-formed file. Since 0.7.0. For a graph without its vectors under `IBHf`, the bytes per vector the graph's header records: a quantized vector plus 16 bytes of correction factors (since 0.8.0); absent under `IHc2`, whose float headers record none (since 0.12.0). For a binary IVF index, the ID map header's, as for binary storage (since 0.14.0) |
+| `quantizer` | object, optional | For scalar-quantized storage or codes, the quantizer as stored: `qtype` (4, 7, or 8), `name` (`QT_fp16`, `QT_bf16`, or `QT_8bit_direct_signed`), `dimension`, `code_size` (bytes per vector: twice the dimension for fp16 and bf16, the dimension for byte), `trained` (number of trained values; none of the three formats uses any). Since 0.4.0; bf16 since 0.5.0; byte since 0.6.0; the codes of an `IwSq` index since 0.14.0 |
+| `pq` | object, optional | For product-quantized storage or codes (since 0.14.0), the quantizer as stored: `dimension`; `m` (sub-quantizers, k-NN's `m`); `nbits` (bits per sub-vector code, k-NN's `code_size`); `sub_dimension` (`dimension / m`); `centroids_per_sub` (`2^nbits`); `centroid_floats` (floats in the stored centroid table, `dimension x centroids_per_sub` in a well-formed file); `code_size` (bytes per code, `(nbits x m + 7) / 8`). Under `IHNp` also `IndexPQ`'s search parameters: `search_type` (0, `ST_PQ`, in every file k-NN writes), `encode_signs` (boolean), `polysemous_ht` |
+| `ivf` | object, optional | For an IVF index (since 0.14.0): `nlist`, `nprobe` (k-NN's `nprobes`, as stored in the trained template); `code_size` (bytes per code as Faiss derives it, nullable); `by_residual` (boolean, optional: whether scalar- or product-quantized codes quantize the residual from the centroid, absent for float32 and binary codes); `coarse_quantizer` (`fourcc`, `count` of centroids, `dimension`, `metric`, `is_trained`); `direct_map` (`type`, 0 none, 1 array, 2 hashtable, with its `name`, and `entries` in the array; k-NN writes an array of one entry per vector); `lists` (`sizes`, `full` or `sparse`; `nlist` and `code_size` as the lists' own header stores them; `non_empty`; `total` vectors; `min` and `max` list size, nullable without lists) |
+| `hnsw.m` | integer, nullable | Neighbor slots per node on the upper levels; `null` if the level table is too short to say. The `hnsw` object is absent for an IVF index (since 0.14.0) |
 | `hnsw.ef_construction`, `hnsw.ef_search` | integer | As stored |
 | `hnsw.max_level`, `hnsw.entry_point` | integer | As stored; `-1` for an empty graph, and for a CAGRA graph, whose search never reads them |
 | `hnsw.level_counts` | array of integers | Nodes on each level a search reads, level 0 first: `max_level + 1` levels, or level 0 alone for a graph of nodes whose `max_level` is negative (which 0.12.0 changed: the array was empty for such a graph before); level 0 alone for a CAGRA graph, whatever its `max_level` says (since 0.12.0) |
@@ -49,7 +53,7 @@ Each entry of `checks`:
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `name` | string | The check: `envelope`, `checksum`, `structure`, `trailing`, `headers`, `metric`, `offsets`, `levels`, `entry_point`, `neighbor_ids`, `neighbor_levels`, `vector_count`, `id_map_length`, `vector_values`, `duplicate_neighbors`, `self_loops`, `norms` |
+| `name` | string | The check: `envelope`, `checksum`, `structure`, `trailing`, `headers`, `metric`, `offsets`, `levels`, `entry_point`, `neighbor_ids`, `neighbor_levels`, `vector_count`, `inverted_lists`, `direct_map` (these two since 0.14.0, for an IVF index, skipped for a graph; every file's array gained them, so look a check up by `name`, not by its position), `id_map_length`, `vector_values`, `duplicate_neighbors`, `self_loops`, `norms` |
 | `severity` | string, nullable | The worst finding: `info`, `warning`, or `failure`; `null` when the check passed silently or was skipped |
 | `skipped` | string, optional | Why the check did not run |
 | `count` | integer | Findings in total, however many are listed |
@@ -60,9 +64,22 @@ Each entry of `checks`:
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `file` | string | The path as given |
+| `method` | string | `hnsw` for a graph, `ivf` for an IVF index, whose statistics are its inverted lists' (below). Since 0.14.0 |
 | `nodes` | integer | Nodes in the graph |
 | `entry_point`, `max_level` | integer | As stored; `-1` for a CAGRA graph, whose search never reads them |
 | `layers` | array | One entry per level a search reads, level 0 first (see below): `max_level + 1` levels, or level 0 alone for a graph of nodes whose `max_level` is negative (which 0.12.0 changed: the array was empty for such a graph before); level 0 alone for a CAGRA graph, whatever its `max_level` says (since 0.12.0) |
+
+For an IVF index (since 0.14.0), in place of `nodes`, `entry_point`, `max_level`, and `layers`:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `nlist`, `nprobe` | integer | As the index stores them |
+| `vectors` | integer | Vectors in all lists |
+| `empty_lists` | integer | Lists that hold no vector |
+| `list_size_min`, `list_size_max` | integer, nullable | The smallest and largest list; `null` without lists |
+| `list_size_mean` | number, nullable | `vectors / nlist`; `null` without lists |
+| `imbalance_factor` | number, nullable | Faiss's `InvertedLists::imbalance_factor`: `nlist` times the sum of the squared list sizes over the squared total, 1 for lists of one size; `null` without vectors |
+| `list_sizes` | array of integers | Every list's size, list 0 first; empty at an `nlist` of 20,000 or more, past what k-NN takes |
 
 Each entry of `layers`:
 
@@ -119,11 +136,12 @@ Each entry of `files`:
 | `size` | integer, nullable | Bytes; `null` when the file would not open |
 | `error` | string, optional | Why the file would not open; `failures`, `warnings`, and `checks` are then absent, and every cross-check is `skipped` |
 | `layout`, `dimension`, `count`, `metric` | optional | As for `info`; absent when the file did not parse |
-| `graph` | string, optional | As for `info`: `hnsw` or `cagra`; absent when the file did not parse (since 0.12.0) |
-| `code_size` | integer, optional | As for `info`, for binary storage (since 0.7.0) and a graph without its vectors under `IBHf` (since 0.8.0) |
+| `method`, `encoding` | string, optional | As for `info`; absent when the file did not parse. Since 0.14.0 |
+| `graph` | string, optional | As for `info`: `hnsw` or `cagra`; absent when the file did not parse (since 0.12.0), and for an IVF index (since 0.14.0) |
+| `code_size` | integer, optional | As for `info`, for binary storage (since 0.7.0), a graph without its vectors under `IBHf` (since 0.8.0), and a binary IVF index (since 0.14.0) |
 | `status` | string | `clean`, `warnings`, or `failed`, counting the Lucene cross-checks (a `warning` from `lucene_quantized` makes a file `warnings` that is otherwise clean, since 0.9.0); or `unsupported` (since 0.7.0): a file whose footer verifies, in a layout or scalar quantizer type this tool does not read, or, since 0.12.0, with bf16 storage under a CAGRA graph, which the remote build never writes and this tool refuses; such a file fails only the structure check. `verify` fails such a file; `scan` does not count it as failed, since nothing is known to be wrong with it |
 | `failures`, `warnings`, `checks` | optional | As for `verify` |
-| `lucene_vectors.status` | string | `match`, `mismatch`, `damaged`, or `skipped` (`damaged` since 0.3.0) |
+| `lucene_vectors.status` | string | `match`, `mismatch`, `damaged`, or `skipped` (`damaged` since 0.3.0). For an IVF index (since 0.14.0), whether the vectors its lists code are the field's, row by row; `skipped` for product-quantized codes |
 | `lucene_vectors.file` | string, optional | The segment's `.vec` file the vectors were found in, or the first one looked in |
 | `lucene_vectors.offset` | integer, optional | Where in that file the stored vectors begin |
 | `lucene_vectors.detail` | string | What was found, what is wrong with the Lucene file, or why the check was skipped |

@@ -53,7 +53,7 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
-use knn_format::faiss::{HnswGraph, HnswIndex, IdMapIndex};
+use knn_format::faiss::{HnswGraph, HnswIndex, IdMapIndex, Inner};
 use rayon::prelude::*;
 
 use crate::{Distance, Draw, Error, Queries, Query, Result, Vectors, check_query, checked_vectors};
@@ -345,10 +345,14 @@ pub fn search_all(
 /// too.
 #[must_use]
 pub fn result_labels(index: &IdMapIndex<'_>, hits: &[Hit], k: usize) -> Vec<i64> {
+    let nodes = match &index.index {
+        Inner::Hnsw(h) => h.graph.node_count(),
+        Inner::Ivf(v) => usize::try_from(v.lists.total).unwrap_or(usize::MAX),
+    };
     hits.iter()
         .map(|h| index.id_map.get(h.node).map_or(-1, |l| l.get()))
         .chain(std::iter::repeat(-1))
-        .take(k.min(index.index.graph.node_count()))
+        .take(k.min(nodes))
         .collect()
 }
 

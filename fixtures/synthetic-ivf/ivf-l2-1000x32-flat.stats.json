@@ -1,0 +1,18 @@
+{
+  "file": "ivf-l2-1000x32-flat.faiss",
+  "faiss_version": "1.15.1",
+  "nlist": 4,
+  "nprobe": 1,
+  "vectors": 1000,
+  "empty_lists": 0,
+  "list_size_min": 232,
+  "list_size_max": 265,
+  "list_size_mean": 250.0,
+  "imbalance_factor": 1.003096,
+  "list_sizes": [
+    241,
+    232,
+    265,
+    262
+  ]
+}

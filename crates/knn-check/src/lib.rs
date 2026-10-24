@@ -4,13 +4,18 @@
 //! one [`CheckResult`] per check, each with its worst [`Severity`] and
 //! the first few [`Finding`]s, every finding carrying the file offset
 //! and node it points at. Nothing here panics on malformed input: a file
-//! that does not parse is reported as a failed [`Check::Structure`].
+//! that does not parse is reported as a failed [`Check::Structure`]. An
+//! IVF index, which k-NN writes through a trained model, has no graph:
+//! the graph checks are skipped, and it gets two of its own,
+//! [`Check::InvertedLists`] and [`Check::DirectMap`], which a graph
+//! skips.
 //!
 //! [`index_stats`] reports per-level node counts, out-degree histograms,
 //! and the nodes no search can reach, as Faiss searches the graph:
 //! [`graph_stats`] from the entry point, or [`base_level_stats`] from
 //! random entry points on level 0, as it searches the CAGRA graph k-NN's
-//! remote index build writes.
+//! remote index build writes. [`ivf_stats`] reports an IVF index's
+//! inverted lists: their sizes and Faiss's imbalance factor.
 
 mod checks;
 mod stats;
@@ -18,7 +23,9 @@ mod stats;
 use serde::Serialize;
 
 pub use checks::verify;
-pub use stats::{GraphStats, LayerStats, base_level_stats, graph_stats, index_stats};
+pub use stats::{
+    GraphStats, IvfStats, LayerStats, base_level_stats, graph_stats, index_stats, ivf_stats,
+};
 
 /// How much a finding matters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -116,7 +123,15 @@ pub enum Check {
     /// changes no search and which the builder leaves off for a binary
     /// field). The ID map header of such a graph says untrained in every
     /// file the builder writes, which k-NN does not read, so that does
-    /// not warn there.
+    /// not warn there. For an IVF index, the ID map's, the index's, and
+    /// the coarse quantizer's headers agree as for a graph's; the
+    /// quantizer holds `nlist` centroids; a scalar or product quantizer
+    /// fits the index; `nlist` is not 0, which would refuse every search;
+    /// `nprobe`, as the int k-NN casts it to, is above 0, or every search
+    /// that gives no `nprobes` fails (every search of a binary index whose
+    /// stored value is 0); and an
+    /// untrained header or codes that are not of residuals warn. A
+    /// product quantizer under `IHNp` is held to the same rules.
     Headers,
     /// `--space` matches the metric the file records. With `--space
     /// cosine`, byte storage is also reported, as a warning or, when the
@@ -148,14 +163,34 @@ pub enum Check {
     NeighborLevels,
     /// The storage holds exactly `count x dimension` components: float32
     /// elements, two bytes each of fp16 or bf16 codes, or one byte each of
-    /// byte codes; binary storage, `count x code size` bytes. Skipped for
-    /// a graph without its vectors, as are the vector values and norms.
+    /// byte codes; binary storage, `count x code size` bytes;
+    /// product-quantized storage, `count` codes of the quantizer's code
+    /// size; for an IVF index, inverted lists of `count` vectors and a
+    /// coarse quantizer holding as many centroids as its header counts:
+    /// that count times the dimension in floats, or times the code size in
+    /// bytes for a binary one, as Faiss's reader requires. Skipped for a graph without its vectors, as are the vector
+    /// values and norms.
     VectorCount,
+    /// For an IVF index: every id in the inverted lists is a vector of
+    /// the index, 0 to `count - 1`, and no id is in two places. Skipped
+    /// for a graph.
+    InvertedLists,
+    /// For an IVF index: the direct map is the array k-NN's training path
+    /// makes, with one entry per vector, each naming the list and position
+    /// that hold its id. k-NN's search never reads it, so anything else
+    /// warns: another kind (a hashtable map's pairs are not checked), an
+    /// entry for a vector in no list, or one naming a position that holds
+    /// another id. Skipped for a graph.
+    DirectMap,
     /// The ID map holds one label per node.
     IdMapLength,
-    /// No NaN or infinite vector components. Skipped for byte and binary
-    /// storage, where no code is either, and for a graph without its
-    /// vectors.
+    /// No NaN or infinite vector components: for product-quantized
+    /// storage, in the centroids its codes index; for an IVF index, in its
+    /// coarse quantizer's and product quantizer's centroids and in its
+    /// float32, fp16, or bf16 codes. Skipped for byte and binary graph
+    /// storage, where no code is either, for a binary IVF index, and for a
+    /// graph without its vectors; a byte IVF index's centroids are
+    /// checked.
     VectorValues,
     /// No node lists the same neighbor twice on one level.
     DuplicateNeighbors,
@@ -164,14 +199,18 @@ pub enum Check {
     /// With `--space cosine`: every vector has unit length. Skipped for
     /// byte storage, which k-NN never normalizes, since it refuses
     /// cosinesimil for byte fields (the metric check reports the space
-    /// instead), for binary storage, whose bits have no length, and for a
-    /// graph without its vectors.
+    /// instead), for binary storage, whose bits have no length, for
+    /// product-quantized storage, whose codes hold no exact vectors, and
+    /// for a graph without its vectors. For an IVF index, the vector each
+    /// float32 code is, or each fp16 or bf16 code stands for (its list's
+    /// centroid plus the decoded residual, within the residual's
+    /// rounding).
     Norms,
 }
 
 impl Check {
     /// Every check, in run order.
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 19] = [
         Self::Envelope,
         Self::Checksum,
         Self::Structure,
@@ -184,6 +223,8 @@ impl Check {
         Self::NeighborIds,
         Self::NeighborLevels,
         Self::VectorCount,
+        Self::InvertedLists,
+        Self::DirectMap,
         Self::IdMapLength,
         Self::VectorValues,
         Self::DuplicateNeighbors,
@@ -207,6 +248,8 @@ impl Check {
             Self::NeighborIds => "neighbor_ids",
             Self::NeighborLevels => "neighbor_levels",
             Self::VectorCount => "vector_count",
+            Self::InvertedLists => "inverted_lists",
+            Self::DirectMap => "direct_map",
             Self::IdMapLength => "id_map_length",
             Self::VectorValues => "vector_values",
             Self::DuplicateNeighbors => "duplicate_neighbors",

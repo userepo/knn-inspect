@@ -1,12 +1,14 @@
-//! The `stats` command: per-level graph statistics.
+//! The `stats` command: per-level graph statistics, or for an IVF index
+//! the sizes of its inverted lists.
 
 use std::fmt::Write as _;
 use std::path::Path;
 use std::process::ExitCode;
 
 use anyhow::Context;
-use knn_check::{GraphStats, LayerStats};
+use knn_check::{GraphStats, IvfStats, LayerStats};
 use knn_format::NativeFile;
+use knn_format::faiss::Inner;
 use serde::Serialize;
 
 /// Unreachable node ids listed per level in the text output; JSON lists
@@ -17,11 +19,16 @@ const TEXT_UNREACHABLE_LIMIT: usize = 10;
 const TEXT_HISTOGRAM_PER_LINE: usize = 8;
 
 #[derive(Serialize)]
-struct Output<'a> {
+struct Output<'a, S: Serialize> {
     file: String,
+    /// k-NN's method: `hnsw` for a graph, `ivf` for an IVF index.
+    method: &'static str,
     #[serde(flatten)]
-    stats: &'a GraphStats,
+    stats: &'a S,
 }
+
+/// Sizes per line in the text output's list of list sizes.
+const TEXT_SIZES_PER_LINE: usize = 16;
 
 /// Runs `stats` on `path`; exit code 0 when the file parsed.
 ///
@@ -33,11 +40,31 @@ pub fn run(path: &Path, json: bool) -> anyhow::Result<ExitCode> {
     let parsed = file
         .parse()
         .with_context(|| format!("parsing {}", path.display()))?;
-    let stats = knn_check::index_stats(&parsed.index.index);
+    let file_name = path.display().to_string();
+    if let Some(ivf) = parsed.index.ivf() {
+        let stats = knn_check::ivf_stats(ivf);
+        if json {
+            let out = Output {
+                file: file_name,
+                method: "ivf",
+                stats: &stats,
+            };
+            println!("{}", serde_json::to_string_pretty(&out)?);
+        } else {
+            print!("{}", ivf_text(path, &stats));
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    let Inner::Hnsw(hnsw) = &parsed.index.index else {
+        // An IVF index returned above; a graph is what remains.
+        return Ok(ExitCode::SUCCESS);
+    };
+    let stats = knn_check::index_stats(hnsw);
 
     if json {
         let out = Output {
-            file: path.display().to_string(),
+            file: file_name,
+            method: "hnsw",
             stats: &stats,
         };
         println!("{}", serde_json::to_string_pretty(&out)?);
@@ -45,6 +72,53 @@ pub fn run(path: &Path, json: bool) -> anyhow::Result<ExitCode> {
         print!("{}", text(path, &stats));
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn ivf_text(path: &Path, stats: &IvfStats) -> String {
+    let mut s = String::new();
+    let mut line = |text: String| {
+        writeln!(s, "{text}").expect("writing to a String cannot fail");
+    };
+    line(path.display().to_string());
+    line(format!(
+        "  method          ivf, nlist {}, nprobe {}",
+        stats.nlist, stats.nprobe
+    ));
+    line(format!(
+        "  vectors         {} in {} of {} lists, {} empty",
+        stats.vectors,
+        stats.nlist.saturating_sub(stats.empty_lists),
+        stats.nlist,
+        stats.empty_lists
+    ));
+    let shown = |v: Option<u64>| v.map_or_else(|| "-".to_owned(), |v| v.to_string());
+    line(format!(
+        "  list sizes      min {}, mean {}, max {}",
+        shown(stats.list_size_min),
+        stats
+            .list_size_mean
+            .map_or_else(|| "-".to_owned(), |m| format!("{m:.2}")),
+        shown(stats.list_size_max)
+    ));
+    line(format!(
+        "  imbalance       {}",
+        stats.imbalance_factor.map_or_else(
+            || "- (no vectors)".to_owned(),
+            |f| format!("{f:.6} (1 when every list holds the same number of vectors)")
+        )
+    ));
+    if stats.list_sizes.is_empty() && stats.nlist > 0 {
+        line(format!(
+            "  sizes           not listed: nlist {} is past what k-NN takes, under 20,000",
+            stats.nlist
+        ));
+    }
+    for (i, chunk) in stats.list_sizes.chunks(TEXT_SIZES_PER_LINE).enumerate() {
+        let label = if i == 0 { "sizes" } else { "" };
+        let sizes: Vec<String> = chunk.iter().map(ToString::to_string).collect();
+        line(format!("  {label:<15} {}", sizes.join(" ")));
+    }
+    s
 }
 
 fn text(path: &Path, stats: &GraphStats) -> String {

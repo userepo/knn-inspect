@@ -20,7 +20,13 @@
 //! build writes the same layouts with a CAGRA graph in place of the HNSW
 //! one: `IHc2` (or Faiss's older `IHNc`) over float32, fp16, or byte
 //! storage, or over `null` for an `sq` encoder of 1, 2, or 4 bits, and `IBHc` over
-//! `IBxF`. See `docs/format-notes.md` in the repository for the
+//! `IBxF`. The trained indexes k-NN writes through a model (its `ivf`
+//! method and `pq` encoders) are read too: `IxMp` wrapping an IVF
+//! (inverted file) index (`IwFl` over float32 codes, `IwSq` over fp16, bf16, or byte codes, or
+//! `IwPQ` over product-quantized codes, each with its coarse quantizer,
+//! direct map, and `ilar` inverted lists), `IxMp` wrapping `IHNp` over
+//! `IxPq` product-quantized storage, and `IBMp` wrapping `IBwF`, a binary
+//! IVF index. See `docs/format-notes.md` in the repository for the
 //! byte-level description.
 //!
 //! [`segment_info`] reads one more Lucene file of the segment, as far as

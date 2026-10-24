@@ -77,7 +77,9 @@ fn baselines() -> Vec<PathBuf> {
 fn load_queries(storage: &Storage<'_>, bytes: &[u8], d: usize) -> Queries {
     match storage {
         Storage::Binary(_) => Queries::from_bits(bytes, d).unwrap(),
-        Storage::Flat(_) | Storage::Sq(_) => Queries::from_bytes(bytes, d).unwrap(),
+        Storage::Flat(_) | Storage::Sq(_) | Storage::Pq(_) => {
+            Queries::from_bytes(bytes, d).unwrap()
+        }
     }
 }
 
@@ -106,31 +108,45 @@ fn own_search_matches_faiss() {
         let parsed = knn_format::parse(&bytes).unwrap();
         let index = &parsed.index;
         let queries = load_queries(
-            &index.index.storage.unwrap(),
+            &index.hnsw().unwrap().storage.unwrap(),
             &fs::read(dir.join(&b.queries_file)).unwrap(),
             b.dimension,
         );
         let faiss = read_results(&dir.join(&b.results_file));
         assert_eq!(
-            usize::try_from(index.index.graph.ef_search).unwrap(),
+            usize::try_from(index.hnsw().unwrap().graph.ef_search).unwrap(),
             b.ef_search,
             "{}: the baseline ran at the stored efSearch",
             b.file
         );
 
-        let hits = search_all(&index.index, &queries, b.k, b.ef_search, Draw::default()).unwrap();
+        let hits = search_all(
+            index.hnsw().unwrap(),
+            &queries,
+            b.k,
+            b.ef_search,
+            Draw::default(),
+        )
+        .unwrap();
         // Deterministic across runs and thread schedules.
         assert_eq!(
-            search_all(&index.index, &queries, b.k, b.ef_search, Draw::default()).unwrap(),
+            search_all(
+                index.hnsw().unwrap(),
+                &queries,
+                b.k,
+                b.ef_search,
+                Draw::default()
+            )
+            .unwrap(),
             hits
         );
         let own: Vec<Vec<i64>> = hits.iter().map(|h| result_labels(index, h, b.k)).collect();
 
         // Within 0.01 of Faiss's recall for the same queries and parameters.
         let labels = Labels::from_id_map(index.id_map).unwrap();
-        let truth = ground_truth(&index.index.storage.unwrap(), &queries, b.k).unwrap();
+        let truth = ground_truth(&index.hnsw().unwrap().storage.unwrap(), &queries, b.k).unwrap();
         let r = score(
-            &index.index.storage.unwrap(),
+            &index.hnsw().unwrap().storage.unwrap(),
             &labels,
             &queries,
             &truth,
@@ -146,7 +162,8 @@ fn own_search_matches_faiss() {
         );
         assert_eq!(r.missing, 0, "{}: every list is full", b.file);
 
-        let inner_product = index.index.storage.unwrap().header().metric() == Metric::InnerProduct;
+        let inner_product =
+            index.hnsw().unwrap().storage.unwrap().header().metric() == Metric::InnerProduct;
         for (ours, theirs) in own.iter().zip(&faiss) {
             lists += 1;
             if ours == theirs {
@@ -408,7 +425,7 @@ fn unreachable_nodes_leave_short_lists() {
     let parsed = knn_format::faiss::IdMapIndex {
         fourcc: FourCc::ID_MAP,
         header: index.header,
-        index,
+        index: knn_format::faiss::Inner::Hnsw(index),
         id_map: &[knn_format::I64::new(100), knn_format::I64::new(101)],
         end: 0,
     };
@@ -538,7 +555,7 @@ fn a_graph_without_its_vectors_has_nothing_to_search() {
     let bytes =
         fs::read(fixtures().join("opensearch-3.9.0-binary/on-disk/l2/_2_165_vec.faiss")).unwrap();
     let parsed = knn_format::parse(&bytes).unwrap();
-    let index = &parsed.index.index;
+    let index = parsed.index.hnsw().unwrap();
     assert!(index.storage.is_none());
     let mut s = Searcher::new(index.graph.node_count());
     let query = [0.0_f32; 16];
@@ -575,7 +592,7 @@ fn a_cagra_graph_is_searched_from_random_entries() {
     ] {
         let bytes = fs::read(fixtures().join(format!("synthetic-cagra/{name}.faiss"))).unwrap();
         let parsed = knn_format::parse(&bytes).unwrap();
-        let index = &parsed.index.index;
+        let index = parsed.index.hnsw().unwrap();
         assert!(index.random_entry_points(), "{name}");
         let mut s = Searcher::new(index.graph.node_count());
         let query = [0.25_f32; 64];
@@ -616,7 +633,7 @@ fn a_cagra_graph_is_searched_from_random_entries() {
     let bytes =
         fs::read(fixtures().join("synthetic-cagra/hamming-100x64-binary-cagra.faiss")).unwrap();
     let parsed = knn_format::parse(&bytes).unwrap();
-    let index = &parsed.index.index;
+    let index = parsed.index.hnsw().unwrap();
     let mut s = Searcher::new(index.graph.node_count());
     let hits = s
         .search(index, Query::Bits(&[0_u8; 8]), 10, 16, Draw::default())
@@ -633,7 +650,7 @@ fn the_seed_steers_a_cagra_graphs_entry_draw() {
     // different entries, so the lists differ.
     let bytes = fs::read(fixtures().join("synthetic-cagra/l2-100x64-cagra.faiss")).unwrap();
     let parsed = knn_format::parse(&bytes).unwrap();
-    let index = &parsed.index.index;
+    let index = parsed.index.hnsw().unwrap();
     let mut s = Searcher::new(index.graph.node_count());
     let query = [0.25_f32; 64];
     let mut nodes_of = |seed: u64| -> Vec<usize> {
@@ -655,7 +672,7 @@ fn a_huge_entry_count_is_capped() {
     // what the cap does.
     let bytes = fs::read(fixtures().join("synthetic-cagra/l2-100x64-cagra.faiss")).unwrap();
     let parsed = knn_format::parse(&bytes).unwrap();
-    let index = &parsed.index.index;
+    let index = parsed.index.hnsw().unwrap();
     let mut s = Searcher::new(index.graph.node_count());
     let query = [0.25_f32; 64];
     let at = |count| Draw {
@@ -679,7 +696,7 @@ fn a_full_exploration_of_a_cagra_graph_finds_the_exact_neighbors() {
     // count is necessary for that, not sufficient).
     let bytes = fs::read(fixtures().join("synthetic-cagra/l2-100x64-cagra.faiss")).unwrap();
     let parsed = knn_format::parse(&bytes).unwrap();
-    let index = &parsed.index.index;
+    let index = parsed.index.hnsw().unwrap();
     let storage = index.storage.as_ref().unwrap();
     let (queries, _) = knn_recall::sample_queries(storage, 20, 11).unwrap();
     let draw = Draw {
@@ -706,7 +723,7 @@ fn scalar_quantized_samples_are_the_decoded_rows() {
     ] {
         let bytes = fs::read(fixtures().join(file)).unwrap();
         let parsed = knn_format::parse(&bytes).unwrap();
-        let storage = &parsed.index.index.storage.unwrap();
+        let storage = &parsed.index.hnsw().unwrap().storage.unwrap();
         let Storage::Sq(sq) = storage else {
             panic!("{file}: scalar-quantized storage");
         };
@@ -725,7 +742,7 @@ fn scalar_quantized_samples_are_the_decoded_rows() {
 fn sampling_is_deterministic_and_distinct() {
     let bytes = fs::read(fixtures().join("synthetic/l2-1000x32.faiss")).unwrap();
     let parsed = knn_format::parse(&bytes).unwrap();
-    let storage = &parsed.index.index.storage.unwrap();
+    let storage = &parsed.index.hnsw().unwrap().storage.unwrap();
     let (q1, rows1) = knn_recall::sample_queries(storage, 50, 7).unwrap();
     let (q2, rows2) = knn_recall::sample_queries(storage, 50, 7).unwrap();
     assert_eq!(rows1, rows2);
@@ -780,7 +797,7 @@ fn binary_samples_are_the_stored_bits() {
     ] {
         let bytes = fs::read(fixtures().join(file)).unwrap();
         let parsed = knn_format::parse(&bytes).unwrap();
-        let storage = &parsed.index.index.storage.unwrap();
+        let storage = &parsed.index.hnsw().unwrap().storage.unwrap();
         let Storage::Binary(binary) = storage else {
             panic!("{file}: binary storage");
         };
@@ -792,10 +809,10 @@ fn binary_samples_are_the_stored_bits() {
         }
         // A query that is a stored vector finds it at distance 0, first or
         // tied with another copy of the same bits.
-        let mut searcher = Searcher::new(parsed.index.index.graph.node_count());
+        let mut searcher = Searcher::new(parsed.index.hnsw().unwrap().graph.node_count());
         let row = binary.row(rows[0]).unwrap();
         let hits = searcher
-            .search(&parsed.index.index, row, 5, 64, Draw::default())
+            .search(parsed.index.hnsw().unwrap(), row, 5, 64, Draw::default())
             .unwrap();
         assert_eq!(hits[0].distance.to_bits(), 0.0_f32.to_bits(), "{file}");
         // Each hit's distance is the bits in which its codes differ from
@@ -816,11 +833,62 @@ fn binary_samples_are_the_stored_bits() {
         }
         // Searching with float32 queries is refused, not guessed at.
         assert!(matches!(
-            searcher.search(&parsed.index.index, &[0.0_f32; 8], 5, 64, Draw::default()),
+            searcher.search(
+                parsed.index.hnsw().unwrap(),
+                &[0.0_f32; 8],
+                5,
+                64,
+                Draw::default()
+            ),
             Err(Error::QueryKind {
                 file: "binary",
                 queries: "float32"
             })
         ));
     }
+}
+
+#[test]
+fn product_quantized_storage_is_refused() {
+    // The codes under `IHNp` hold no exact vectors: no search, ground
+    // truth, or sample is taken over them.
+    let bytes = fs::read(fixtures().join("synthetic-ivf/hnsw-l2-1000x32-pq4.faiss")).unwrap();
+    let parsed = knn_format::parse(&bytes).unwrap();
+    let hnsw = parsed.index.hnsw().unwrap();
+    let storage = hnsw.storage.as_ref().unwrap();
+    assert!(matches!(storage, Storage::Pq(_)));
+    assert!(matches!(
+        knn_recall::query_dimension(storage),
+        Err(Error::ProductQuantized)
+    ));
+    assert!(matches!(
+        knn_recall::sample_queries(storage, 5, 1),
+        Err(Error::ProductQuantized)
+    ));
+    let queries = Queries::from_rows(32, vec![0.0; 64]).unwrap();
+    assert!(matches!(
+        ground_truth(storage, &queries, 5),
+        Err(Error::ProductQuantized)
+    ));
+    let mut searcher = Searcher::new(hnsw.graph.node_count());
+    assert!(matches!(
+        searcher.search(hnsw, &[0.0_f32; 32], 5, 16, Draw::default()),
+        Err(Error::ProductQuantized)
+    ));
+    assert!(matches!(
+        search_all(hnsw, &queries, 5, 16, Draw::default()),
+        Err(Error::ProductQuantized)
+    ));
+    let text = Error::ProductQuantized.to_string();
+    assert!(text.contains("product-quantized codes"), "{text}");
+}
+
+#[test]
+fn result_labels_pad_to_an_ivf_indexs_vector_count() {
+    // An IVF index has no graph; its lists' total is what bounds a list.
+    let bytes = fs::read(fixtures().join("synthetic-ivf/ivf-l2-5x4-sparse-flat.faiss")).unwrap();
+    let parsed = knn_format::parse(&bytes).unwrap();
+    assert!(parsed.index.hnsw().is_none());
+    assert_eq!(result_labels(&parsed.index, &[], 3), vec![-1, -1, -1]);
+    assert_eq!(result_labels(&parsed.index, &[], 10).len(), 5);
 }

@@ -155,7 +155,7 @@ fn without_rescoring_the_first_pass_is_the_result() {
         let field = &meta.fields[0];
         let data = DataFile::parse(&files.veq).unwrap();
         let records = QuantizedVectors::open(&files.veq, &data, field).unwrap();
-        let graph = &parsed.index.index.graph;
+        let graph = &parsed.index.hnsw().unwrap().graph;
         for q in queries(f, 5).rows() {
             let knn_recall::Query::Floats(q) = q else {
                 panic!("float queries");
@@ -844,9 +844,9 @@ fn an_unseeded_search_of_a_cagra_graph_finds_nothing() {
     graph_only.extend_from_slice(b"null");
     graph_only.extend_from_slice(&bytes[count_at + 8 + floats * 4..]);
     let parsed = knn_format::parse(&graph_only).unwrap();
-    assert!(parsed.index.index.storage.is_none());
-    assert!(parsed.index.index.random_entry_points());
-    let graph = &parsed.index.index.graph;
+    assert!(parsed.index.hnsw().unwrap().storage.is_none());
+    assert!(parsed.index.hnsw().unwrap().random_entry_points());
+    let graph = &parsed.index.hnsw().unwrap().graph;
     let search = |seeds: Option<&[usize]>| {
         lucene_search::search(
             graph,

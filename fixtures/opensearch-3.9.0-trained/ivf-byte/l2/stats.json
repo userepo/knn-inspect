@@ -1,0 +1,18 @@
+{
+  "file": "_2_165_vec.faiss",
+  "faiss_version": "1.15.1",
+  "nlist": 4,
+  "nprobe": 1,
+  "vectors": 500,
+  "empty_lists": 0,
+  "list_size_min": 106,
+  "list_size_max": 137,
+  "list_size_mean": 125.0,
+  "imbalance_factor": 1.008544,
+  "list_sizes": [
+    106,
+    130,
+    137,
+    127
+  ]
+}
