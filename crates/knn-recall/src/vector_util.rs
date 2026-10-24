@@ -4,7 +4,9 @@
 //! in [`LANES`] float32 lanes, one fused multiply-add per component, the
 //! lanes added as the JVM's compiled code adds them. And the sum of Faiss's
 //! scalar quantizer distance computer, as k-NN's native library for that
-//! host runs it.
+//! host runs it, and of Faiss's float32 loops (`fvec_L2sqr`,
+//! `fvec_inner_product`, `fvec_norm_L2sqr`), as the compiler laid them out
+//! in that library.
 
 use knn_format::F32;
 
@@ -21,7 +23,7 @@ fn reduce(l: Lanes) -> f32 {
 
 /// The lanes added in pairs, halves first: `(l0 + l4) + (l2 + l6)` and
 /// `(l1 + l5) + (l3 + l7)`, then the two.
-fn tree(l: Lanes) -> f32 {
+pub(crate) fn tree(l: [f32; LANES]) -> f32 {
     let [l0, l1, l2, l3, l4, l5, l6, l7] = l;
     ((l0 + l4) + (l2 + l6)) + ((l1 + l5) + (l3 + l7))
 }
@@ -152,6 +154,122 @@ pub(crate) fn faiss_sum(
     tree(lanes)
 }
 
+/// The sum of Faiss's float32 loops over `n` components, `term(i)` giving
+/// component `i`'s two factors, as GCC 13 compiled them for k-NN 3.9's
+/// AVX2 library (`libopensearchknn_faiss_avx2.so`; read from its
+/// disassembly). Faiss marks the loops imprecise
+/// (`FAISS_PRAGMA_IMPRECISE_FUNCTION_BEGIN`: unrolled, reassociated), and
+/// the compiler vectorized them: the whole groups of [`LANES`] are summed
+/// in one accumulator, component `i` into lane `i % LANES`, each product
+/// rounded before it is added; the halves are added lane by lane into
+/// four, and those as `(s1 + s3) + (s0 + s2)`. Where four components or
+/// more remain, they are fused into the four, one multiply-add each, and
+/// the four added the same way; the last few are fused into the sum one by
+/// one, in order. A vector under 8 components starts from four zeros, so
+/// one of 4 to 7 sums its first four by the same rule.
+pub(crate) fn fvec_sum(n: usize, term: impl Fn(usize) -> (f32, f32)) -> f32 {
+    let four = |[s0, s1, s2, s3]: [f32; 4]| (s1 + s3) + (s0 + s2);
+    let whole = n - n % LANES;
+    let mut quad = [0.0_f32; 4];
+    let mut total = 0.0_f32;
+    if whole > 0 {
+        let mut lanes = [0.0_f32; LANES];
+        for i in 0..whole {
+            let (a, b) = term(i);
+            if let Some(lane) = lanes.get_mut(i % LANES) {
+                *lane += a * b;
+            }
+        }
+        let [l0, l1, l2, l3, l4, l5, l6, l7] = lanes;
+        quad = [l0 + l4, l1 + l5, l2 + l6, l3 + l7];
+        total = four(quad);
+    }
+    let mut i = whole;
+    if n - whole >= 4 {
+        for (j, q) in quad.iter_mut().enumerate() {
+            let (a, b) = term(i + j);
+            *q = a.mul_add(b, *q);
+        }
+        total = four(quad);
+        i += 4;
+    }
+    for i in i..n {
+        let (a, b) = term(i);
+        total = a.mul_add(b, total);
+    }
+    total
+}
+
+/// Float32 components however they are stored: decoded, as file views,
+/// or as the raw little-endian bytes of an inverted list.
+pub(crate) trait Floats {
+    /// Components held.
+    fn count(&self) -> usize;
+    /// Component `i`, 0 past the end, which the callers never reach.
+    fn value(&self, i: usize) -> f32;
+}
+
+impl Floats for [f32] {
+    fn count(&self) -> usize {
+        self.len()
+    }
+    fn value(&self, i: usize) -> f32 {
+        self.get(i).copied().unwrap_or(0.0)
+    }
+}
+
+impl Floats for [F32] {
+    fn count(&self) -> usize {
+        self.len()
+    }
+    fn value(&self, i: usize) -> f32 {
+        self.get(i).map_or(0.0, |v| v.get())
+    }
+}
+
+/// Little-endian float32 components in raw bytes, as an inverted list of
+/// float32 codes holds them; a partial last component is not one.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LeBytes<'a>(pub(crate) &'a [u8]);
+
+impl Floats for LeBytes<'_> {
+    fn count(&self) -> usize {
+        self.0.len() / 4
+    }
+    fn value(&self, i: usize) -> f32 {
+        self.0
+            .as_chunks::<4>()
+            .0
+            .get(i)
+            .map_or(0.0, |&w| f32::from_le_bytes(w))
+    }
+}
+
+/// Faiss's `fvec_L2sqr(x, y, d)` over the shorter of the two, as
+/// [`fvec_sum`] sums it: each difference `x - y` squared.
+pub(crate) fn fvec_l2sqr<Y: Floats + ?Sized>(x: &[f32], y: &Y) -> f32 {
+    let n = x.len().min(y.count());
+    fvec_sum(n, |i| {
+        let d = x.value(i) - y.value(i);
+        (d, d)
+    })
+}
+
+/// Faiss's `fvec_inner_product(x, y, d)` over the shorter of the two, as
+/// [`fvec_sum`] sums it.
+pub(crate) fn fvec_inner_product<Y: Floats + ?Sized>(x: &[f32], y: &Y) -> f32 {
+    let n = x.len().min(y.count());
+    fvec_sum(n, |i| (x.value(i), y.value(i)))
+}
+
+/// Faiss's `fvec_norm_L2sqr(x, d)`, as [`fvec_sum`] sums it.
+pub(crate) fn fvec_norm_l2sqr<X: Floats + ?Sized>(x: &X) -> f32 {
+    fvec_sum(x.count(), |i| {
+        let v = x.value(i);
+        (v, v)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,6 +316,54 @@ mod tests {
         // No leading 0: a sum of -0 stays -0.
         let negative_zero = faiss_sum(&[-0.0; 8], [1.0; 8].into_iter(), |_, a, b| a * b);
         assert!(negative_zero == 0.0 && negative_zero.is_sign_negative());
+    }
+
+    /// `1 + 2^-12`, whose square, `1 + 2^-11 + 2^-24`, rounds to
+    /// `1 + 2^-11` alone but survives a fused multiply-add with -1.
+    const INEXACT: f32 = 1.0 + 1.0 / 4096.0;
+    const ROUNDED: f32 = 1.0 / 2048.0;
+    const FUSED: f32 = 1.0 / 2048.0 + 1.0 / 16_777_216.0;
+
+    #[test]
+    fn fvec_lanes_round_products_and_tails_fuse_them() {
+        // Component 0 is -1, component `at` the inexact square.
+        let term = |at: usize| {
+            move |i: usize| match i {
+                0 => (1.0, -1.0),
+                i if i == at => (INEXACT, INEXACT),
+                _ => (0.0, 0.0),
+            }
+        };
+        // Sixteen: both in lane 0, the square rounded before it is added.
+        assert_eq!(fvec_sum(16, term(8)), ROUNDED);
+        // Twelve: the four past the lanes are fused into the halves' sums.
+        assert_eq!(fvec_sum(12, term(8)), FUSED);
+        // Nine: the one past the lanes is fused into the sum.
+        assert_eq!(fvec_sum(9, term(8)), FUSED);
+        // Five: under 8, four fused from zeros, the fifth into their sum.
+        assert_eq!(fvec_sum(5, term(4)), FUSED);
+    }
+
+    #[test]
+    fn fvec_lanes_pair_across_the_halves_then_odd_with_odd() {
+        // Float32 is 8 apart at 1e8, and 1e8 + 4 rounds to 1e8 (to even).
+        // Lane i meets lane i + 4 first, so lanes 1 and 5 make 8 before
+        // 1e8 sees them.
+        let lanes = |values: [f32; 8]| move |i: usize| (values[i % 8], 1.0);
+        assert_eq!(
+            fvec_sum(8, lanes([1e8, 4.0, 0.0, 0.0, 0.0, 4.0, 0.0, 0.0])),
+            1e8 + 8.0
+        );
+        // Then (s1 + s3) + (s0 + s2): lanes 1 and 3 meet before lane 0.
+        assert_eq!(
+            fvec_sum(8, lanes([1e8, 4.0, 0.0, 4.0, 0.0, 0.0, 0.0, 0.0])),
+            1e8 + 8.0
+        );
+        // And lanes 0 and 2 meet before lanes 1 and 3.
+        assert_eq!(
+            fvec_sum(8, lanes([4.0, 1e8, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0])),
+            1e8 + 8.0
+        );
     }
 
     #[test]

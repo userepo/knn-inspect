@@ -53,10 +53,11 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
-use knn_format::faiss::{HnswGraph, HnswIndex, IdMapIndex, Inner};
+use knn_format::faiss::{HnswGraph, HnswIndex, IdMapIndex, Inner, PqStorage, Storage};
 use rayon::prelude::*;
 
-use crate::{Distance, Draw, Error, Queries, Query, Result, Vectors, check_query, checked_vectors};
+use crate::pq::{Pq, Table};
+use crate::{Distance, Draw, Error, FLOAT32, Queries, Query, Result, Vectors, check_query};
 
 /// One result of a search.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -112,15 +113,14 @@ impl Searcher {
         }
         let query = query.into();
         let storage = index.storage.as_ref().ok_or(Error::NoVectors)?;
-        let vectors = Vectors::of(storage)?;
-        check_query(&vectors, query.kind(), query.dimension())?;
-        let distance = Distance::of_storage(storage)?;
+        let scorer = Scorer::of(storage, query)?;
+        let distance = scorer.distance;
         let graph = &index.graph;
         if self.visited.len() != graph.node_count() {
             self.visited = vec![0; graph.node_count()];
             self.stamp = 1;
         }
-        let dist_to = |node: usize| vectors.distance(distance, node, query);
+        let dist_to = |node: usize| scorer.to(node);
 
         let (nearest, d_nearest) = if let Some(cagra) = index.kind.cagra() {
             // `IndexHNSWCagra::search`: the nearest of the file's count of
@@ -324,8 +324,7 @@ pub fn search_all(
         return Err(Error::ZeroK);
     }
     let storage = index.storage.as_ref().ok_or(Error::NoVectors)?;
-    checked_vectors(storage, queries)?;
-    Distance::of_storage(storage)?;
+    checked(storage, queries.kind(), queries.d())?;
     let nodes = index.graph.node_count();
     queries
         .rows()
@@ -337,6 +336,102 @@ pub fn search_all(
             |searcher, (row, q)| searcher.search(index, q, k, ef_search, draw.for_row(row)),
         )
         .collect()
+}
+
+/// What a search scores nodes with: the stored vectors, or for
+/// product-quantized storage (`IxPq` under `IHNp`) the query's table of
+/// distances to the sub-quantizer centroids, as `IndexPQ`'s distance
+/// computer scores codes (see [`crate::pq`]); an inner product negated,
+/// as Faiss's HNSW search negates it.
+struct Scorer<'a, 'q> {
+    distance: Distance,
+    with: With<'a, 'q>,
+}
+
+enum With<'a, 'q> {
+    Vectors(Vectors<'a>, Query<'q>),
+    Codes {
+        pq: Pq<'a>,
+        storage: PqStorage<'a>,
+        table: Vec<f32>,
+    },
+}
+
+impl<'a, 'q> Scorer<'a, 'q> {
+    fn of(storage: &Storage<'a>, query: Query<'q>) -> Result<Self> {
+        checked(storage, query.kind(), query.dimension())?;
+        let distance = Distance::of_storage(storage)?;
+        let with = match (storage, query) {
+            (Storage::Pq(s), Query::Floats(q)) => {
+                let pq = Pq::of(&s.pq)?;
+                let mut table = Vec::new();
+                let kind = if distance == Distance::L2 {
+                    Table::L2
+                } else {
+                    Table::InnerProduct
+                };
+                pq.table(kind, q, &mut table);
+                With::Codes {
+                    pq,
+                    storage: *s,
+                    table,
+                }
+            }
+            _ => With::Vectors(Vectors::of(storage)?, query),
+        };
+        Ok(Self { distance, with })
+    }
+
+    /// Node `node`'s distance, smaller closer, or `None` when it has no
+    /// stored vector or code.
+    fn to(&self, node: usize) -> Option<f32> {
+        match &self.with {
+            With::Vectors(vectors, query) => vectors.distance(self.distance, node, *query),
+            With::Codes { pq, storage, table } => {
+                let d = pq.code_distance(table, storage.row(node)?);
+                Some(match self.distance {
+                    Distance::NegatedInnerProduct => -d,
+                    Distance::L2 | Distance::Hamming => d,
+                })
+            }
+        }
+    }
+}
+
+/// `Ok` when queries of `kind` and dimension `d` can search `storage`:
+/// float32 ones of the dimension of product-quantized storage, whose
+/// quantizer must be whole, or of the kind and dimension of any other.
+fn checked(storage: &Storage<'_>, kind: &'static str, d: usize) -> Result<()> {
+    if let Storage::Pq(s) = storage {
+        let pq = Pq::of(&s.pq)?;
+        let own = usize::try_from(s.header.d)
+            .ok()
+            .filter(|&own| own > 0)
+            .ok_or(Error::Dimension { d: s.header.d })?;
+        if pq.d() != own {
+            return Err(Error::Unsearchable {
+                why: format!(
+                    "its product quantizer's dimension, {}, is not the storage's, {own}",
+                    pq.d()
+                ),
+            });
+        }
+        if kind != FLOAT32 {
+            return Err(Error::QueryKind {
+                file: FLOAT32,
+                queries: kind,
+            });
+        }
+        if d != own {
+            return Err(Error::DimensionMismatch {
+                file: own,
+                queries: d,
+            });
+        }
+    } else {
+        check_query(&Vectors::of(storage)?, kind, d)?;
+    }
+    Distance::of_storage(storage).map(|_| ())
 }
 
 /// A result list in Faiss's shape: the hits' labels in order, padded

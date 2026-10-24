@@ -849,9 +849,10 @@ fn binary_samples_are_the_stored_bits() {
 }
 
 #[test]
-fn product_quantized_storage_is_refused() {
-    // The codes under `IHNp` hold no exact vectors: no search, ground
-    // truth, or sample is taken over them.
+fn product_quantized_storage_has_no_ground_truth_but_is_searched() {
+    // The codes under `IHNp` hold no exact vectors: no ground truth or
+    // sample is taken over them (the field's vectors in the .vec stand in;
+    // see tests/trained.rs). The search scores the codes.
     let bytes = fs::read(fixtures().join("synthetic-ivf/hnsw-l2-1000x32-pq4.faiss")).unwrap();
     let parsed = knn_format::parse(&bytes).unwrap();
     let hnsw = parsed.index.hnsw().unwrap();
@@ -871,13 +872,27 @@ fn product_quantized_storage_is_refused() {
         Err(Error::ProductQuantized)
     ));
     let mut searcher = Searcher::new(hnsw.graph.node_count());
+    let hits = searcher
+        .search(hnsw, &[0.0_f32; 32], 5, 16, Draw::default())
+        .unwrap();
+    assert_eq!(hits.len(), 5);
+    assert!(hits.windows(2).all(|w| w[0].distance <= w[1].distance));
+    let all = search_all(hnsw, &queries, 5, 16, Draw::default()).unwrap();
+    assert_eq!(all, vec![hits.clone(), hits]);
+    // A query of the other kind or dimension is refused.
     assert!(matches!(
-        searcher.search(hnsw, &[0.0_f32; 32], 5, 16, Draw::default()),
-        Err(Error::ProductQuantized)
+        searcher.search(hnsw, &[0_u8; 4], 5, 16, Draw::default()),
+        Err(Error::QueryKind {
+            file: "float32",
+            queries: "binary"
+        })
     ));
     assert!(matches!(
-        search_all(hnsw, &queries, 5, 16, Draw::default()),
-        Err(Error::ProductQuantized)
+        searcher.search(hnsw, &[0.0_f32; 31], 5, 16, Draw::default()),
+        Err(Error::DimensionMismatch {
+            file: 32,
+            queries: 31
+        })
     ));
     let text = Error::ProductQuantized.to_string();
     assert!(text.contains("product-quantized codes"), "{text}");

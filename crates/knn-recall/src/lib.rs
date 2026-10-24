@@ -17,7 +17,14 @@
 //! Faiss's; a CAGRA graph, which stores no entry point, is entered at
 //! random nodes drawn by a [`Draw`]'s seed, so the lists are reproducible
 //! here, where k-NN's own are not (it draws from `std::random_device` or
-//! `ThreadLocalRandom`). [`sample_queries`] draws queries from the file's
+//! `ThreadLocalRandom`). An IVF (inverted file) index's come from
+//! [`IvfSearcher`], Faiss's IVF search as k-NN runs it, with its
+//! `nprobes`, and its ground truth from [`IvfVectors`], the vectors its
+//! lists hold, by id. Product-quantized codes, a graph's or an IVF
+//! index's, are searched through tables of the query's distances to the
+//! sub-quantizer centroids, as Faiss searches them, but hold no exact
+//! vectors: [`on_disk::field_vectors`] gives their field's in the `.vec`
+//! for the ground truth. [`sample_queries`] draws queries from the file's
 //! vectors.
 //! [`quantizer`] ports Lucene's `OptimizedScalarQuantizer`, which wrote
 //! the quantized vectors Lucene keeps for a graph without its own,
@@ -26,17 +33,22 @@
 //! graph, and [`on_disk`] the whole query k-NN runs against such a field,
 //! rescored against its vectors in the `.vec`, float32 or fp16.
 //!
-//! Distances are float32 sums in element order. That is how Faiss's
+//! The ground truth's distances, and an HNSW search's over stored
+//! vectors, are float32 sums in element order. That is how Faiss's
 //! portable scalar-quantizer code computes scalar-quantized distances; its
 //! float32 code, and its SIMD builds' scalar-quantizer code, regroup the
 //! sums, so two neighbors a last bit apart can order differently here
-//! than in Faiss. Faiss from `c000190` on (1.14.3), running its
+//! than in Faiss. The IVF search, and the HNSW search over
+//! product-quantized codes, sum as k-NN 3.9's AVX2 Faiss library does
+//! instead (its kernels, and where its compiler chose the order, the
+//! library's disassembly), and keep their results in Faiss's heaps, whose
+//! tie rules they follow. Faiss from `c000190` on (1.14.3), running its
 //! `AVX512_SPR` code, also rounds the query to bf16 for bf16 distances;
 //! this crate, like `5616caa`, the Faiss that k-NN 3.9.0 builds, keeps it
 //! float32.
 //!
-//! Exact distance ties are broken as `5616caa` breaks them, toward the
-//! lower node: that Faiss searches an inner-product index over negated
+//! Exact distance ties in an HNSW search are broken as `5616caa` breaks
+//! them, toward the lower node: that Faiss searches an inner-product index over negated
 //! distances with the same max-heaps it uses for L2. Faiss 1.15.1 searches
 //! it with min-heaps over the similarities instead, which break ties
 //! toward the higher node in the candidate queue and the results alike,
@@ -45,9 +57,12 @@
 //! data, happen with byte vectors and integer queries, and are the rule
 //! with binary vectors, whose distances are small integers.
 
+mod faiss_heap;
 mod hnsw;
+mod ivf;
 pub mod lucene_search;
 pub mod on_disk;
+mod pq;
 pub mod quantized_scorer;
 pub mod quantizer;
 mod vector_util;
@@ -57,6 +72,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::LazyLock;
 
 pub use hnsw::{Hit, Searcher, result_labels, search_all};
+pub use ivf::{IvfSearcher, IvfVectors};
 
 use knn_format::faiss::{CodeFormat, Metric, Storage, bf16_to_f32, byte_to_f32, f16_to_f32};
 use knn_format::{F32, I64, U16};
@@ -134,11 +150,70 @@ pub enum Error {
     )]
     NoVectors,
     /// The file stores product-quantized codes, which hold no exact
-    /// vectors and which no search here reads.
+    /// vectors to take ground truth or samples over: the field's vectors
+    /// in the segment's `.vec` stand in for them
+    /// ([`on_disk::field_vectors`]).
     #[error(
-        "the file stores its vectors as product-quantized codes, which hold no exact vectors; this search does not read them"
+        "the file stores its vectors as product-quantized codes, which hold no exact vectors; the field's vectors in the segment's .vec do"
     )]
     ProductQuantized,
+    /// The product quantizer's centroid table holds another number of
+    /// floats than its fields size, so Faiss would read past it.
+    #[error(
+        "the product quantizer holds {found} centroid floats, where its fields size {expected}"
+    )]
+    PqCentroids {
+        /// Floats stored.
+        found: usize,
+        /// `d x 2^nbits`.
+        expected: u64,
+    },
+    /// A product quantizer's table would pass Faiss's
+    /// `precomputed_table_max_bytes`, 2 GiB: past it Faiss precomputes no
+    /// IVF table, and k-NN's search reads an empty one.
+    #[error("a product-quantized table of {bytes} bytes is past the 2 GiB Faiss precomputes")]
+    PqTable {
+        /// Its size, saturating.
+        bytes: u64,
+    },
+    /// The parts of an IVF index, or of product-quantized storage, do not
+    /// fit together, so Faiss's search of it would fail or read out of
+    /// bounds; `verify` reports it.
+    #[error("the index cannot be searched: {why}")]
+    Unsearchable {
+        /// What does not fit.
+        why: String,
+    },
+    /// The stored `nprobe`, as the `int` k-NN casts it to, is 0 or less,
+    /// with which every search that gives no `nprobes` fails.
+    #[error(
+        "the file's nprobe {nprobe} is {as_int} as the int k-NN reads it, with which every search that gives no nprobes fails"
+    )]
+    Nprobe {
+        /// As stored.
+        nprobe: u64,
+        /// Its low 32 bits, as an `int`.
+        as_int: i32,
+    },
+    /// A binary IVF index whose stored `nprobe` is 0, which k-NN's patched
+    /// binary search refuses whatever a query gives.
+    #[error(
+        "the file's nprobe is 0, with which k-NN's binary IVF search fails whatever nprobes a query gives"
+    )]
+    BinaryNprobe,
+    /// `nprobes` was 0, which k-NN refuses.
+    #[error("nprobes must be at least 1")]
+    ZeroNprobes,
+    /// An IVF index's lists do not hold one code for each id from 0 to
+    /// their count less 1, as every file k-NN writes does, so no vector
+    /// stands for some id.
+    #[error(
+        "the inverted lists do not hold one code for each of the index's vectors: id {id} is past their count or repeated"
+    )]
+    ListIds {
+        /// The first id out of place.
+        id: i64,
+    },
     /// Two nodes carry the same label, so a result cannot be resolved.
     #[error("label {label} belongs to nodes {first} and {second}")]
     DuplicateLabel {
@@ -165,8 +240,12 @@ pub enum Error {
         /// Queries given.
         queries: usize,
     },
-    /// The file holds its own vectors, which Faiss's search reads.
-    #[error("the file holds its own vectors, not a graph over a field's quantized ones")]
+    /// The file holds its own exact vectors, which Faiss's search reads:
+    /// neither a graph without them nor product-quantized codes, whose
+    /// field's vectors stand in for them.
+    #[error(
+        "the file holds its own vectors: it is neither a graph without them nor product-quantized codes"
+    )]
     HasVectors,
     /// The field records no quantized vectors.
     #[error("the field records no quantized vectors")]

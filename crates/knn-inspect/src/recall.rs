@@ -10,16 +10,16 @@ use std::time::Instant;
 use anyhow::{Context, bail};
 use clap::Args;
 use knn_format::NativeFile;
-use knn_format::faiss::{IdMapIndex, Storage};
+use knn_format::faiss::{IdMapIndex, Inner, IvfEncoding, IvfIndex, Storage};
 use knn_format::flat_vectors::{FlatField, FlatVectorsMeta};
 use knn_format::quantized_vectors::{DataFile, QuantizedVectors};
 use knn_recall::on_disk::{DEFAULT_EF_SEARCH, OnDiskField, Plan, Rescore, field_vectors};
 use knn_recall::quantizer::Similarity;
-use knn_recall::{Draw, Labels, Queries, Recall};
+use knn_recall::{Draw, IvfSearcher, IvfVectors, Labels, Queries, Recall};
 use serde::Serialize;
 
 use crate::scan::quantized::{
-    FieldFiles, Graph, Quantized, RawFiles, field_files, similarity_name,
+    FieldFiles, Graph, Quantized, RawFiles, field_files, native_field_files, similarity_name,
 };
 use crate::scan::shown;
 
@@ -34,8 +34,9 @@ pub struct RecallArgs {
     #[arg(long, required_unless_present = "sample", conflicts_with = "sample")]
     pub queries: Option<PathBuf>,
     /// Instead of --queries: this many of the file's own vectors, chosen by
-    /// --seed. Only for the tool's own search: results produced elsewhere
-    /// cannot have used them.
+    /// --seed; for a file of product-quantized codes or a graph without
+    /// its vectors, of the field's vectors in the .vec. Only for the tool's
+    /// own search: results produced elsewhere cannot have used them.
     #[arg(long, conflicts_with = "results")]
     pub sample: Option<usize>,
     /// Seed for --sample and for the random entry points of a CAGRA
@@ -58,13 +59,18 @@ pub struct RecallArgs {
     /// Neighbors per query to score; longer result lists are cut to this.
     #[arg(long, default_value_t = 10)]
     pub k: usize,
-    /// Candidate queue size for the tool's own search; the file's efSearch
+    /// Candidate queue size for a graph's own search; the file's efSearch
     /// when absent. At least 1: with 0 the search stops after one step. For
     /// a graph without its vectors, the index's `ef_search` setting or a
     /// query's `method_parameters.ef_search`, which k-NN reads instead of
     /// the file's: 100 when absent.
     #[arg(long, conflicts_with = "results", value_parser = clap::value_parser!(u64).range(1..))]
     pub ef_search: Option<u64>,
+    /// For an IVF index's own search: lists scanned per query, as a
+    /// query's `method_parameters.nprobes`, from 1 to 2147483647; the
+    /// file's nprobe when absent. A search scans at most nlist lists.
+    #[arg(long, conflicts_with = "results", value_parser = clap::value_parser!(u64).range(1..=2_147_483_647))]
+    pub nprobes: Option<u64>,
     /// For a graph without its vectors: rescore the first pass with this
     /// oversample factor, from 1 to 100, instead of k-NN's default (2 for a
     /// 1-bit field, 1 for 2 and 4 bits).
@@ -115,7 +121,16 @@ struct Sample {
 
 #[derive(Serialize)]
 struct OwnSearch {
-    ef_search: usize,
+    /// For a graph: the candidate queue's size.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ef_search: Option<usize>,
+    /// For an IVF index: the nprobes the search passed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    nprobes: Option<usize>,
+    /// For an IVF index: its lists, of which the search scanned the
+    /// nprobes nearest.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    nlist: Option<usize>,
     /// For a CAGRA graph: random entry points drawn per query.
     #[serde(skip_serializing_if = "Option::is_none")]
     entry_points: Option<usize>,
@@ -161,12 +176,16 @@ pub fn run(args: &RecallArgs) -> anyhow::Result<ExitCode> {
         .parse()
         .with_context(|| format!("parsing {}", path.display()))?;
     let index = &parsed.index;
-    let Some(hnsw) = index.hnsw() else {
+    let hnsw = match &index.index {
+        Inner::Ivf(ivf) => return run_ivf(args, index, ivf),
+        Inner::Hnsw(hnsw) => hnsw,
+    };
+    if args.nprobes.is_some() {
         bail!(
-            "{}: the file is an IVF index, whose search recall does not run yet",
+            "{}: --nprobes applies to an IVF index's own search; this file is a graph",
             path.display()
         );
-    };
+    }
     // Clap cannot see the graph kind, so the arguments that steer the
     // random entry draws are checked against the file here.
     if !hnsw.random_entry_points() {
@@ -193,9 +212,26 @@ pub fn run(args: &RecallArgs) -> anyhow::Result<ExitCode> {
         );
     }
     if matches!(storage, Storage::Pq(_)) {
-        bail!(
-            "{}: the file stores product-quantized codes, which hold no exact vectors; recall over them is not implemented yet",
-            path.display()
+        // The codes hold no exact vectors: the field's in the .vec stand
+        // in for them, and the own search scores the codes.
+        let (raw, flat, similarity) = pq_field(args)?;
+        let exact = field_vectors(index, similarity, &flat, raw.vec.bytes())
+            .with_context(|| format!("{}: the field's vectors in the .vec", path.display()))?;
+        let dimension = knn_recall::query_dimension(&exact)
+            .with_context(|| format!("{}: no query can match it", path.display()))?;
+        let (queries, sample) = load_queries(args, &exact, dimension)?;
+        let (results, search) = results_for(args, index, &queries)?;
+        return report(
+            args,
+            index,
+            &exact,
+            dimension,
+            Searched {
+                queries,
+                sample,
+                results,
+                search,
+            },
         );
     }
     // The dimension queries must have: the file's, or for binary storage
@@ -219,6 +255,151 @@ pub fn run(args: &RecallArgs) -> anyhow::Result<ExitCode> {
     )
 }
 
+/// `recall` on an IVF index: ground truth over the vectors its lists
+/// hold, decoded, or for product-quantized codes over the field's vectors
+/// in the segment's `.vec`, and the own search Faiss's IVF search as
+/// k-NN runs it, with `--nprobes` or the file's `nprobe`.
+fn run_ivf(
+    args: &RecallArgs,
+    index: &IdMapIndex<'_>,
+    ivf: &IvfIndex<'_>,
+) -> anyhow::Result<ExitCode> {
+    let path = &args.file;
+    // Clap cannot see the index kind: the graph searches' arguments are
+    // checked against the file here.
+    for (given, flag) in [
+        (args.entry_points.is_some(), "--entry-points"),
+        (args.ef_search.is_some(), "--ef-search"),
+    ] {
+        if given {
+            bail!(
+                "{}: {flag} applies to a graph's own search; this file is an IVF index, searched with --nprobes",
+                path.display()
+            );
+        }
+    }
+    if args.seed.is_some() && args.sample.is_none() {
+        bail!(
+            "{}: --seed without --sample applies to a CAGRA graph's own search; an IVF index's search draws nothing at random",
+            path.display()
+        );
+    }
+    if args.oversample.is_some() || args.no_rescore {
+        bail!(
+            "{}: --oversample and --no-rescore apply to a graph without its vectors",
+            path.display()
+        );
+    }
+    let decoded;
+    let field;
+    let storage = if matches!(ivf.encoding, IvfEncoding::Pq { .. }) {
+        field = pq_field(args)?;
+        let (raw, flat, similarity) = &field;
+        field_vectors(index, *similarity, flat, raw.vec.bytes())
+            .with_context(|| format!("{}: the field's vectors in the .vec", path.display()))?
+    } else {
+        decoded = IvfVectors::of(ivf)
+            .with_context(|| format!("{}: the vectors its lists hold", path.display()))?;
+        decoded.storage()
+    };
+    let dimension = knn_recall::query_dimension(&storage)
+        .with_context(|| format!("{}: no query can match it", path.display()))?;
+    let (queries, sample) = load_queries(args, &storage, dimension)?;
+    let (results, search) = if let Some(p) = &args.results {
+        (read_results(p)?, None)
+    } else {
+        let searcher =
+            IvfSearcher::new(ivf).with_context(|| format!("{}: searching it", path.display()))?;
+        let nprobes = searcher
+            .nprobes(
+                args.nprobes
+                    .map(|n| usize::try_from(n).unwrap_or(usize::MAX)),
+            )
+            .with_context(|| {
+                format!(
+                    "{}: searching it (--nprobes gives a query's nprobes)",
+                    path.display()
+                )
+            })?;
+        let started = Instant::now();
+        let hits = searcher.search_all(&queries, args.k, nprobes)?;
+        let search_ms = started.elapsed().as_millis();
+        let results = hits
+            .iter()
+            .map(|h| knn_recall::result_labels(index, h, args.k))
+            .collect();
+        (
+            results,
+            Some(OwnSearch {
+                ef_search: None,
+                nprobes: Some(nprobes),
+                nlist: Some(searcher.nlist()),
+                entry_points: None,
+                seed: None,
+                beam: None,
+                rescore: None,
+                first_pass_k: None,
+                search_ms,
+            }),
+        )
+    };
+    report(
+        args,
+        index,
+        &storage,
+        dimension,
+        Searched {
+            queries,
+            sample,
+            results,
+            search,
+        },
+    )
+}
+
+/// The field of a file of product-quantized codes, which hold no exact
+/// vectors: its `.vemf` and `.vec`, found through the segment's `.fnm`,
+/// its record in the `.vemf`, and the similarity the `.fnm` records.
+fn pq_field(args: &RecallArgs) -> anyhow::Result<(RawFiles, FlatField, Similarity)> {
+    let path = &args.file;
+    let at = |why: String| anyhow::anyhow!("{}: {why}", path.display());
+    let files = native_field_files(path).map_err(|why| {
+        at(format!(
+            "the file's product-quantized codes hold no exact vectors, and its field's vectors could not be found: {why}"
+        ))
+    })?;
+    // The file is tied to the field by its name alone. A field built
+    // through a model records no space type, and Lucene's default
+    // similarity, Euclidean, whatever the model's metric, so nothing in
+    // the .fnm can confirm the file's metric: the index's own decides.
+    let raw = files.raw().map_err(at)?;
+    let flat = flat_field(&files, &raw)?;
+    same_similarity(path, &files, &flat)?;
+    let similarity =
+        Similarity::from_ordinal(files.similarity).ok_or(knn_recall::Error::Similarity {
+            ordinal: files.similarity,
+        })?;
+    Ok((raw, flat, similarity))
+}
+
+/// `Ok` when the field's `.vemf` record, `flat`, records the similarity
+/// the `.fnm` does, or none; scan's check holds both to the `.vemq`'s.
+fn same_similarity(path: &Path, files: &FieldFiles, flat: &FlatField) -> anyhow::Result<()> {
+    if let Some(recorded) = flat.similarity
+        && recorded != files.similarity
+    {
+        bail!(
+            "{}: {} records the {} similarity for field {}, the .fnm the {}",
+            path.display(),
+            shown(&files.vemq.with_extension("vemf")),
+            similarity_name(recorded).unwrap_or("?"),
+            files.number,
+            similarity_name(files.similarity).unwrap_or("?")
+        );
+    }
+    Ok(())
+}
+
 /// `recall` on a graph without its vectors: the field the segment's `.fnm`
 /// ties it to, searched as k-NN searches it, against the field's vectors
 /// in the `.vec`, float32, or fp16 for a `half_float` field. Result lists
@@ -232,20 +413,7 @@ fn run_on_disk(args: &RecallArgs, index: &IdMapIndex<'_>) -> anyhow::Result<Exit
     if let Some(p) = &args.results {
         let raw = files.raw().map_err(at)?;
         let flat_field = flat_field(&files, &raw)?;
-        // The .fnm's similarity, as the .vemf records it for the field;
-        // scan's check holds both to the .vemq's instead.
-        if let Some(recorded) = flat_field.similarity
-            && recorded != files.similarity
-        {
-            bail!(
-                "{}: {} records the {} similarity for field {}, the .fnm the {}",
-                path.display(),
-                ext("vemf"),
-                similarity_name(recorded).unwrap_or("?"),
-                files.number,
-                similarity_name(files.similarity).unwrap_or("?")
-            );
-        }
+        same_similarity(path, &files, &flat_field)?;
         return score_on_disk(
             args,
             index,
@@ -300,7 +468,9 @@ fn run_on_disk(args: &RecallArgs, index: &IdMapIndex<'_>) -> anyhow::Result<Exit
         (
             results,
             Some(OwnSearch {
-                ef_search,
+                ef_search: Some(ef_search),
+                nprobes: None,
+                nlist: None,
                 // The seeds each query got: k-NN caps the count at the
                 // vector count, past which every node is one.
                 entry_points: cagra.map(|c| {
@@ -475,7 +645,7 @@ fn results_for(
     if let Some(p) = &args.results {
         return Ok((read_results(p)?, None));
     }
-    // `run` has refused an IVF index already; a graph is all that reaches
+    // `run` sends an IVF index to `run_ivf`; a graph is all that reaches
     // here.
     let hnsw = index
         .hnsw()
@@ -496,7 +666,9 @@ fn results_for(
     Ok((
         results,
         Some(OwnSearch {
-            ef_search,
+            ef_search: Some(ef_search),
+            nprobes: None,
+            nlist: None,
             // The draws each query got: the search cuts a corrupt count.
             entry_points: cagra.map(|c| {
                 draw.count
@@ -570,6 +742,49 @@ fn read_results(path: &Path) -> anyhow::Result<Vec<Vec<i64>>> {
     Ok(results)
 }
 
+/// How the tool's own search of a graph ran, of `vectors` vectors, as the
+/// report's results line says it.
+fn graph_search(search: &OwnSearch, vectors: usize) -> String {
+    let ef_search = search.ef_search.unwrap_or(0);
+    // For a CAGRA graph: where each query's search started. A
+    // graph without its vectors scores every vector once the beam
+    // reaches the vector count, reading no entry points, and is
+    // seeded with every node once the count reaches it, where the
+    // seed no longer matters.
+    let entries = search.entry_points.map_or_else(String::new, |e| {
+        let graph_only = search.beam.is_some();
+        if graph_only && search.beam.is_some_and(|b| b >= vectors) {
+            ", every vector scored (the beam reaches the vector count), no entry points".to_owned()
+        } else if graph_only && e >= vectors {
+            ", every node as an entry point".to_owned()
+        } else {
+            let plural = if e == 1 { "" } else { "s" };
+            format!(
+                ", {e} random entry point{plural} per query (seed {})",
+                search.seed.unwrap_or(1)
+            )
+        }
+    });
+    match search.beam {
+        Some(beam) => format!(
+            "own search as k-NN runs it, beam {beam} (ef_search {ef_search}){entries}, {}, {} ms",
+            search.first_pass_k.map_or_else(
+                || "no rescoring".to_owned(),
+                |f| format!("first {f} rescored against the .vec")
+            ),
+            search.search_ms
+        ),
+        None if entries.is_empty() => format!(
+            "own HNSW search, efSearch {ef_search}, {} ms",
+            search.search_ms
+        ),
+        None => format!(
+            "own search of the CAGRA graph, efSearch {ef_search}{entries}, {} ms",
+            search.search_ms
+        ),
+    }
+}
+
 fn text(out: &Output<'_>) -> String {
     let r = out.recall;
     let mut s = String::new();
@@ -600,48 +815,15 @@ fn text(out: &Output<'_>) -> String {
                 |ids| format!("from {ids}")
             )
         ),
+        (None, Some(search)) if search.nprobes.is_some() => writeln!(
+            s,
+            "  results         own IVF search, nprobes {} (nlist {}), {} ms",
+            search.nprobes.unwrap_or(0),
+            search.nlist.unwrap_or(0),
+            search.search_ms
+        ),
         (None, Some(search)) => {
-            // For a CAGRA graph: where each query's search started. A
-            // graph without its vectors scores every vector once the beam
-            // reaches the vector count, reading no entry points, and is
-            // seeded with every node once the count reaches it, where the
-            // seed no longer matters.
-            let entries = search.entry_points.map_or_else(String::new, |e| {
-                let graph_only = search.beam.is_some();
-                if graph_only && search.beam.is_some_and(|b| b >= out.vectors) {
-                    ", every vector scored (the beam reaches the vector count), no entry points".to_owned()
-                } else if graph_only && e >= out.vectors {
-                    ", every node as an entry point".to_owned()
-                } else {
-                    let plural = if e == 1 { "" } else { "s" };
-                    format!(
-                        ", {e} random entry point{plural} per query (seed {})",
-                        search.seed.unwrap_or(1)
-                    )
-                }
-            });
-            match search.beam {
-                Some(beam) => writeln!(
-                    s,
-                    "  results         own search as k-NN runs it, beam {beam} (ef_search {}){entries}, {}, {} ms",
-                    search.ef_search,
-                    search.first_pass_k.map_or_else(
-                        || "no rescoring".to_owned(),
-                        |f| format!("first {f} rescored against the .vec")
-                    ),
-                    search.search_ms
-                ),
-                None if entries.is_empty() => writeln!(
-                    s,
-                    "  results         own HNSW search, efSearch {}, {} ms",
-                    search.ef_search, search.search_ms
-                ),
-                None => writeln!(
-                    s,
-                    "  results         own search of the CAGRA graph, efSearch {}{entries}, {} ms",
-                    search.ef_search, search.search_ms
-                ),
-            }
+            writeln!(s, "  results         {}", graph_search(search, out.vectors))
         }
         (None, None) => writeln!(s, "  results         {} lists", r.queries),
     }

@@ -51,11 +51,24 @@ const QUANTIZED_FORMATS: [&str; 2] = [
 const HALF_FLOAT_QUANTIZED_FORMAT: &str = "Faiss1040HalfFloatScalarQuantizedKnnVectorsFormat";
 
 /// k-NN's per-field formats that keep a field's vectors in its native
-/// file.
-const NATIVE_FORMATS: [&str; 2] = [
-    "NativeEngines990KnnVectorsFormat",
-    "NativeEngines990HalfFloatKnnVectorsFormat",
-];
+/// file, and in the `.vec` beside it: the second for a `half_float`
+/// field, whose `.vec` holds its vectors in fp16.
+const NATIVE_FORMATS: [&str; 2] = ["NativeEngines990KnnVectorsFormat", HALF_FLOAT_NATIVE_FORMAT];
+
+/// The native format of a `half_float` field.
+const HALF_FLOAT_NATIVE_FORMAT: &str = "NativeEngines990HalfFloatKnnVectorsFormat";
+
+/// Which per-field formats the `.fnm` may record the native file's field
+/// in, for what is looked for beside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Formats {
+    /// [`QUANTIZED_FORMATS`]: a graph without its vectors, beside the
+    /// field's quantized and raw ones.
+    Quantized,
+    /// [`NATIVE_FORMATS`]: a file of product-quantized codes, beside the
+    /// field's raw vectors.
+    Native,
+}
 
 /// The graph's quantized vectors compared with Lucene's files.
 #[derive(Serialize)]
@@ -205,7 +218,7 @@ struct Found {
 /// the graph's shape, and checks it against the graph, its records, and
 /// the `.vec` beside it.
 pub(super) fn lucene_quantized(path: &Path, graph: Graph, space: Option<Space>) -> LuceneQuantized {
-    match tie(path, space) {
+    match tie(path, space, Formats::Quantized) {
         Tie::Field(tied) => by_field(&tied, graph, space).named(&tied.info.name),
         Tie::Decided(outcome) => outcome,
         Tie::Shape(why) => {
@@ -225,9 +238,13 @@ pub(super) fn lucene_quantized(path: &Path, graph: Graph, space: Option<Space>) 
 /// vectors to: what `recall` searches. They are opened as they are
 /// needed: the `.vemf` and `.vec` by [`Self::raw`], held to what `scan`
 /// holds them to; the `.vemq` and `.veq` by [`Self::quantized`], once the
-/// field as a whole passes `scan`'s check.
+/// field as a whole passes `scan`'s check. For a file of
+/// product-quantized codes, the field's in a native format, of which
+/// only the `.vemf` and `.vec` exist ([`native_field_files`]).
 pub(crate) struct FieldFiles {
-    /// The `.vemq`; the `.veq`, `.vemf`, and `.vec` share its name.
+    /// The `.vemq`; the `.veq`, `.vemf`, and `.vec` share its name. A
+    /// native field has none, but its `.vemf` and `.vec` are named the
+    /// same way.
     pub(crate) vemq: PathBuf,
     /// The field's number, which its files record it under.
     pub(crate) number: u32,
@@ -346,7 +363,24 @@ impl FieldFiles {
 /// Returns why not, as text: the `.fnm` is missing, unread, not the
 /// segment's, or records the field otherwise than k-NN does.
 pub(crate) fn field_files(path: &Path) -> Result<FieldFiles, String> {
-    let t = match tie(path, None) {
+    field_files_in(path, Formats::Quantized)
+}
+
+/// Finds the files of the field a native file of product-quantized codes
+/// holds, through the segment's `.fnm`, as [`field_files`] does for a
+/// graph without its vectors: a field in one of k-NN's native formats,
+/// whose `.vemf` and `.vec` hold its vectors; [`FieldFiles::raw`] opens
+/// them.
+///
+/// # Errors
+///
+/// As for [`field_files`].
+pub(crate) fn native_field_files(path: &Path) -> Result<FieldFiles, String> {
+    field_files_in(path, Formats::Native)
+}
+
+fn field_files_in(path: &Path, formats: Formats) -> Result<FieldFiles, String> {
+    let t = match tie(path, None, formats) {
         Tie::Field(t) => t,
         Tie::Decided(outcome) => return Err(outcome.detail),
         Tie::Shape(why) => {
@@ -400,9 +434,10 @@ fn field_of<'a>(name: &'a str, segment: &str) -> Option<&'a str> {
 }
 
 /// Ties the native file to the field it is named for, through the
-/// segment's `.fnm`: a k-NN Faiss field of the `--space` given, in the
-/// quantized format, whose suffix names its `.vemq`.
-fn tie(path: &Path, space: Option<Space>) -> Tie {
+/// segment's `.fnm`: a k-NN Faiss field of the `--space` given, in one of
+/// `formats`, whose suffix names its `.vemq` (or, for a native field, its
+/// `.vemf` and `.vec`).
+fn tie(path: &Path, space: Option<Space>, formats: Formats) -> Tie {
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         return Tie::Shape("the native file's name is not UTF-8".to_owned());
     };
@@ -488,7 +523,7 @@ fn tie(path: &Path, space: Option<Space>) -> Tie {
         );
     }
     let segment_id = header.segment_id;
-    match quantized_field(&infos, field, space) {
+    match quantized_field(&infos, field, space, formats) {
         Ok((info, format, suffix)) => Tie::Field(Tied {
             info: info.clone(),
             vemq: dir.join(format!("{segment}_{format}_{suffix}.vemq")),
@@ -518,6 +553,7 @@ fn quantized_field<'a>(
     infos: &'a FieldInfos,
     field: &str,
     space: Option<Space>,
+    formats: Formats,
 ) -> Result<(&'a FieldInfo, &'a str, &'a str), (CrossCheck, String)> {
     let mismatch = |detail| Err((CrossCheck::Mismatch, detail));
     let Some(info) = infos.by_name(field) else {
@@ -555,12 +591,24 @@ fn quantized_field<'a>(
             "the .fnm records the per-field vectors format {format} for field {field:?}, but no suffix for its files"
         ));
     };
-    if NATIVE_FORMATS.contains(&format) {
-        return mismatch(format!(
-            "the .fnm records field {field:?} in {format}, which keeps the vectors in the native file, not beside a graph without them"
-        ));
+    match formats {
+        Formats::Quantized if NATIVE_FORMATS.contains(&format) => {
+            return mismatch(format!(
+                "the .fnm records field {field:?} in {format}, which keeps the vectors in the native file, not beside a graph without them"
+            ));
+        }
+        Formats::Native if QUANTIZED_FORMATS.contains(&format) => {
+            return mismatch(format!(
+                "the .fnm records field {field:?} in {format}, which keeps a graph without its vectors, not product-quantized codes"
+            ));
+        }
+        _ => {}
     }
-    if !QUANTIZED_FORMATS.contains(&format) {
+    let known = match formats {
+        Formats::Quantized => QUANTIZED_FORMATS,
+        Formats::Native => NATIVE_FORMATS,
+    };
+    if !known.contains(&format) {
         return Err((
             CrossCheck::Skipped,
             format!(
@@ -1343,14 +1391,22 @@ fn raw_codecs(
     Ok(())
 }
 
-/// The flat format the quantized format of the per-field suffix `suffix`,
+/// The flat format the per-field format of the suffix `suffix`,
 /// `<format>_<n>`, keeps its raw vectors in: k-NN's half-float one for its
-/// half-float format (`KNN1040HalfFloatScalarQuantizedVectorsFormat`),
-/// Lucene's for the others.
+/// half-float formats (`KNN1040HalfFloatScalarQuantizedVectorsFormat`, and
+/// the native one's flat vectors), Lucene's for the others.
 fn raw_format(suffix: &str) -> MetaFormat {
-    match suffix.strip_prefix(HALF_FLOAT_QUANTIZED_FORMAT) {
-        Some(rest) if rest.starts_with('_') => MetaFormat::Knn1040HalfFloat,
-        _ => MetaFormat::Lucene99,
+    let half_float = [HALF_FLOAT_QUANTIZED_FORMAT, HALF_FLOAT_NATIVE_FORMAT]
+        .into_iter()
+        .any(|f| {
+            suffix
+                .strip_prefix(f)
+                .is_some_and(|rest| rest.starts_with('_'))
+        });
+    if half_float {
+        MetaFormat::Knn1040HalfFloat
+    } else {
+        MetaFormat::Lucene99
     }
 }
 

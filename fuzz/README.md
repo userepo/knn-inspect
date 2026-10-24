@@ -3,12 +3,14 @@
 One libFuzzer target, `parse_and_verify`, feeds arbitrary bytes to
 `knn_format::parse`, `knn_check::verify`, `knn_check::graph_stats`, and
 an HNSW search (`knn_recall::Searcher`) over whatever graph parsed (one
-without its vectors must refuse the search, as must one over
-product-quantized codes; a CAGRA graph of its base
+without its vectors must refuse the search; one over product-quantized
+codes is searched through the query's table; a CAGRA graph of its base
 level is searched from seeded random entry points, with a fixed count
 and with the file's own), walks every inverted list and the first
-direct map entries of whatever IVF index parsed and takes its list statistics
-(`knn_check::ivf_stats`), and runs the search k-NN runs
+direct map entries of whatever IVF index parsed, takes its list statistics
+(`knn_check::ivf_stats`), searches it (`knn_recall::IvfSearcher`, with
+one, three, and every list probed) and decodes its lists by id
+(`knn_recall::IvfVectors`), and runs the search k-NN runs
 with Lucene's searcher (`knn_recall::lucene_search`), unseeded and
 seeded, to the segment
 info, field infos, flat-vectors metadata, and scalar-quantized vectors

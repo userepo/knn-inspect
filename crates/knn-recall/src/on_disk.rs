@@ -75,8 +75,8 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
 use knn_format::faiss::{
-    CodeFormat, FlatStorage, FourCc, HeaderKind, HnswIndex, IdMapIndex, IndexHeader, Metric,
-    QT_FP16, ScalarQuantizer, SqStorage, Storage, f16_to_f32,
+    CodeFormat, FlatStorage, FourCc, HeaderKind, HnswIndex, IdMapIndex, IndexHeader, Inner,
+    IvfEncoding, Metric, QT_FP16, ScalarQuantizer, SqStorage, Storage, f16_to_f32,
 };
 use knn_format::flat_vectors::{FlatField, VectorEncoding};
 use knn_format::quantized_vectors::{QuantizedField, QuantizedVectors, ScalarEncoding};
@@ -123,16 +123,37 @@ fn graph_without_vectors<'a>(index: &'a IdMapIndex<'a>) -> Result<&'a HnswIndex<
         .ok_or(Error::HasVectors)
 }
 
+/// The dimension and the vector count of a file whose exact vectors k-NN
+/// keeps in Lucene's files only: a graph without its vectors, or a graph
+/// (`IHNp`) or IVF index (`IwPQ`) over product-quantized codes, which
+/// hold none. A node, or an IVF id, is the field's vector in the order
+/// k-NN added them.
+fn field_shape(index: &IdMapIndex<'_>) -> Result<(i32, usize)> {
+    match &index.index {
+        Inner::Hnsw(hnsw) if matches!(hnsw.storage, None | Some(Storage::Pq(_))) => {
+            Ok((hnsw.header.d, hnsw.graph.node_count()))
+        }
+        Inner::Ivf(ivf) if matches!(ivf.encoding, IvfEncoding::Pq { .. }) => Ok((
+            ivf.header.d,
+            usize::try_from(ivf.lists.total).unwrap_or(usize::MAX),
+        )),
+        Inner::Hnsw(_) | Inner::Ivf(_) => Err(Error::HasVectors),
+    }
+}
+
 /// The vectors of the field of a graph without its vectors, `index`, as
 /// storage of the graph's metric, row `i` node `i`'s: `flat` is the field's
 /// record in the `.vemf`, which places them in `vec`, the `.vec`, as
 /// float32 components, or as fp16 ones in k-NN's half-float format, which
 /// are fp16 storage here. They serve as the file's own vectors for ground
-/// truth and sampling, and are what k-NN rescores against.
+/// truth and sampling, and are what k-NN rescores against. A file of
+/// product-quantized codes, a graph's or an IVF index's, holds no exact
+/// vectors either, and its field's stand in for them the same way, row
+/// `i` node `i`'s or the IVF id `i`'s.
 ///
 /// # Errors
 ///
-/// Returns an error when the file holds its own vectors, its metric is
+/// Returns an error when the file holds its own exact vectors, its metric is
 /// neither L2 nor inner product, its ID map holds another number of
 /// labels than the graph has nodes or a label that is not a doc id, the
 /// `.vemf` records no float32 or fp16 vectors, they disagree with the
@@ -148,7 +169,7 @@ pub fn field_vectors<'a>(
     flat: &FlatField,
     vec: &'a [u8],
 ) -> Result<Storage<'a>> {
-    let hnsw = graph_without_vectors(index)?;
+    let (d, nodes) = field_shape(index)?;
     let fourcc = match index.metric() {
         Metric::L2 => FourCc::FLAT_L2,
         Metric::InnerProduct => FourCc::FLAT_IP,
@@ -158,9 +179,7 @@ pub fn field_vectors<'a>(
             });
         }
     };
-    let d = hnsw.header.d;
     let dimension = usize::try_from(d).map_err(|_| Error::Dimension { d })?;
-    let nodes = hnsw.graph.node_count();
     if index.id_map.len() != nodes {
         return Err(Error::LabelCount {
             nodes,

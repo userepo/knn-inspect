@@ -192,6 +192,43 @@ fuzz_target!(|data: &[u8]| {
                 let _ = pq.centroid(0, 0);
                 let _ = pq.expected_centroid_floats();
             }
+            // The IVF search, with the first centroid as the query, so its
+            // size is bounded by the file. The searcher refuses what Faiss
+            // could not search; one that builds searches whatever the
+            // lists hold, with any nprobes.
+            if let Ok(searcher) = knn_recall::IvfSearcher::new(ivf) {
+                let _ = searcher.nprobes(None);
+                let floats: Vec<f32> = match &ivf.quantizer {
+                    knn_format::faiss::CoarseQuantizer::Flat(q) => q
+                        .vector(0)
+                        .map(|v| v.iter().map(|x| x.get()).collect())
+                        .unwrap_or_default(),
+                    knn_format::faiss::CoarseQuantizer::Binary(_) => Vec::new(),
+                };
+                let query = match &ivf.quantizer {
+                    knn_format::faiss::CoarseQuantizer::Binary(q) => {
+                        q.row(0).map(knn_recall::Query::Bits)
+                    }
+                    knn_format::faiss::CoarseQuantizer::Flat(_) => {
+                        (!floats.is_empty()).then_some(knn_recall::Query::Floats(&floats))
+                    }
+                };
+                if let Some(query) = query {
+                    for nprobes in [1, 3, usize::MAX] {
+                        if let Ok(hits) = searcher.search(query, 3, nprobes) {
+                            assert!(hits.len() <= 3);
+                            let labels = knn_recall::result_labels(&parsed.index, &hits, 3);
+                            assert!(labels.len() <= 3);
+                        }
+                    }
+                }
+            }
+            // The vectors the lists hold, by id, as ground truth takes
+            // them: one code per id, or an error.
+            if let Ok(vectors) = knn_recall::IvfVectors::of(ivf) {
+                let total = usize::try_from(ivf.lists.total).unwrap_or(usize::MAX);
+                assert_eq!(vectors.storage().row_count(), total);
+            }
         }
         if let Some(footer) = parsed.envelope.footer {
             let _ = footer.verify(data);
@@ -251,17 +288,19 @@ fuzz_target!(|data: &[u8]| {
                 break 'storage;
             };
             if let knn_format::faiss::Storage::Pq(s) = storage {
-                // Product-quantized codes hold no vectors to search over:
-                // refused, whatever the query, once the dimension is one.
+                // Product-quantized codes are scored through the query's
+                // table: a query of the quantizer's dimension, capped so a
+                // huge stored one costs nothing, searches a whole
+                // quantizer, and any other is refused.
                 let _ = s.row(0);
                 let _ = s.pq.centroid(0, 0);
+                let d = usize::try_from(s.pq.d).unwrap_or(0).min(4096);
+                let query = vec![0.5_f32; d];
                 let mut searcher = knn_recall::Searcher::new(graph.node_count());
-                let searched =
-                    searcher.search(hnsw, &[0.0_f32; 4][..], 3, 5, knn_recall::Draw::default());
-                assert!(matches!(
-                    searched,
-                    Err(knn_recall::Error::ProductQuantized | knn_recall::Error::Dimension { .. })
-                ));
+                let searched = searcher.search(hnsw, &query[..], 3, 5, knn_recall::Draw::default());
+                if let Ok(hits) = searched {
+                    assert!(hits.len() <= 3);
+                }
             }
             // The HNSW search over an arbitrary graph and any storage,
             // with the first stored vector, decoded, or for binary storage

@@ -3743,9 +3743,9 @@ fn every_ivf_encoding_is_read_by_info() {
 #[test]
 fn trained_ivf_indexes_are_checked_counted_and_scanned() {
     // verify runs every check but the graph's on an IVF index; stats
-    // reports its lists; recall, which needs the IVF search, refuses it
-    // with a reason; scan counts every trained fixture clean and names its
-    // method and encoding.
+    // reports its lists; recall searches it by its stored nprobe; scan
+    // counts every trained fixture clean and names its method and
+    // encoding.
     let dir = fixtures().join("synthetic-ivf");
     let file = dir.join("ivf-l2-1000x32-sqfp16.faiss");
     let path = file.to_str().unwrap();
@@ -3793,9 +3793,12 @@ fn trained_ivf_indexes_are_checked_counted_and_scanned() {
     assert_eq!(v["method"], "hnsw", "{v}");
 
     let o = run(&["recall", path, "--sample", "3"]);
-    assert_eq!(o.status.code(), Some(1));
-    let err = String::from_utf8_lossy(&o.stderr).into_owned();
-    assert!(err.contains("an IVF index, whose search recall"), "{err}");
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+    assert!(
+        stdout(&o).contains("  results         own IVF search, nprobes 1 (nlist 4), "),
+        "{}",
+        stdout(&o)
+    );
 
     let o = run(&["scan", "--json", dir.to_str().unwrap()]);
     assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
@@ -3826,6 +3829,166 @@ fn trained_ivf_indexes_are_checked_counted_and_scanned() {
             "14 file(s): 14 clean, 0 with warnings, 0 unsupported, 0 failed; exit code 0"
         ),
         "{text}"
+    );
+}
+
+#[test]
+fn recall_searches_ivf_indexes_by_nprobes() {
+    // The own search of an IVF index scans the stored nprobe's lists, or
+    // --nprobes's; every list gives the exact neighbors of the vectors
+    // the lists hold. The JSON names nprobes and nlist, and no efSearch.
+    let file = fixtures().join("synthetic-ivf/ivf-l2-1000x32-flat.faiss");
+    let path = file.to_str().unwrap();
+    let json = |extra: &[&str]| {
+        let mut args = vec!["recall", path, "--sample", "40", "--json"];
+        args.extend_from_slice(extra);
+        let o = run(&args);
+        assert_eq!(
+            o.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        serde_json::from_str::<serde_json::Value>(&stdout(&o)).unwrap()
+    };
+    let v = json(&[]);
+    assert_eq!(v["search"]["nprobes"], 1, "{v}");
+    assert_eq!(v["search"]["nlist"], 4, "{v}");
+    assert!(v["search"].get("ef_search").is_none(), "{v}");
+    assert!(v["recall"].as_f64().unwrap() < 1.0, "{v}");
+    let v = json(&["--nprobes", "4"]);
+    assert_eq!(v["search"]["nprobes"], 4, "{v}");
+    assert_eq!(v["recall"], 1.0, "{v}");
+    // More than nlist scans them all.
+    assert_eq!(json(&["--nprobes", "2147483647"])["recall"], 1.0);
+
+    // The graph searches' arguments do not apply, nor --nprobes to a
+    // graph.
+    for (extra, why) in [
+        (
+            &["--sample", "3", "--ef-search", "8"][..],
+            "--ef-search applies to a graph's own search",
+        ),
+        (
+            &["--sample", "3", "--entry-points", "8"][..],
+            "--entry-points applies to a graph's own search",
+        ),
+        (
+            &["--queries", path, "--seed", "4"][..],
+            "--seed without --sample applies to a CAGRA graph's own search",
+        ),
+        (
+            &["--sample", "3", "--no-rescore"][..],
+            "apply to a graph without its vectors",
+        ),
+    ] {
+        let mut args = vec!["recall", path];
+        args.extend_from_slice(extra);
+        let o = run(&args);
+        assert_eq!(o.status.code(), Some(1));
+        let err = String::from_utf8_lossy(&o.stderr).into_owned();
+        assert!(err.contains(why), "{err}");
+    }
+    let graph = fixtures().join("synthetic/l2-100x4.faiss");
+    let o = run(&[
+        "recall",
+        graph.to_str().unwrap(),
+        "--sample",
+        "3",
+        "--nprobes",
+        "2",
+    ]);
+    assert_eq!(o.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&o.stderr).into_owned();
+    assert!(
+        err.contains("--nprobes applies to an IVF index's own search"),
+        "{err}"
+    );
+    // Clap holds nprobes to k-NN's: from 1 to the largest int.
+    for bad in ["0", "2147483648"] {
+        let o = run(&["recall", path, "--sample", "3", "--nprobes", bad]);
+        assert_eq!(o.status.code(), Some(2), "{bad}");
+    }
+}
+
+#[test]
+fn recall_takes_product_quantized_ground_truth_from_the_vec() {
+    // Product-quantized codes hold no exact vectors: the field's in the
+    // segment's .vec, found through the .fnm, are the ground truth, for
+    // the own search and for --results alike. Every list of an IVF-PQ
+    // index scanned still misses some exact neighbors; the codes are
+    // lossy.
+    let root = fixtures().join("opensearch-3.9.0-trained");
+    for (set, search) in [
+        ("ivf-pq/l2", "own IVF search, nprobes 1 (nlist 4)"),
+        ("hnsw-pq/l2", "own HNSW search, efSearch"),
+        ("hnsw-pq/innerproduct", "own HNSW search, efSearch"),
+    ] {
+        let file = root.join(set).join("_2_165_vec.faiss");
+        let path = file.to_str().unwrap();
+        let o = run(&["recall", path, "--sample", "30"]);
+        assert_eq!(
+            o.status.code(),
+            Some(0),
+            "{set}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        let text = stdout(&o);
+        assert!(
+            text.contains("  vectors         500 x 16, "),
+            "{set}: {text}"
+        );
+        assert!(text.contains(search), "{set}: {text}");
+        // Lossy codes, but no worse than half the exact neighbors.
+        let o = run(&["recall", path, "--sample", "30", "--json"]);
+        let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+        assert!(v["recall"].as_f64().unwrap() > 0.5, "{set}: {v}");
+    }
+    let file = root.join("ivf-pq/l2/_2_165_vec.faiss");
+    let path = file.to_str().unwrap();
+    let o = run(&["recall", path, "--sample", "50", "--nprobes", "4", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    let recall = v["recall"].as_f64().unwrap();
+    assert!(recall > 0.5 && recall < 1.0, "{v}");
+
+    // Lists from elsewhere: the first five vectors of the .vec, each its
+    // own nearest neighbor, score 1.0 at k 1.
+    let scratch = std::env::temp_dir().join(format!("knn-inspect-cli-{}-pq", std::process::id()));
+    std::fs::create_dir_all(&scratch).unwrap();
+    let vectors = std::fs::read(root.join("ivf-pq/l2/vectors.f32")).unwrap();
+    let queries = scratch.join("queries.f32");
+    std::fs::write(&queries, &vectors[..5 * 16 * 4]).unwrap();
+    let results = scratch.join("results.jsonl");
+    std::fs::write(&results, "[0]\n[1]\n[2]\n[3]\n[4]\n").unwrap();
+    let o = run(&[
+        "recall",
+        path,
+        "--queries",
+        queries.to_str().unwrap(),
+        "--results",
+        results.to_str().unwrap(),
+        "--k",
+        "1",
+        "--json",
+    ]);
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["recall"], 1.0, "{v}");
+    std::fs::remove_dir_all(&scratch).unwrap();
+
+    // Without a segment beside it, a file of codes has no exact vectors.
+    let file = fixtures().join("synthetic-ivf/ivf-l2-1000x32-pq4x8.faiss");
+    let o = run(&["recall", file.to_str().unwrap(), "--sample", "3"]);
+    assert_eq!(o.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&o.stderr).into_owned();
+    assert!(
+        err.contains("product-quantized codes hold no exact vectors, and its field's vectors could not be found"),
+        "{err}"
     );
 }
 

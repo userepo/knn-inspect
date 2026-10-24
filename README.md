@@ -11,11 +11,8 @@ Rust, read-only, and does not link Faiss or talk to a cluster.
 
 Every command reads every layout listed under [Supported
 files](#supported-files), except that `recall` on a graph without its
-vectors needs its segment's files loose, not in a compound file, and
-that `recall` does not yet search the trained indexes k-NN writes
-through a model (its `ivf` method and `pq` encoders): it refuses an IVF
-(inverted file) index, and a graph over product-quantized codes, with a
-reason. Each is
+vectors, or on product-quantized codes, which hold no exact vectors,
+needs its segment's files loose, not in a compound file. Each is
 checked against Faiss Python and Lucene's own files on the
 fixtures, real OpenSearch 3.9.0 segments included. The JSON output of each command
 is documented in [docs/json.md](docs/json.md) with a stability rule:
@@ -41,7 +38,7 @@ cargo install --git https://github.com/userepo/knn-inspect --tag v0.14.0 knn-ins
 knn-inspect info <file.faiss> [--json]
 knn-inspect verify <file.faiss> [--space l2|innerproduct|cosine|hamming] [--max-findings N] [--json]
 knn-inspect stats <file.faiss> [--json]
-knn-inspect recall <file.faiss> (--queries <q.f32|q.u8> | --sample N) [--seed S] [--entry-points N] [--k N] [--ef-search N] [--oversample F | --no-rescore] [--json]
+knn-inspect recall <file.faiss> (--queries <q.f32|q.u8> | --sample N) [--seed S] [--entry-points N] [--k N] [--ef-search N | --nprobes N] [--oversample F | --no-rescore] [--json]
 knn-inspect recall <file.faiss> --queries <q.f32|q.u8> --results <r.jsonl> [--k N] [--ids <ids.json>] [--json]
 knn-inspect scan <dir> [--space l2|innerproduct|cosine|hamming] [--max-findings N] [--json]
 ```
@@ -158,9 +155,7 @@ of one size), which matches Faiss Python's to the bit.
 Exit code 0 when the file parsed, 1 otherwise.
 
 `recall` measures recall@k against exact brute force over the file's own
-vectors. It refuses an IVF index, and a graph over product-quantized
-codes, which hold no exact vectors, each with a reason, until their
-search is written. By default it searches the file's HNSW graph itself, following
+vectors. By default it searches the file's HNSW graph itself, following
 Faiss's search step for step (greedy descent through the upper levels,
 then a best-first search on level 0 with a candidate queue of
 `max(efSearch, k)`) at the Faiss commit k-NN 3.9.0 builds. On the
@@ -202,6 +197,43 @@ are broken as that Faiss breaks them, toward the lower node. Faiss
 1.15.1 breaks them toward the higher node in an inner-product index,
 which can change which results it returns, not only their order; it
 breaks L2 and Hamming ties alike.
+
+An IVF (inverted file) index is searched as k-NN 3.9 searches it, since
+0.15.0: the `min(nlist, nprobes)` centroids of its coarse quantizer
+nearest the query, chosen as Faiss's flat search chooses them, and their
+inverted lists scanned nearest first, each code's distance offered to a
+result heap of k; `nprobes` is `--nprobes`, as a query's
+`method_parameters.nprobes`, or else the file's `nprobe`, cast to an
+int as k-NN casts it, which fails the search when that comes to 0 or
+less. Float32 codes are compared as they are, fp16, bf16, and byte codes
+decoded and, by residual, against the query less the list's centroid
+(for inner product, its product with the centroid added), and binary
+codes by Hamming distance after a Hamming coarse search. Results tied
+at the k-th place are settled as Faiss's result heaps settle them: the
+first scanned is kept. Tied results are listed by id, the lower first
+for L2 and Hamming and the higher first for inner product, unlike an
+HNSW search's. The brute force runs over the vectors the lists encode,
+by id, decoded the same way with the centroid added back, as for scalar
+quantizer storage under a graph: recall measures the search over the
+codes, not the codes' loss against the field's vectors. Byte codes
+whose residual left the byte range encode something else entirely (see
+the format notes), and so do the vectors here.
+
+Product-quantized codes, an IVF index's or a graph's (since 0.15.0),
+hold no exact vectors: the brute force and `--sample` take the field's
+vectors in the segment's `.vec` instead, which the `.fnm` names, so the
+segment's files must be loose. The own search scores the codes through
+tables of the query's distances to the sub-quantizer centroids, as
+Faiss's does: for an L2 IVF index by residual, through the precomputed
+table k-NN installs on every such index. The sums of the IVF and PQ
+searches follow k-NN's Faiss library for AVX2, which it loads on an
+x86-64 CPU with AVX2 and without AVX-512: its kernels and, where its
+compiler chose the order, the library's disassembly. On the fixtures
+their result lists are faiss-cpu 1.15.1's, labels in order; that build
+adds in plain order, so it confirms the lists, not the last bits of the
+sums, which have not been compared with a live cluster's results, and on
+another host they can differ in a last bit (see
+[docs/format-notes.md](docs/format-notes.md)).
 
 With `--results`, the tool scores lists produced elsewhere (Faiss, or a
 live OpenSearch query): one line per query, in the same order, holding
@@ -451,12 +483,12 @@ wrapping an IVF index over float32 codes (the `ivf` method with the
 holding its coarse quantizer, direct map, and inverted lists; an ID map
 wrapping HNSW over product-quantized storage (the `hnsw` method with the
 `pq` encoder); and a binary ID map wrapping a binary IVF index (a
-`binary` field's `ivf` method). Every command but `recall` reads these;
-see [Status](#status). Fixtures and format notes target OpenSearch
-3.9.0.
+`binary` field's `ivf` method). Every command reads these, except that
+`recall` on product-quantized codes needs the segment's `.fnm` and the
+field's `.vemf` and `.vec` loose, not in a compound file. Fixtures and
+format notes target OpenSearch 3.9.0.
 
-Not yet: other scalar-quantized storage, and `recall`'s search of the
-trained indexes. Files in
+Not yet: other scalar-quantized storage. Files in
 another layout or scalar quantizer type are refused rather than misread:
 `verify` fails them, and `scan` reports those whose footer verifies as
 `unsupported`. NMSLIB and Lucene-engine fields write no `.faiss` file,

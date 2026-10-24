@@ -1172,8 +1172,115 @@ its sign, which both `scan` and the values check accept. The field is
 read only where the `.vemf` puts it; with no `.vemf` this tool reads,
 the comparison is skipped. Product-quantized codes hold no exact
 vectors, so only the labels are compared, against the `.si`.
-`recall` refuses an IVF index and product-quantized storage; their
-search follows in a later release.
+
+`recall` searches an IVF index as k-NN 3.9 does (since 0.15.0): its JNI
+search (`QueryIndex`) passes `SearchParametersIVF` with the query's
+`nprobes`, or else the stored `nprobe` cast to an `int`, and Faiss's
+`IndexIVF::search` (`IndexBinaryIVF::search` under k-NN's patch 0004)
+scans `min(nlist, nprobes)` lists. The coarse quantizer is searched for
+that many centroids as `IndexFlat::search` selects them: one at a time
+for 1 (`Top1BlockResultHandler`), in a heap below 100
+(`distance_compute_min_k_reservoir`), and above that in a reservoir
+shrunk by `partition_fuzzy_median3`, ported operation for operation; a
+binary quantizer always uses a heap (`hammings_knn_hc`). The lists are
+scanned in that order, nearest first, and the codes of a list in order,
+each distance offered to a heap of k (`CMax` for L2 and Hamming, `CMin`
+on the inner product itself, not its negation as under HNSW): a result
+enters only when strictly better than the worst held, so of results
+tied at the k-th place the first scanned stays, and ties inside are
+ordered by id, the lower first from a max-heap and the higher first
+from a min-heap. Float32 codes are compared with `fvec_L2sqr` or
+`fvec_inner_product`; scalar-quantized ones with the distance computer
+of `IVFSQScannerL2` against the query less the list's centroid
+(`compute_residual`), or of `IVFSQScannerIP` against the query with the
+coarse inner product added, both over the decoded components in Faiss's
+8-lane order where the dimension is a multiple of 8, as under the
+on-disk rescoring. Product-quantized codes are scored through tables:
+for L2 by residual, the precomputed table k-NN installs on every L2
+IVF-PQ index (`InitSharedIndexState` then `SetSharedIndexState`, so
+`use_precomputed_table` 1, whatever the index says), which holds per
+list `||r||^2 + 2 (c|r)` for every sub-quantizer centroid `r` and the
+list's centroid `c` (`initialize_IVFPQ_precomputed_table`), added to the
+query's `-2 (q|r)` (`fvec_madd`, whose doubling is exact, so fused or
+not it rounds once) and to the coarse distance (the table is built up
+front only while it stays within 64 times the bytes of the centroids it
+comes from or 64 MiB, whichever is larger; past that, each scanned list's part is computed
+when the list is scanned, by the same arithmetic, so a small file
+cannot ask for gigabytes); for inner product, the
+query's own table and its product with the centroid
+(`precompute_list_tables_IP`); without residuals, the query's own table
+alone. `IHNp` is searched as any HNSW graph, its distance computer
+(`PQDistanceComputer`) scoring each code through the query's table,
+negated for inner product. Hits are the ids the lists store, which the
+ID map turns into labels; the ground truth runs over the vectors the
+lists encode, by id, decoded as `reconstruct_from_offset` decodes them
+(the centroid added back by residual), the lists required to hold one
+code for each id: recall over the codes, as for `IxSQ` storage under a
+graph, not their loss against the field's vectors, from which a byte
+code whose residual left the byte range differs wholly (the scan
+section above). Product-quantized codes hold none: their ground truth
+is the field's vectors in the segment's `.vec`, the field found through
+the `.fnm` (in `NativeEngines990KnnVectorsFormat`, or its half-float
+variant, whose `.vec` holds fp16), row `i` id or node `i`'s. The tie is
+by the native file's name alone: a field built through a model records
+no space type, and Lucene's default similarity, Euclidean, whatever the
+model's metric, so the `.fnm` cannot confirm the file's metric, and a
+native file copied in from another segment of the same shape would be
+measured against this one's vectors.
+
+The sums are those of k-NN 3.9.0's `libopensearchknn_faiss_avx2.so`,
+built by GCC 13.3.1, the library k-NN loads on an x86-64 CPU with AVX2
+and without AVX-512. Faiss's float32 loops (`fvec_L2sqr`,
+`fvec_inner_product`, `fvec_norm_L2sqr`) are marked imprecise, and the
+compiler's order is read from their disassembly: whole groups of 8 into
+one 8-lane accumulator, each product rounded before it is added (no
+fused multiply-add there); the halves added lane by lane, and those four
+as `(s1 + s3) + (s0 + s2)`; 4 or more components left are fused into the
+four, one multiply-add each, and the four added the same way; the last
+1 to 3 fused into the sum in order; under 8 components, the four start
+from zero. The PQ tables (`fvec_L2sqr_ny`, `fvec_inner_products_ny`) run
+SIMD kernels for sub-vectors of 1, 2, 4, 8, and 12 components and the
+float32 loop for any other: for 2, 4, and 8, eight centroids at a time,
+the first product rounded and the rest fused onto it in order; a table
+of fewer than 8 centroids (1 or 2 bits) takes the kernels' tails, the
+products of 4 or 8 added as the halves above, those of 2 fused the
+other way (the first onto the second, the compiler's choice); for 12,
+lane `j` fuses component `j` onto component `4 + j`'s product and then
+`8 + j` onto that. A code of 8-bit sub-codes sums its table entries
+with `distance_single_code_avx2`: 4 as `(t0 + t2) + (t1 + t3)`, 8 as
+the 8-lane halves above, any other count 16 at a time into 8 lanes (the
+first 8 entries of each 16, then the next 8) and then the rest in order;
+16-bit and other codes in order (`PQDecoder16`, `PQDecoderGeneric`).
+`distance_four_codes`, which the IVF-PQ scan uses four codes at a time,
+sums each code the same way.
+
+Two comparisons were made for 0.15.0 with scripts outside the
+repository (their inputs are not fixtures). Over the synthetic and live
+trained fixtures, 200 random queries each, `nprobes` from 1 to 1,000
+(`efSearch` 16 to 256 for `IHNp`), every one of the tool's result lists
+equalled faiss-cpu 1.15.1's for the same file, labels in order; that
+wheel's portable code adds in order, so the distances agreed to float32
+rounding only, and the order of the sums above rests on the disassembly
+alone: it has not been compared with a live cluster's results. Over IVF
+indexes built with integer vectors and integer queries on lattice
+points (up to 1,257 lists), where every distance is exact and ties are
+everywhere, coarse and in the lists, the lists equalled faiss-cpu's too,
+with `nprobes` from 1 to `nlist`, through the reservoir past 100, so the
+tie rules are Faiss's. A heap in place of the reservoir gave the same
+lists there. Where a malformed index
+would make Faiss fail or read out of bounds (a coarse quantizer of
+more centroids than `nlist`, codes of another size than the encoding's,
+a scalar quantizer of another dimension than the index, by which Faiss
+decodes, a product quantizer whose centroid table is incomplete, or a table past
+Faiss's 2 GiB `precomputed_table_max_bytes`, past which k-NN would
+search an empty one), `recall` refuses it, and also what no k-NN file
+holds and Faiss would search oddly: a coarse quantizer of fewer
+centroids than `nlist`, or of another dimension or metric than the
+index, and a binary index whose metric type is not L2 (under inner
+product, 0, Faiss's binary search heapifies a min-heap and scans with a
+max-heap's test); a list
+id below -1, which Faiss would return as a label, names no node and is
+left out.
 
 ### Synthetic IVF and PQ fixtures
 
