@@ -4,13 +4,14 @@ members = [
     "crates/knn-format",
     "crates/knn-check",
     "crates/knn-recall",
+    "crates/knn-report",
     "crates/knn-inspect",
 ]
 # The fuzz crate is its own root: nightly-only, built by cargo-fuzz.
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.15.0"
+version = "0.16.0"
 edition = "2024"
 rust-version = "1.99"
 authors = ["Ivan Petrouchtchak"]
@@ -22,6 +23,7 @@ publish = false
 knn-format = { path = "crates/knn-format" }
 knn-check = { path = "crates/knn-check" }
 knn-recall = { path = "crates/knn-recall" }
+knn-report = { path = "crates/knn-report" }
 
 # knn-format: the mapping, unaligned little-endian views, the footer CRC.
 memmap2 = "0.9.12"
@@ -32,15 +34,17 @@ thiserror = "2.0.21"
 # knn-recall: brute force in parallel over queries.
 rayon = "1.12.0"
 
-# knn-inspect: the CLI and its output.
-clap = { version = "4.6.7", features = ["derive"] }
+# knn-report: the commands' reports and their JSON.
 serde = { version = "1.0.229", features = ["derive"] }
 # float_roundtrip: the tests compare parsed floats with values Faiss
 # Python printed; the default fast parser can be a ULP off.
 serde_json = { version = "1.0.154", features = ["float_roundtrip"] }
-anyhow = "1.0.104"
-# knn-inspect scan: linear-time search for the native vectors in a .vec.
+# knn-report scan: linear-time search for the native vectors in a .vec.
 memchr = "2.8.3"
+
+# knn-inspect: the CLI that prints the reports.
+clap = { version = "4.6.7", features = ["derive"] }
+anyhow = "1.0.104"
 
 [workspace.lints.rust]
 ambiguous_negative_literals = "warn"

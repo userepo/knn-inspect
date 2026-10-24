@@ -71,31 +71,31 @@ enum Formats {
 }
 
 /// The graph's quantized vectors compared with Lucene's files.
-#[derive(Serialize)]
-pub(super) struct LuceneQuantized {
-    pub(super) status: CrossCheck,
+#[derive(Debug, Clone, Serialize)]
+pub struct LuceneQuantized {
+    pub status: CrossCheck,
     /// The field the segment's `.fnm` ties the native file to.
     #[serde(skip_serializing_if = "Option::is_none")]
-    field: Option<String>,
+    pub field: Option<String>,
     /// The `.vemq` read.
     #[serde(skip_serializing_if = "Option::is_none")]
-    file: Option<String>,
+    pub file: Option<String>,
     /// The `.veq` its records are in.
     #[serde(skip_serializing_if = "Option::is_none")]
-    data_file: Option<String>,
+    pub data_file: Option<String>,
     /// Where in the `.veq` the field's records begin.
     #[serde(skip_serializing_if = "Option::is_none")]
-    offset: Option<usize>,
+    pub offset: Option<usize>,
     /// Lucene's name for the scalar encoding.
     #[serde(skip_serializing_if = "Option::is_none")]
-    encoding: Option<&'static str>,
+    pub encoding: Option<&'static str>,
     /// Bits a stored component is quantized to.
     #[serde(skip_serializing_if = "Option::is_none")]
-    bits: Option<u32>,
+    pub bits: Option<u32>,
     /// The similarity function the `.vemq` records.
     #[serde(skip_serializing_if = "Option::is_none")]
-    similarity: Option<&'static str>,
-    pub(super) detail: String,
+    pub similarity: Option<&'static str>,
+    pub detail: String,
 }
 
 impl LuceneQuantized {

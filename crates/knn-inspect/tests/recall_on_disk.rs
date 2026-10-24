@@ -633,13 +633,7 @@ fn what_scan_only_warns_of_is_searched_and_said() {
     // back, which scan warns of. The field is searched, and the warning
     // shown.
     let s = Scratch::of("spoiled-correction", "on-disk/l2");
-    s.edit(&format!("{STEM}.veq"), true, |b| {
-        // Records of 18 bytes from 112: the packed bits (2 bytes), then
-        // the lower and upper ends, then the additional correction.
-        let at = 112 + 7 * 18 + 2 + 8;
-        let x = f32::from_le_bytes(b[at..at + 4].try_into().unwrap());
-        b[at..at + 4].copy_from_slice(&(2.0 * x).to_le_bytes());
-    });
+    spoil_correction(&s);
     let o = run(&["recall", &s.native(), "--sample", "5", "--json"]);
     let err = String::from_utf8_lossy(&o.stderr);
     assert_eq!(o.status.code(), Some(0), "{err}");
@@ -650,6 +644,43 @@ fn what_scan_only_warns_of_is_searched_and_said() {
     );
     let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
     assert_eq!(v["queries"], 5, "{v}");
+}
+
+/// Doubles record 7's additional correction: the .vec does not give it
+/// back, which scan warns of.
+fn spoil_correction(s: &Scratch) {
+    s.edit(&format!("{STEM}.veq"), true, |b| {
+        // Records of 18 bytes from 112: the packed bits (2 bytes), then
+        // the lower and upper ends, then the additional correction.
+        let at = 112 + 7 * 18 + 2 + 8;
+        let x = f32::from_le_bytes(b[at..at + 4].try_into().unwrap());
+        b[at..at + 4].copy_from_slice(&(2.0 * x).to_le_bytes());
+    });
+}
+
+#[test]
+fn what_scan_warns_of_is_said_before_a_later_failure() {
+    // The same warning, then queries of a length no row divides: the
+    // warning is said first, as it is before a search, then the error.
+    let s = Scratch::of("spoiled-then-refused", "on-disk/l2");
+    spoil_correction(&s);
+    let queries = s.0.join("short.f32");
+    std::fs::write(&queries, [0_u8; 3]).unwrap();
+    let (code, err) = refused(&[
+        "recall",
+        &s.native(),
+        "--queries",
+        queries.to_str().unwrap(),
+    ]);
+    assert_eq!(code, Some(1), "{err}");
+    let (warning, error) = err.split_once("\nerror: ").unwrap_or_default();
+    assert!(
+        warning.starts_with("warning: ")
+            && warning
+                .contains("1 of 500 records' additional corrections differ from their vectors'"),
+        "{err}"
+    );
+    assert!(error.contains("short.f32"), "{err}");
 }
 
 #[test]

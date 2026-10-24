@@ -1,15 +1,15 @@
-//! The `stats` command: per-level graph statistics, or for an IVF index
+//! The `stats` report: per-level graph statistics, or for an IVF index
 //! the sizes of its inverted lists.
 
 use std::fmt::Write as _;
 use std::path::Path;
-use std::process::ExitCode;
 
-use anyhow::Context;
 use knn_check::{GraphStats, IvfStats, LayerStats};
 use knn_format::NativeFile;
 use knn_format::faiss::Inner;
 use serde::Serialize;
+
+use crate::error::{Context as _, Result};
 
 /// Unreachable node ids listed per level in the text output; JSON lists
 /// them all.
@@ -18,68 +18,91 @@ const TEXT_UNREACHABLE_LIMIT: usize = 10;
 /// Histogram buckets per line in the text output.
 const TEXT_HISTOGRAM_PER_LINE: usize = 8;
 
-#[derive(Serialize)]
-struct Output<'a, S: Serialize> {
-    file: String,
+/// What `stats` reports of a native file. Its JSON gives the file, the
+/// method, then the statistics.
+#[derive(Debug, Clone)]
+pub struct Report {
+    pub file: String,
+    pub stats: Stats,
+}
+
+impl Report {
     /// k-NN's method: `hnsw` for a graph, `ivf` for an IVF index.
-    method: &'static str,
-    #[serde(flatten)]
-    stats: &'a S,
+    #[must_use]
+    pub fn method(&self) -> &'static str {
+        match self.stats {
+            Stats::Hnsw(_) => "hnsw",
+            Stats::Ivf(_) => "ivf",
+        }
+    }
+}
+
+impl Serialize for Report {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Fields<'a> {
+            file: &'a str,
+            method: &'static str,
+            #[serde(flatten)]
+            stats: &'a Stats,
+        }
+        Fields {
+            file: &self.file,
+            method: self.method(),
+            stats: &self.stats,
+        }
+        .serialize(serializer)
+    }
+}
+
+/// The statistics, by what the file is.
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum Stats {
+    /// A graph's, per level.
+    Hnsw(GraphStats),
+    /// An IVF index's, over its lists.
+    Ivf(IvfStats),
 }
 
 /// Sizes per line in the text output's list of list sizes.
 const TEXT_SIZES_PER_LINE: usize = 16;
 
-/// Runs `stats` on `path`; exit code 0 when the file parsed.
+/// The statistics of the native file at `path`.
 ///
 /// # Errors
 ///
 /// Returns the open or parse error, wrapped with the path.
-pub fn run(path: &Path, json: bool) -> anyhow::Result<ExitCode> {
+pub fn stats(path: &Path) -> Result<Report> {
     let file = NativeFile::open(path).with_context(|| format!("opening {}", path.display()))?;
     let parsed = file
         .parse()
         .with_context(|| format!("parsing {}", path.display()))?;
-    let file_name = path.display().to_string();
-    if let Some(ivf) = parsed.index.ivf() {
-        let stats = knn_check::ivf_stats(ivf);
-        if json {
-            let out = Output {
-                file: file_name,
-                method: "ivf",
-                stats: &stats,
-            };
-            println!("{}", serde_json::to_string_pretty(&out)?);
-        } else {
-            print!("{}", ivf_text(path, &stats));
-        }
-        return Ok(ExitCode::SUCCESS);
-    }
-    let Inner::Hnsw(hnsw) = &parsed.index.index else {
-        // An IVF index returned above; a graph is what remains.
-        return Ok(ExitCode::SUCCESS);
+    let stats = match &parsed.index.index {
+        Inner::Ivf(ivf) => Stats::Ivf(knn_check::ivf_stats(ivf)),
+        Inner::Hnsw(hnsw) => Stats::Hnsw(knn_check::index_stats(hnsw)),
     };
-    let stats = knn_check::index_stats(hnsw);
-
-    if json {
-        let out = Output {
-            file: file_name,
-            method: "hnsw",
-            stats: &stats,
-        };
-        println!("{}", serde_json::to_string_pretty(&out)?);
-    } else {
-        print!("{}", text(path, &stats));
-    }
-    Ok(ExitCode::SUCCESS)
+    Ok(Report {
+        file: path.display().to_string(),
+        stats,
+    })
 }
 
-fn ivf_text(path: &Path, stats: &IvfStats) -> String {
+/// The report as `stats` prints it.
+#[must_use]
+pub fn text(r: &Report) -> String {
+    match &r.stats {
+        Stats::Ivf(stats) => ivf_text(&r.file, stats),
+        Stats::Hnsw(stats) => graph_text(&r.file, stats),
+    }
+}
+
+fn ivf_text(file: &str, stats: &IvfStats) -> String {
     let mut s = String::new();
     let mut line = |text: String| {
-        writeln!(s, "{text}").expect("writing to a String cannot fail");
+        push_line!(s, "{text}");
     };
-    line(path.display().to_string());
+    line(file.to_owned());
     line(format!(
         "  method          ivf, nlist {}, nprobe {}",
         stats.nlist, stats.nprobe
@@ -121,15 +144,16 @@ fn ivf_text(path: &Path, stats: &IvfStats) -> String {
     s
 }
 
-fn text(path: &Path, stats: &GraphStats) -> String {
+fn graph_text(file: &str, stats: &GraphStats) -> String {
     let mut s = String::new();
-    writeln!(s, "{}", path.display()).expect("writing to a String cannot fail");
-    writeln!(
+    push_line!(s, "{file}");
+    push_line!(
         s,
         "  nodes           {}, entry point {}, max level {}",
-        stats.nodes, stats.entry_point, stats.max_level
-    )
-    .expect("writing to a String cannot fail");
+        stats.nodes,
+        stats.entry_point,
+        stats.max_level
+    );
     for layer in &stats.layers {
         layer_text(&mut s, layer);
     }
@@ -137,7 +161,7 @@ fn text(path: &Path, stats: &GraphStats) -> String {
 }
 
 fn layer_text(s: &mut String, layer: &LayerStats) {
-    writeln!(
+    push_line!(
         s,
         "  level {:<9} {} nodes, {} slots, {} edges, {}",
         layer.level,
@@ -145,15 +169,13 @@ fn layer_text(s: &mut String, layer: &LayerStats) {
         layer.slots,
         layer.edges,
         unreachable_text(layer)
-    )
-    .expect("writing to a String cannot fail");
+    );
     if let (Some(min), Some(max)) = (layer.degree_min, layer.degree_max) {
-        writeln!(
+        push_line!(
             s,
             "    degree        min {min}, mean {}, max {max}",
             mean(layer.edges, layer.nodes)
-        )
-        .expect("writing to a String cannot fail");
+        );
     }
     let buckets: Vec<String> = layer
         .degree_histogram
@@ -164,7 +186,7 @@ fn layer_text(s: &mut String, layer: &LayerStats) {
         .collect();
     for (i, line) in buckets.chunks(TEXT_HISTOGRAM_PER_LINE).enumerate() {
         let label = if i == 0 { "histogram" } else { "" };
-        writeln!(s, "    {label:<13} {}", line.join(" ")).expect("writing to a String cannot fail");
+        push_line!(s, "    {label:<13} {}", line.join(" "));
     }
 }
 

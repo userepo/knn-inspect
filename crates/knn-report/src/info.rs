@@ -1,9 +1,9 @@
-//! The `info` command: what a file is, in one screen or one JSON object.
+//! The `info` report: what a file is, as a value, one JSON object, or
+//! one screen.
 
+use std::fmt::Write as _;
 use std::path::Path;
-use std::process::ExitCode;
 
-use anyhow::Context;
 use knn_format::NativeFile;
 use knn_format::faiss::{
     GraphKind, HnswIndex, IdMapIndex, Inner, IvfEncoding, IvfIndex, ListSizes, ProductQuantizer,
@@ -11,65 +11,69 @@ use knn_format::faiss::{
 };
 use serde::Serialize;
 
+use crate::error::{Context as _, Result};
+
 /// What `info` says of a graph without its vectors in place of them.
 const NO_STORAGE: &str = "none: k-NN keeps the field's quantized vectors in Lucene's .veq file";
 
-#[derive(Serialize)]
-struct Report {
-    file: String,
-    size: usize,
-    envelope: EnvelopeReport,
-    payload: PayloadReport,
-    layout: Vec<String>,
+/// What `info` reports of a native file.
+#[derive(Debug, Clone, Serialize)]
+pub struct Report {
+    pub file: String,
+    pub size: usize,
+    pub envelope: EnvelopeReport,
+    pub payload: PayloadReport,
+    pub layout: Vec<String>,
     /// k-NN's method: `hnsw` or `ivf`.
-    method: &'static str,
+    pub method: &'static str,
     /// How the file stores a vector.
-    encoding: &'static str,
+    pub encoding: &'static str,
     /// `hnsw`, or `cagra` for the graph k-NN's remote index build writes;
     /// absent for an IVF index, which has no graph.
     #[serde(skip_serializing_if = "Option::is_none")]
-    graph: Option<&'static str>,
-    dimension: i32,
-    count: i64,
-    metric: String,
+    pub graph: Option<&'static str>,
+    pub dimension: i32,
+    pub count: i64,
+    pub metric: String,
     /// Bytes per vector, which only a binary index's headers record.
     #[serde(skip_serializing_if = "Option::is_none")]
-    code_size: Option<i32>,
+    pub code_size: Option<i32>,
     /// What the dimension counts and the storage holds, for text output.
     #[serde(skip)]
-    kind: Kind,
+    pub kind: Kind,
     /// The scalar quantizer of fp16, bf16, or byte codes.
     #[serde(skip_serializing_if = "Option::is_none")]
-    quantizer: Option<QuantizerReport>,
+    pub quantizer: Option<QuantizerReport>,
     /// The product quantizer of PQ codes.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pq: Option<PqReport>,
+    pub pq: Option<PqReport>,
     /// The fields a CAGRA graph stores after its header.
     #[serde(skip_serializing_if = "Option::is_none")]
-    cagra: Option<CagraReport>,
+    pub cagra: Option<CagraReport>,
     /// The graph; absent for an IVF index.
     #[serde(skip_serializing_if = "Option::is_none")]
-    hnsw: Option<HnswReport>,
+    pub hnsw: Option<HnswReport>,
     /// The IVF index; absent for a graph.
     #[serde(skip_serializing_if = "Option::is_none")]
-    ivf: Option<IvfReport>,
-    ids: IdsReport,
+    pub ivf: Option<IvfReport>,
+    pub ids: IdsReport,
 }
 
-#[derive(Serialize)]
-struct CagraReport {
-    keep_max_size_level0: bool,
-    base_level_only: bool,
-    search_entry_points: i32,
+/// The fields a CAGRA graph stores after its HNSW header.
+#[derive(Debug, Clone, Serialize)]
+pub struct CagraReport {
+    pub keep_max_size_level0: bool,
+    pub base_level_only: bool,
+    pub search_entry_points: i32,
     /// As stored under `IHc2`; absent under `IHNc` and `IBHc`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    numeric_type: Option<i32>,
+    pub numeric_type: Option<i32>,
 }
 
 /// The three kinds of storage a file can have, as text output tells them
 /// apart.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Kind {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
     /// Float32, scalar-quantized, or product-quantized components.
     Float,
     /// Packed bits, the dimension counting them.
@@ -78,140 +82,155 @@ enum Kind {
     GraphOnly,
 }
 
-#[derive(Serialize)]
-struct QuantizerReport {
-    qtype: i32,
-    name: String,
-    dimension: u64,
-    code_size: u64,
-    trained: usize,
+/// A scalar quantizer: its type, dimension, code size, and trained values.
+#[derive(Debug, Clone, Serialize)]
+pub struct QuantizerReport {
+    pub qtype: i32,
+    pub name: String,
+    pub dimension: u64,
+    pub code_size: u64,
+    pub trained: usize,
 }
 
-#[derive(Serialize)]
-struct PqReport {
-    dimension: u64,
-    m: u64,
-    nbits: u64,
-    sub_dimension: u64,
-    centroids_per_sub: u64,
+/// A product quantizer: its sub-quantizers, its codes, and its centroid
+/// table.
+#[derive(Debug, Clone, Serialize)]
+pub struct PqReport {
+    pub dimension: u64,
+    pub m: u64,
+    pub nbits: u64,
+    pub sub_dimension: u64,
+    pub centroids_per_sub: u64,
     /// Floats in the centroid table as stored; `dimension x
     /// centroids_per_sub` in a well-formed file.
-    centroid_floats: usize,
-    code_size: u64,
+    pub centroid_floats: usize,
+    pub code_size: u64,
     /// `IndexPQ`'s search parameters, under `IHNp` only.
     #[serde(skip_serializing_if = "Option::is_none")]
-    search_type: Option<i32>,
+    pub search_type: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    encode_signs: Option<bool>,
+    pub encode_signs: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    polysemous_ht: Option<i32>,
+    pub polysemous_ht: Option<i32>,
 }
 
-#[derive(Serialize)]
-struct IvfReport {
-    nlist: u64,
-    nprobe: u64,
+/// An IVF index: its list count and nprobe, its coarse quantizer, its
+/// direct map, and its inverted lists.
+#[derive(Debug, Clone, Serialize)]
+pub struct IvfReport {
+    pub nlist: u64,
+    pub nprobe: u64,
     /// Bytes per code as Faiss derives it; `null` when the dimension or
     /// code size is negative.
-    code_size: Option<u64>,
+    pub code_size: Option<u64>,
     /// Whether the codes quantize residuals; absent for float32 and
     /// binary codes.
     #[serde(skip_serializing_if = "Option::is_none")]
-    by_residual: Option<bool>,
-    coarse_quantizer: CoarseQuantizerReport,
-    direct_map: DirectMapReport,
-    lists: ListsReport,
+    pub by_residual: Option<bool>,
+    pub coarse_quantizer: CoarseQuantizerReport,
+    pub direct_map: DirectMapReport,
+    pub lists: ListsReport,
 }
 
-#[derive(Serialize)]
-struct CoarseQuantizerReport {
-    fourcc: String,
+/// The flat index of an IVF index's list centroids.
+#[derive(Debug, Clone, Serialize)]
+pub struct CoarseQuantizerReport {
+    pub fourcc: String,
     /// Centroids, by the quantizer's header.
-    count: i64,
-    dimension: i32,
-    metric: String,
-    is_trained: bool,
+    pub count: i64,
+    pub dimension: i32,
+    pub metric: String,
+    pub is_trained: bool,
 }
 
-#[derive(Serialize)]
-struct DirectMapReport {
+/// An IVF index's map from a vector's id to its place in the lists.
+#[derive(Debug, Clone, Serialize)]
+pub struct DirectMapReport {
     /// The type byte: 0 none, 1 array, 2 hashtable.
-    r#type: u8,
-    name: &'static str,
+    pub r#type: u8,
+    pub name: &'static str,
     /// Array entries.
-    entries: usize,
+    pub entries: usize,
 }
 
-#[derive(Serialize)]
-struct ListsReport {
+/// An IVF index's inverted lists, by their own header.
+#[derive(Debug, Clone, Serialize)]
+pub struct ListsReport {
     /// `full` or `sparse`.
-    sizes: &'static str,
+    pub sizes: &'static str,
     /// Lists, by the lists' own header.
-    nlist: u64,
+    pub nlist: u64,
     /// Bytes per code, by the lists' own header.
-    code_size: u64,
-    non_empty: usize,
+    pub code_size: u64,
+    pub non_empty: usize,
     /// Vectors in all lists.
-    total: u64,
+    pub total: u64,
     /// Smallest and largest list, over every list; `null` without lists.
-    min: Option<u64>,
-    max: Option<u64>,
+    pub min: Option<u64>,
+    pub max: Option<u64>,
 }
 
-#[derive(Serialize)]
-struct EnvelopeReport {
-    header: Option<HeaderReport>,
-    footer: Option<FooterReport>,
+/// The Lucene envelope around the Faiss payload: a codec header and a
+/// footer, each when present.
+#[derive(Debug, Clone, Serialize)]
+pub struct EnvelopeReport {
+    pub header: Option<HeaderReport>,
+    pub footer: Option<FooterReport>,
 }
 
-#[derive(Serialize)]
-struct HeaderReport {
-    length: usize,
-    codec: String,
-    version: i32,
-    segment_id: String,
-    suffix: String,
+/// A Lucene codec header.
+#[derive(Debug, Clone, Serialize)]
+pub struct HeaderReport {
+    pub length: usize,
+    pub codec: String,
+    pub version: i32,
+    pub segment_id: String,
+    pub suffix: String,
 }
 
-#[derive(Serialize)]
-struct FooterReport {
-    offset: usize,
-    algorithm: i32,
-    checksum: String,
-    verified: bool,
+/// A Lucene footer, and whether its checksum verifies.
+#[derive(Debug, Clone, Serialize)]
+pub struct FooterReport {
+    pub offset: usize,
+    pub algorithm: i32,
+    pub checksum: String,
+    pub verified: bool,
 }
 
-#[derive(Serialize)]
-struct PayloadReport {
-    offset: usize,
-    length: usize,
-    trailing_bytes: usize,
+/// Where the Faiss payload lies in the file, and what follows it.
+#[derive(Debug, Clone, Serialize)]
+pub struct PayloadReport {
+    pub offset: usize,
+    pub length: usize,
+    pub trailing_bytes: usize,
 }
 
-#[derive(Serialize)]
-struct HnswReport {
-    m: Option<i32>,
-    ef_construction: i32,
-    ef_search: i32,
-    max_level: i32,
-    entry_point: i32,
-    level_counts: Vec<usize>,
-    neighbor_slots: usize,
+/// An HNSW graph's parameters and levels.
+#[derive(Debug, Clone, Serialize)]
+pub struct HnswReport {
+    pub m: Option<i32>,
+    pub ef_construction: i32,
+    pub ef_search: i32,
+    pub max_level: i32,
+    pub entry_point: i32,
+    pub level_counts: Vec<usize>,
+    pub neighbor_slots: usize,
 }
 
-#[derive(Serialize)]
-struct IdsReport {
-    len: usize,
-    first: Option<i64>,
-    last: Option<i64>,
+/// The ID map's labels: how many, the first, and the last.
+#[derive(Debug, Clone, Serialize)]
+pub struct IdsReport {
+    pub len: usize,
+    pub first: Option<i64>,
+    pub last: Option<i64>,
 }
 
-/// Runs `info` on `path`; exit code 0 when the file parsed.
+/// Describes the native file at `path`.
 ///
 /// # Errors
 ///
 /// Returns the open or parse error, wrapped with the path.
-pub fn run(path: &Path, json: bool) -> anyhow::Result<ExitCode> {
+pub fn info(path: &Path) -> Result<Report> {
     let file = NativeFile::open(path).with_context(|| format!("opening {}", path.display()))?;
     let parsed = file
         .parse()
@@ -272,12 +291,7 @@ pub fn run(path: &Path, json: bool) -> anyhow::Result<ExitCode> {
         },
     };
 
-    if json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
-    } else {
-        print_text(&report);
-    }
-    Ok(ExitCode::SUCCESS)
+    Ok(report)
 }
 
 /// What the file's storage is for text output, and its scalar or product
@@ -401,7 +415,6 @@ fn ivf_report(v: &IvfIndex<'_>) -> IvfReport {
 }
 
 fn hex(bytes: &[u8]) -> String {
-    use std::fmt::Write;
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
         write!(s, "{b:02x}").expect("writing to a String cannot fail");
@@ -411,51 +424,68 @@ fn hex(bytes: &[u8]) -> String {
 
 /// The file, its envelope, and its payload: the lines every report
 /// starts with.
-fn print_envelope(r: &Report) {
-    println!("{}", r.file);
-    println!("  size            {} bytes", r.size);
+fn envelope_text(s: &mut String, r: &Report) {
+    push_line!(s, "{}", r.file);
+    push_line!(s, "  size            {} bytes", r.size);
     match &r.envelope.header {
-        Some(h) => println!(
+        Some(h) => push_line!(
+            s,
             "  header          {} v{} ({} bytes), segment {}, suffix {:?}",
-            h.codec, h.version, h.length, h.segment_id, h.suffix
+            h.codec,
+            h.version,
+            h.length,
+            h.segment_id,
+            h.suffix
         ),
-        None => println!("  header          none"),
+        None => push_line!(s, "  header          none"),
     }
     match &r.envelope.footer {
-        Some(f) => println!(
+        Some(f) => push_line!(
+            s,
             "  footer          at {}, crc32 {} ({})",
             f.offset,
             f.checksum,
             if f.verified { "verified" } else { "MISMATCH" }
         ),
-        None => println!("  footer          none"),
+        None => push_line!(s, "  footer          none"),
     }
-    println!(
+    push_line!(
+        s,
         "  payload         offset {}, {} bytes, {} trailing",
-        r.payload.offset, r.payload.length, r.payload.trailing_bytes
+        r.payload.offset,
+        r.payload.length,
+        r.payload.trailing_bytes
     );
 }
 
-fn print_text(r: &Report) {
-    print_envelope(r);
-    println!("  layout          {}", r.layout.join(" > "));
-    println!(
+/// The report as `info` prints it.
+#[must_use]
+pub fn text(r: &Report) -> String {
+    let mut s = String::new();
+    envelope_text(&mut s, r);
+    push_line!(s, "  layout          {}", r.layout.join(" > "));
+    push_line!(
+        s,
         "  method          {}, vectors stored as {}",
-        r.method, r.encoding
+        r.method,
+        r.encoding
     );
     if let Some(c) = &r.cagra {
         if c.base_level_only {
-            println!(
+            push_line!(
+                s,
                 "  graph           CAGRA (k-NN's remote index build), base level only, {} random entry points per search",
                 c.search_entry_points
             );
         } else {
-            println!(
+            push_line!(
+                s,
                 "  graph           CAGRA (k-NN's remote index build) with base_level_only off: k-NN's memory-optimized search draws {} random entry points per search, Faiss's own starts from the entry point",
                 c.search_entry_points
             );
         }
-        println!(
+        push_line!(
+            s,
             "  cagra fields    keep_max_size_level0 {}, base_level_only {}, numeric type {}",
             u8::from(c.keep_max_size_level0),
             u8::from(c.base_level_only),
@@ -469,53 +499,45 @@ fn print_text(r: &Report) {
         );
     }
     match (r.kind, r.code_size) {
-        (Kind::Binary, Some(size)) => println!(
+        (Kind::Binary, Some(size)) => push_line!(
+            s,
             "  dimension       {} bits, code size {size} bytes",
             r.dimension
         ),
-        (Kind::GraphOnly, Some(size)) => println!(
+        (Kind::GraphOnly, Some(size)) => push_line!(
+            s,
             "  dimension       {}, code size {size} bytes (quantized vector and correction factors)",
             r.dimension
         ),
-        _ => println!("  dimension       {}", r.dimension),
+        _ => push_line!(s, "  dimension       {}", r.dimension),
     }
-    println!("  vectors         {}", r.count);
+    push_line!(s, "  vectors         {}", r.count);
     if r.kind == Kind::GraphOnly {
-        println!("  storage         {NO_STORAGE}");
+        push_line!(s, "  storage         {NO_STORAGE}");
     }
-    println!("  metric          {}", r.metric);
+    push_line!(s, "  metric          {}", r.metric);
     if let Some(q) = &r.quantizer {
-        println!(
+        push_line!(
+            s,
             "  quantizer       {} (type {}), dimension {}, code size {}, trained values {}",
-            q.name, q.qtype, q.dimension, q.code_size, q.trained
+            q.name,
+            q.qtype,
+            q.dimension,
+            q.code_size,
+            q.trained
         );
     }
     if let Some(pq) = &r.pq {
-        print_pq(pq);
+        pq_text(&mut s, pq);
     }
     if let Some(v) = &r.ivf {
-        print_ivf(v);
+        ivf_text(&mut s, v);
     }
     if let Some(h) = &r.hnsw {
-        println!(
-            "  hnsw            M {}, efConstruction {}, efSearch {}",
-            h.m.map_or_else(|| "?".to_owned(), |m| m.to_string()),
-            h.ef_construction,
-            h.ef_search
-        );
-        println!(
-            "  levels          {} (max level {}), entry point {}",
-            h.level_counts
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(" / "),
-            h.max_level,
-            h.entry_point
-        );
-        println!("  neighbor slots  {}", h.neighbor_slots);
+        hnsw_text(&mut s, h);
     }
-    println!(
+    push_line!(
+        s,
         "  labels          {} ({}..{})",
         r.ids.len,
         r.ids
@@ -523,17 +545,47 @@ fn print_text(r: &Report) {
             .map_or_else(|| "-".to_owned(), |v| v.to_string()),
         r.ids.last.map_or_else(|| "-".to_owned(), |v| v.to_string())
     );
+    s
 }
 
-fn print_pq(pq: &PqReport) {
-    println!(
+fn hnsw_text(s: &mut String, h: &HnswReport) {
+    push_line!(
+        s,
+        "  hnsw            M {}, efConstruction {}, efSearch {}",
+        h.m.map_or_else(|| "?".to_owned(), |m| m.to_string()),
+        h.ef_construction,
+        h.ef_search
+    );
+    push_line!(
+        s,
+        "  levels          {} (max level {}), entry point {}",
+        h.level_counts
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(" / "),
+        h.max_level,
+        h.entry_point
+    );
+    push_line!(s, "  neighbor slots  {}", h.neighbor_slots);
+}
+
+fn pq_text(s: &mut String, pq: &PqReport) {
+    push_line!(
+        s,
         "  pq              M {}, {} bits per code, {} centroids per sub-quantizer of dimension {}, {} floats stored, code size {} bytes",
-        pq.m, pq.nbits, pq.centroids_per_sub, pq.sub_dimension, pq.centroid_floats, pq.code_size
+        pq.m,
+        pq.nbits,
+        pq.centroids_per_sub,
+        pq.sub_dimension,
+        pq.centroid_floats,
+        pq.code_size
     );
     if let (Some(search_type), Some(encode_signs), Some(ht)) =
         (pq.search_type, pq.encode_signs, pq.polysemous_ht)
     {
-        println!(
+        push_line!(
+            s,
             "  pq search       type {search_type} ({}), encode_signs {}, polysemous_ht {ht}",
             search_type_name(search_type).unwrap_or("not a Faiss type"),
             u8::from(encode_signs)
@@ -541,8 +593,9 @@ fn print_pq(pq: &PqReport) {
     }
 }
 
-fn print_ivf(v: &IvfReport) {
-    println!(
+fn ivf_text(s: &mut String, v: &IvfReport) {
+    push_line!(
+        s,
         "  ivf             nlist {}, nprobe {}, code size {}{}",
         v.nlist,
         v.nprobe,
@@ -555,7 +608,8 @@ fn print_ivf(v: &IvfReport) {
         }
     );
     let q = &v.coarse_quantizer;
-    println!(
+    push_line!(
+        s,
         "  centroids       {} in {}, dimension {}, metric {}{} (the coarse quantizer)",
         q.count,
         q.fourcc,
@@ -563,12 +617,16 @@ fn print_ivf(v: &IvfReport) {
         q.metric,
         if q.is_trained { "" } else { ", untrained" }
     );
-    println!(
+    push_line!(
+        s,
         "  direct map      {} (type {}), {} entries",
-        v.direct_map.name, v.direct_map.r#type, v.direct_map.entries
+        v.direct_map.name,
+        v.direct_map.r#type,
+        v.direct_map.entries
     );
     let l = &v.lists;
-    println!(
+    push_line!(
+        s,
         "  inverted lists  {} of {} non-empty, {} vectors, sizes {} to {} ({} list sizes), code size {} bytes",
         l.non_empty,
         l.nlist,

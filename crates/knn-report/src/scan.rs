@@ -1,4 +1,4 @@
-//! The `scan` command: every native file under a directory, each verified
+//! The `scan` report: every native file under a directory, each verified
 //! and summarized, plus a cross-check of its vectors against the Lucene
 //! flat-vector file (`.vec`) of the same segment when one lies beside it,
 //! or for a graph without its vectors, against the scalar-quantized ones
@@ -10,11 +10,8 @@ use std::fmt::Write as _;
 use std::fs;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
 
-use anyhow::Context;
-use clap::Args;
-use knn_check::{Check, Options, Severity, Space, Status};
+use knn_check::{Check, Options as CheckOptions, Severity, Space, Status};
 use knn_format::U16;
 use knn_format::envelope::Envelope;
 use knn_format::faiss::{CodeFormat, HalfRounding, Storage, bf16_rounds_to, byte_code};
@@ -25,47 +22,34 @@ use serde::Serialize;
 
 mod ivf;
 
-use self::quantized::{
-    Graph, HOLDS_ITS_VECTORS, IVF_HOLDS_ITS_VECTORS, LuceneQuantized, lucene_quantized,
-};
-use crate::verify::SpaceArg;
+pub use self::quantized::LuceneQuantized;
+use self::quantized::{Graph, HOLDS_ITS_VECTORS, IVF_HOLDS_ITS_VECTORS, lucene_quantized};
+use crate::error::{Context as _, Result};
 
-/// Arguments of `scan`.
-#[derive(Debug, Args)]
-pub struct ScanArgs {
-    /// A shard or segment directory; subdirectories are included.
-    pub dir: PathBuf,
-    /// The space type of every field found. Needed for the cosine checks;
-    /// leave it out when the directory mixes spaces.
-    #[arg(long, value_enum)]
-    pub space: Option<SpaceArg>,
-    /// Findings to list per check; the count is always exact. 0 means the default.
-    #[arg(long, default_value_t = 5)]
-    pub max_findings: usize,
-    /// Print the report as JSON.
-    #[arg(long)]
-    pub json: bool,
-}
+/// How `scan` checks each file it finds: as `verify` checks one.
+pub use crate::verify::Options;
 
-#[derive(Serialize)]
-struct Output {
-    directory: String,
-    space: Option<Space>,
-    status: Verdict,
-    files: Vec<FileReport>,
+/// What `scan` reports of a directory.
+#[derive(Debug, Clone, Serialize)]
+pub struct Report {
+    pub directory: String,
+    pub space: Option<Space>,
+    pub status: Verdict,
+    pub files: Vec<FileReport>,
     /// Subdirectories that could not be read, and so were not scanned.
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    unreadable: Vec<Unreadable>,
-    summary: Summary,
+    pub unreadable: Vec<Unreadable>,
+    pub summary: Summary,
 }
 
-#[derive(Serialize)]
-struct Summary {
-    files: usize,
-    clean: usize,
-    warnings: usize,
-    unsupported: usize,
-    failed: usize,
+/// How many native files `scan` found, by verdict.
+#[derive(Debug, Clone, Serialize)]
+pub struct Summary {
+    pub files: usize,
+    pub clean: usize,
+    pub warnings: usize,
+    pub unsupported: usize,
+    pub failed: usize,
 }
 
 /// A file's verdict, or the directory's: [`Status`] plus a layout or
@@ -73,7 +57,7 @@ struct Summary {
 /// never writes it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
-enum Verdict {
+pub enum Verdict {
     /// No failures, no warnings.
     Clean,
     /// Warnings only.
@@ -89,7 +73,8 @@ enum Verdict {
 impl Verdict {
     /// The process exit code: 0 clean, 1 failed, 2 warnings or
     /// unsupported, which is not a failure of the file.
-    fn exit_code(self) -> u8 {
+    #[must_use]
+    pub fn exit_code(self) -> u8 {
         match self {
             Self::Clean => 0,
             Self::Failed => 1,
@@ -108,63 +93,66 @@ impl From<Status> for Verdict {
     }
 }
 
-#[derive(Serialize)]
-struct FileReport {
-    file: String,
-    size: Option<usize>,
+/// What `scan` reports of one native file: its shape as `info` gives it,
+/// `verify`'s checks, and the cross-checks against its segment's Lucene
+/// files.
+#[derive(Debug, Clone, Serialize)]
+pub struct FileReport {
+    pub file: String,
+    pub size: Option<usize>,
     /// Set when the file could not be opened; the checks are then absent.
     #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
+    pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    layout: Option<Vec<String>>,
+    pub layout: Option<Vec<String>>,
     /// k-NN's method, `hnsw` or `ivf`, and how the file stores a vector,
     /// as `info` names them.
     #[serde(skip_serializing_if = "Option::is_none")]
-    method: Option<&'static str>,
+    pub method: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    encoding: Option<&'static str>,
+    pub encoding: Option<&'static str>,
     /// `hnsw`, or `cagra` for the graph k-NN's remote index build writes;
     /// absent for an IVF index, which has no graph.
     #[serde(skip_serializing_if = "Option::is_none")]
-    graph: Option<&'static str>,
+    pub graph: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    dimension: Option<i32>,
+    pub dimension: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    count: Option<i64>,
+    pub count: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    metric: Option<String>,
+    pub metric: Option<String>,
     /// Bytes per vector, for binary storage.
     #[serde(skip_serializing_if = "Option::is_none")]
-    code_size: Option<i32>,
-    status: Verdict,
+    pub code_size: Option<i32>,
+    pub status: Verdict,
     #[serde(skip_serializing_if = "Option::is_none")]
-    failures: Option<usize>,
+    pub failures: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    warnings: Option<usize>,
+    pub warnings: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    checks: Option<Vec<knn_check::CheckResult>>,
-    lucene_vectors: LuceneVectors,
-    lucene_docs: LuceneDocs,
+    pub checks: Option<Vec<knn_check::CheckResult>>,
+    pub lucene_vectors: LuceneVectors,
+    pub lucene_docs: LuceneDocs,
     /// For a graph without its vectors, the quantized vectors Lucene keeps
     /// for it.
-    lucene_quantized: LuceneQuantized,
+    pub lucene_quantized: LuceneQuantized,
     /// For an unsupported file, why: a quantizer type refused where k-NN
     /// never writes it, rather than one this tool does not read.
     #[serde(skip)]
-    refused: bool,
+    pub refused: bool,
 }
 
 /// The vectors compared with the segment's Lucene flat-vector file.
-#[derive(Serialize)]
-struct LuceneVectors {
-    status: CrossCheck,
+#[derive(Debug, Clone, Serialize)]
+pub struct LuceneVectors {
+    pub status: CrossCheck,
     /// The `.vec` file the vectors were found in, or looked for in.
     #[serde(skip_serializing_if = "Option::is_none")]
-    file: Option<String>,
+    pub file: Option<String>,
     /// Where in that file the stored vectors begin.
     #[serde(skip_serializing_if = "Option::is_none")]
-    offset: Option<usize>,
-    detail: String,
+    pub offset: Option<usize>,
+    pub detail: String,
 }
 
 impl LuceneVectors {
@@ -180,16 +168,16 @@ impl LuceneVectors {
 
 /// The ID map's labels, which k-NN sets to Lucene doc ids, checked
 /// against the document count in the segment's info file (`.si`).
-#[derive(Serialize)]
-struct LuceneDocs {
-    status: CrossCheck,
+#[derive(Debug, Clone, Serialize)]
+pub struct LuceneDocs {
+    pub status: CrossCheck,
     /// The `.si` file read.
     #[serde(skip_serializing_if = "Option::is_none")]
-    file: Option<String>,
+    pub file: Option<String>,
     /// Documents in the segment, deleted ones included.
     #[serde(skip_serializing_if = "Option::is_none")]
-    doc_count: Option<u32>,
-    detail: String,
+    pub doc_count: Option<u32>,
+    pub detail: String,
 }
 
 impl LuceneDocs {
@@ -207,7 +195,7 @@ impl LuceneDocs {
 /// same segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum CrossCheck {
+pub enum CrossCheck {
     /// The native file agrees with the Lucene file.
     Match,
     /// The Lucene files are sound, and the native file, the `--space`
@@ -242,21 +230,19 @@ impl CrossCheck {
     }
 }
 
-/// Runs `scan`; the exit code is the worst verdict over the files found:
-/// 0 clean, 1 any failure (or a file that would not open, a subdirectory
-/// that could not be read, or no native files at all), 2 warnings or a
-/// sound file in a layout or scalar quantizer type this tool does not
-/// read.
+/// Scans the directory `dir`, a shard or segment directory, its
+/// subdirectories included. The report's status is the worst
+/// verdict over the files found: failed on any failure (or a file that
+/// would not open, a subdirectory that could not be read, or no native
+/// files at all), else unsupported for a sound file in a layout or scalar
+/// quantizer type this tool does not read, else warnings.
 ///
 /// # Errors
 ///
 /// Returns the error when the directory itself cannot be read.
-pub fn run(args: &ScanArgs) -> anyhow::Result<ExitCode> {
-    let (files, unreadable) = native_files(&args.dir)?;
-    let options = Options {
-        space: args.space.map(Space::from),
-        max_examples: args.max_findings,
-    };
+pub fn scan(dir: &Path, options: &Options) -> Result<Report> {
+    let (files, unreadable) = native_files(dir)?;
+    let options = options.checks();
     let reports: Vec<FileReport> = files.iter().map(|f| scan_file(f, &options)).collect();
 
     let count = |verdict| reports.iter().filter(|r| r.status == verdict).count();
@@ -276,20 +262,14 @@ pub fn run(args: &ScanArgs) -> anyhow::Result<ExitCode> {
     } else {
         Verdict::Clean
     };
-    let out = Output {
-        directory: shown(&args.dir),
+    Ok(Report {
+        directory: shown(dir),
         space: options.space,
         status,
         files: reports,
         unreadable,
         summary,
-    };
-    if args.json {
-        println!("{}", serde_json::to_string_pretty(&out)?);
-    } else {
-        print!("{}", text(&out));
-    }
-    Ok(ExitCode::from(status.exit_code()))
+    })
 }
 
 /// Every `.faiss` and `.faissc` file under `dir`, in path order, and the
@@ -303,7 +283,7 @@ pub fn run(args: &ScanArgs) -> anyhow::Result<ExitCode> {
 /// # Errors
 ///
 /// Returns the error when `dir` itself cannot be read.
-fn native_files(dir: &Path) -> anyhow::Result<(Vec<PathBuf>, Vec<Unreadable>)> {
+fn native_files(dir: &Path) -> Result<(Vec<PathBuf>, Vec<Unreadable>)> {
     let mut found = Vec::new();
     let mut unreadable = Vec::new();
     let mut pending = vec![dir.to_path_buf()];
@@ -342,10 +322,10 @@ fn native_files(dir: &Path) -> anyhow::Result<(Vec<PathBuf>, Vec<Unreadable>)> {
 }
 
 /// A directory, or an entry in one, that could not be read.
-#[derive(Serialize)]
-struct Unreadable {
-    path: String,
-    error: String,
+#[derive(Debug, Clone, Serialize)]
+pub struct Unreadable {
+    pub path: String,
+    pub error: String,
 }
 
 impl Unreadable {
@@ -411,7 +391,7 @@ fn unopened(path: &Path, e: &knn_format::Error) -> FileReport {
     }
 }
 
-fn scan_file(path: &Path, options: &Options) -> FileReport {
+fn scan_file(path: &Path, options: &CheckOptions) -> FileReport {
     let file = match NativeFile::open(path) {
         Ok(file) => file,
         Err(e) => return unopened(path, &e),
@@ -1504,10 +1484,11 @@ fn shape(r: &FileReport) -> String {
     }
 }
 
-fn text(out: &Output) -> String {
+/// The report as `scan` prints it.
+#[must_use]
+pub fn text(out: &Report) -> String {
     let mut s = String::new();
-    writeln!(s, "{}: {} native file(s)", out.directory, out.summary.files)
-        .expect("writing to a String cannot fail");
+    push_line!(s, "{}: {} native file(s)", out.directory, out.summary.files);
     for r in &out.files {
         let verdict = match r.status {
             Verdict::Clean => "clean",
@@ -1515,12 +1496,10 @@ fn text(out: &Output) -> String {
             Verdict::Unsupported => "unsupported",
             Verdict::Failed => "FAILED",
         };
-        writeln!(s, "  {}", r.file).expect("writing to a String cannot fail");
-        writeln!(s, "    {verdict:<VERDICT_WIDTH$} {}", shape(r))
-            .expect("writing to a String cannot fail");
+        push_line!(s, "  {}", r.file);
+        push_line!(s, "    {verdict:<VERDICT_WIDTH$} {}", shape(r));
         if let Some(e) = &r.error {
-            writeln!(s, "    {:<VERDICT_WIDTH$} {e}", "error")
-                .expect("writing to a String cannot fail");
+            push_line!(s, "    {:<VERDICT_WIDTH$} {e}", "error");
         }
         for c in r.checks.iter().flatten() {
             let tag = match c.severity {
@@ -1542,50 +1521,47 @@ fn text(out: &Output) -> String {
             } else {
                 String::new()
             };
-            writeln!(s, "    {tag:<VERDICT_WIDTH$} {:<20} {first}{more}", c.name)
-                .expect("writing to a String cannot fail");
+            push_line!(s, "    {tag:<VERDICT_WIDTH$} {:<20} {first}{more}", c.name);
         }
         let tag = cross_tag(r.lucene_vectors.status);
-        writeln!(
+        push_line!(
             s,
             "    {tag:<VERDICT_WIDTH$} {:<20} {}",
-            "lucene_vectors", r.lucene_vectors.detail
-        )
-        .expect("writing to a String cannot fail");
-        writeln!(
+            "lucene_vectors",
+            r.lucene_vectors.detail
+        );
+        push_line!(
             s,
             "    {:<VERDICT_WIDTH$} {:<20} {}",
             cross_tag(r.lucene_docs.status),
             "lucene_docs",
             r.lucene_docs.detail
-        )
-        .expect("writing to a String cannot fail");
+        );
         // Left out only for a file that holds its own vectors, where it
         // does not apply.
         if r.lucene_quantized.detail != HOLDS_ITS_VECTORS
             && r.lucene_quantized.detail != IVF_HOLDS_ITS_VECTORS
         {
-            writeln!(
+            push_line!(
                 s,
                 "    {:<VERDICT_WIDTH$} {:<20} {}",
                 cross_tag(r.lucene_quantized.status),
                 "lucene_quantized",
                 r.lucene_quantized.detail
-            )
-            .expect("writing to a String cannot fail");
+            );
         }
     }
     for u in &out.unreadable {
-        writeln!(s, "  {}", u.path).expect("writing to a String cannot fail");
-        writeln!(
+        push_line!(s, "  {}", u.path);
+        push_line!(
             s,
             "    {:<VERDICT_WIDTH$} not scanned: {}",
-            "FAILED", u.error
-        )
-        .expect("writing to a String cannot fail");
+            "FAILED",
+            u.error
+        );
     }
     let summary = &out.summary;
-    writeln!(
+    push_line!(
         s,
         "{} file(s): {} clean, {} with warnings, {} unsupported, {} failed; exit code {}",
         summary.files,
@@ -1594,8 +1570,7 @@ fn text(out: &Output) -> String {
         summary.unsupported,
         summary.failed,
         out.status.exit_code()
-    )
-    .expect("writing to a String cannot fail");
+    );
     s
 }
 

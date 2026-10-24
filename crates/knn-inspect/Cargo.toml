@@ -10,16 +10,16 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
-knn-format.workspace = true
 knn-check.workspace = true
-knn-recall.workspace = true
+knn-report.workspace = true
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
-memchr.workspace = true
 
 [dev-dependencies]
+# The tests read fixtures and build corrupt files through the format crate.
+knn-format.workspace = true
 serde_json.workspace = true
 
 [lints]

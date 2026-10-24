@@ -29,7 +29,7 @@ The macOS binary is not notarized; after unpacking, run
 `xattr -d com.apple.quarantine knn-inspect`. Or build from source:
 
 ```
-cargo install --git https://github.com/userepo/knn-inspect --tag v0.15.0 knn-inspect
+cargo install --git https://github.com/userepo/knn-inspect --tag v0.16.0 knn-inspect
 ```
 
 ## Usage
