@@ -8,3 +8,11 @@ __pycache__/
 /fuzz/artifacts
 /fuzz/coverage
 /fuzz/fuzz-*.log
+
+# The Python package: its build and the extension modules maturin develop
+# places beside the sources.
+/python/target
+/python/knn_inspect/_native*.pyd
+/python/knn_inspect/_native*.so
+/python/knn_inspect/_native*.pdb
+/python/.pytest_cache

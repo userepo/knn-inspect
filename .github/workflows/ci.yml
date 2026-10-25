@@ -1,6 +1,7 @@
 # Every push and pull request: format and lints on Linux (the fuzz target
-# included), the test suite on Linux and Windows, and the dependency
-# policy. The toolchain comes from rust-toolchain.toml.
+# and the Python extension included), the test suite on Linux and
+# Windows, the Python package's tests on its oldest and newest Python,
+# and the dependency policy. The toolchain comes from rust-toolchain.toml.
 name: CI
 
 on:
@@ -36,8 +37,52 @@ jobs:
       - name: Clippy (fuzz target)
         if: runner.os == 'Linux'
         run: cargo clippy --manifest-path fuzz/Cargo.toml --locked -- -D warnings
+      # The Python extension is its own Cargo root too.
+      - name: Format and Clippy (Python extension)
+        if: runner.os == 'Linux'
+        run: |
+          cargo fmt --manifest-path python/Cargo.toml --check
+          cargo clippy --manifest-path python/Cargo.toml --all-targets --locked -- -D warnings
       - name: Test
         run: cargo test --workspace --locked
+
+  python:
+    name: Python (${{ matrix.os }}, ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        # The oldest the abi3 wheel takes, and the newest.
+        python: ["3.11", "3.14"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            python
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+      # numpy only for the tests; its newest release that takes 3.11 is 2.4.
+      - name: Install the build and test tools
+        run: >-
+          python -m pip install maturin==1.15.0 pytest==9.1.1 mypy==2.4.0
+          "numpy==2.5.4; python_version >= '3.12'"
+          "numpy==2.4.6; python_version < '3.12'"
+      # The tests run against the installed wheel, not the sources, and
+      # build the CLI they compare it with.
+      - name: Build and install the wheel
+        shell: bash
+        run: |
+          maturin build --release --locked -m python/Cargo.toml --out dist
+          python -m pip install dist/*.whl
+      - name: Test
+        run: pytest python/tests
+      - name: Types
+        if: runner.os == 'Linux' && matrix.python == '3.11'
+        run: mypy --strict --python-version 3.11 python/knn_inspect
 
   deny:
     name: Dependency policy
@@ -45,3 +90,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: EmbarkStudios/cargo-deny-action@v2
+      # The Python extension's dependencies, in its own lockfile.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: python/Cargo.toml

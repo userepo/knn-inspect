@@ -1,0 +1,94 @@
+# Publishing a release sends its Python wheels and sdist, the files named
+# knn_inspect-*, to PyPI. Run by hand on a release's tag while it is still
+# a draft (gh workflow run publish-pypi.yml --ref v<version>), it sends
+# them to TestPyPI instead, to prove the upload before the release. Both
+# upload through trusted publishing: PyPI and TestPyPI trust this
+# workflow in the environments pypi and testpypi, which take only tags
+# v*, and no token is stored.
+name: Publish to PyPI
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pypi:
+    name: PyPI
+    if: github.event_name == 'release'
+    runs-on: ubuntu-26.04
+    environment:
+      name: pypi
+      url: https://pypi.org/p/knn-inspect
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Download the release's Python files
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --pattern 'knn_inspect-*' --dir dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  # The draft's files are fetched in a job of their own: only write access
+  # sees a draft, and the upload job then runs without it.
+  testpypi-files:
+    name: TestPyPI files
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: write
+    steps:
+      - name: Check that the run is on a tag
+        run: |
+          if [ "$GITHUB_REF_TYPE" != tag ]; then
+            echo "run this on a release's tag: --ref v<version>" >&2
+            exit 1
+          fi
+      - name: Download the release's Python files
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --pattern 'knn_inspect-*' --dir dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: python-files
+          path: dist/
+          if-no-files-found: error
+
+  testpypi:
+    name: TestPyPI
+    needs: testpypi-files
+    runs-on: ubuntu-26.04
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/knn-inspect
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: python-files
+          path: dist
+      # A rerun, after the install below gave up waiting, finds the files
+      # there already; PyPI's upload above stays strict.
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          skip-existing: true
+      # From TestPyPI as a user would install it; the index can take a
+      # minute to list a new upload.
+      - name: Install from TestPyPI
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            if "$RUNNER_TEMP/venv/bin/python" -m pip install --no-deps \
+              --index-url https://test.pypi.org/simple/ "knn-inspect==${GITHUB_REF_NAME#v}"; then
+              break
+            fi
+            [ "$attempt" = 10 ] && exit 1
+            sleep 30
+          done
+          "$RUNNER_TEMP/venv/bin/python" -c 'import knn_inspect; print(knn_inspect.__version__)'

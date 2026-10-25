@@ -1,6 +1,7 @@
 //! The `recall` report: search results, the tool's own or produced
 //! elsewhere, scored against exact brute force over the file's vectors.
 
+use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -21,6 +22,51 @@ use crate::scan::quantized::{
 };
 use crate::scan::shown;
 
+/// An input `recall` reads: a file, or the data the file would hold.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Input<T> {
+    /// A file.
+    File(PathBuf),
+    /// The data itself.
+    Data(T),
+}
+
+impl<T> Input<T> {
+    /// The file, when the input is one.
+    #[must_use]
+    pub fn file(&self) -> Option<&Path> {
+        match self {
+            Self::File(p) => Some(p),
+            Self::Data(_) => None,
+        }
+    }
+}
+
+impl<T> From<PathBuf> for Input<T> {
+    fn from(p: PathBuf) -> Self {
+        Self::File(p)
+    }
+}
+
+/// Query vectors given as data: their bytes, as a queries file holds
+/// them, and the bytes in a row when the caller knows it (an array's
+/// shape gives it), which [`recall`] holds to the file's instead of
+/// reading the bytes as rows of another width.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct QueryBytes {
+    /// The rows, one after another.
+    pub bytes: Vec<u8>,
+    /// The bytes in a row, when known.
+    pub row: Option<usize>,
+}
+
+impl From<Vec<u8>> for QueryBytes {
+    /// Bytes as a file holds them, of rows of any width.
+    fn from(bytes: Vec<u8>) -> Self {
+        Self { bytes, row: None }
+    }
+}
+
 /// What `recall` scores, and how it searches. [`recall`] refuses options
 /// that contradict each other or lie outside the ranges k-NN accepts,
 /// as the command line does ([`Options::validate`]); errors name an
@@ -29,9 +75,9 @@ use crate::scan::shown;
 pub struct Options {
     /// Query vectors: row-major little-endian float32, the file's
     /// dimension; for a binary file, packed bits, a row the bytes of its
-    /// code size (its dimension / 8). `None` samples the file's own
-    /// vectors instead, `sample` of them.
-    pub queries: Option<PathBuf>,
+    /// code size (its dimension / 8). A file of them, or their bytes.
+    /// `None` samples the file's own vectors instead, `sample` of them.
+    pub queries: Option<Input<QueryBytes>>,
     /// Without `queries`: this many of the file's own vectors, chosen by
     /// `seed`; for a file of product-quantized codes or a graph without
     /// its vectors, of the field's vectors in the `.vec`. Only for the
@@ -48,8 +94,9 @@ pub struct Options {
     /// every node, in order, so the seed no longer matters.
     pub entry_points: Option<u64>,
     /// Result lists to score instead of searching: one per query, in query
-    /// order, as a JSON array of labels per line or `{"labels": [...]}`.
-    pub results: Option<PathBuf>,
+    /// order. A file of them, a JSON array of labels per line or
+    /// `{"labels": [...]}`, or the lists.
+    pub results: Option<Input<Vec<Vec<i64>>>>,
     /// Neighbors per query to score; longer result lists are cut to this.
     pub k: usize,
     /// Candidate queue size for a graph's own search, at least 1; the
@@ -69,9 +116,10 @@ pub struct Options {
     /// For a graph without its vectors: keep the first pass's top k
     /// without rescoring, as k-NN does for `"rescore": false`.
     pub no_rescore: bool,
-    /// A JSON array naming node i as `ids[i]`, when `results` use ids
-    /// other than the file's labels (a stored position field, say).
-    pub ids: Option<PathBuf>,
+    /// The ids naming node i as `ids[i]`, when `results` use ids other
+    /// than the file's labels (a stored position field, say). A file
+    /// holding them as a JSON array, or the ids.
+    pub ids: Option<Input<Vec<i64>>>,
 }
 
 /// The most lists a query's `nprobes` may scan: k-NN casts it to an int.
@@ -162,8 +210,8 @@ impl Options {
 /// Where the queries come from.
 #[derive(Debug, Clone, Copy)]
 enum QuerySource<'a> {
-    /// A file of them.
-    File(&'a Path),
+    /// Given: a file of them, or their bytes.
+    Given(&'a Input<QueryBytes>),
     /// This many of the file's own vectors.
     Sample(usize),
 }
@@ -172,7 +220,7 @@ impl Options {
     /// Where the queries come from: `queries` or `sample`, exactly one.
     fn query_source(&self) -> Result<QuerySource<'_>> {
         match (&self.queries, self.sample) {
-            (Some(p), None) => Ok(QuerySource::File(p)),
+            (Some(q), None) => Ok(QuerySource::Given(q)),
             (None, Some(count)) => Ok(QuerySource::Sample(count)),
             (None, None) => Err(Error::Options("give --queries or --sample".to_owned())),
             (Some(_), Some(_)) => Err(Error::Options(
@@ -200,12 +248,15 @@ impl std::ops::Deref for Args<'_> {
 #[derive(Debug, Clone, Serialize)]
 pub struct Report {
     pub file: String,
+    /// The `queries` file; absent for queries given as data.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub queries_file: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sample: Option<Sample>,
+    /// The `results` file; absent for result lists given as data.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub results_file: Option<String>,
+    /// The `ids` file; absent for ids given as data.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ids_file: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -221,6 +272,10 @@ pub struct Report {
     /// JSON.
     #[serde(skip)]
     pub warning: Option<String>,
+    /// Whether the result lists' labels were named by ids given as
+    /// data. Not in the JSON.
+    #[serde(skip)]
+    pub ids_given: bool,
 }
 
 /// Queries sampled from the file's own vectors, or for a file without
@@ -412,8 +467,8 @@ fn run_ivf(args: &Args<'_>, index: &IdMapIndex<'_>, ivf: &IvfIndex<'_>) -> Resul
     let dimension = knn_recall::query_dimension(&storage)
         .with_context(|| format!("{}: no query can match it", path.display()))?;
     let (queries, sample) = load_queries(args, &storage, dimension)?;
-    let (results, search) = if let Some(p) = &args.results {
-        (read_results(p)?, None)
+    let (results, search) = if let Some(given) = &args.results {
+        (read_results(given)?, None)
     } else {
         let searcher =
             IvfSearcher::new(ivf).with_context(|| format!("{}: searching it", path.display()))?;
@@ -436,7 +491,7 @@ fn run_ivf(args: &Args<'_>, index: &IdMapIndex<'_>, ivf: &IvfIndex<'_>) -> Resul
             .map(|h| knn_recall::result_labels(index, h, args.k))
             .collect();
         (
-            results,
+            Cow::Owned(results),
             Some(OwnSearch {
                 ef_search: None,
                 nprobes: Some(nprobes),
@@ -517,7 +572,7 @@ fn run_on_disk(args: &Args<'_>, index: &IdMapIndex<'_>) -> Result<Report> {
     let path = &args.file;
     let at = |why: String| message!("{}: {why}", path.display());
     let files = field_files(path).map_err(at)?;
-    if let Some(p) = &args.results {
+    if let Some(given) = &args.results {
         let raw = files.raw().map_err(at)?;
         let flat_field = flat_field(&files, &raw)?;
         same_similarity(path, &files, &flat_field)?;
@@ -527,7 +582,7 @@ fn run_on_disk(args: &Args<'_>, index: &IdMapIndex<'_>) -> Result<Report> {
             files.similarity,
             &flat_field,
             raw.vec.bytes(),
-            p,
+            given,
         );
     }
     // The field passes scan's check before any of its files is opened
@@ -593,7 +648,7 @@ fn search_on_disk(
         let results = on_disk.search_all(&queries, &plan, draw)?;
         let cagra = index.hnsw().and_then(|h| h.kind.cagra());
         (
-            results,
+            Cow::Owned(results),
             Some(OwnSearch {
                 ef_search: Some(ef_search),
                 nprobes: None,
@@ -649,7 +704,7 @@ fn score_on_disk(
     similarity: i32,
     flat: &FlatField,
     vec: &[u8],
-    results: &Path,
+    results: &Input<Vec<Vec<i64>>>,
 ) -> Result<Report> {
     let path = &args.file;
     let similarity = Similarity::from_ordinal(similarity).ok_or(knn_recall::Error::Similarity {
@@ -676,11 +731,14 @@ fn score_on_disk(
     )
 }
 
+/// Result lists: one of labels per query, read, given, or searched.
+type Lists<'a> = Cow<'a, [Vec<i64>]>;
+
 /// The queries and the result lists to score for them.
-struct Searched {
+struct Searched<'a> {
     queries: Queries,
     sample: Option<Sample>,
-    results: Vec<Vec<i64>>,
+    results: Lists<'a>,
     search: Option<OwnSearch>,
     /// What scan's check of a graph-only field's files warns of.
     warning: Option<String>,
@@ -693,7 +751,7 @@ fn report(
     index: &IdMapIndex<'_>,
     storage: &Storage<'_>,
     dimension: usize,
-    searched: Searched,
+    searched: Searched<'_>,
 ) -> Result<Report> {
     let path = &args.file;
     let Searched {
@@ -712,10 +770,10 @@ fn report(
 
     Ok(Report {
         file: path.display().to_string(),
-        queries_file: args.queries.as_ref().map(|p| p.display().to_string()),
+        queries_file: shown_file(args.queries.as_ref()),
         sample,
-        results_file: args.results.as_ref().map(|p| p.display().to_string()),
-        ids_file: args.ids.as_ref().map(|p| p.display().to_string()),
+        results_file: shown_file(args.results.as_ref()),
+        ids_file: shown_file(args.ids.as_ref()),
         search,
         dimension,
         vectors: storage.row_count(),
@@ -723,24 +781,43 @@ fn report(
         ground_truth_ms,
         recall,
         warning,
+        ids_given: matches!(args.ids, Some(Input::Data(_))),
     })
 }
 
-/// The queries from `--queries`, or sampled from the file for `--sample`.
+/// The input's file as the report names it, when it is one.
+fn shown_file<T>(input: Option<&Input<T>>) -> Option<String> {
+    input.and_then(Input::file).map(|p| p.display().to_string())
+}
+
+/// The queries from `--queries`, read or given, or sampled from the
+/// file for `--sample`.
 fn load_queries(
     args: &Args<'_>,
     storage: &Storage<'_>,
     dimension: usize,
 ) -> Result<(Queries, Option<Sample>)> {
     let count = match args.query_source()? {
-        QuerySource::File(p) => {
-            let bytes = fs::read(p).with_context(|| format!("reading {}", p.display()))?;
+        QuerySource::Given(given) => {
+            let (bytes, what) = match given {
+                Input::File(p) => {
+                    let what = || format!("reading {}", p.display());
+                    (Cow::Owned(fs::read(p).with_context(what)?), what())
+                }
+                Input::Data(data) => {
+                    check_row(data, storage, dimension)?;
+                    (
+                        Cow::Borrowed(data.bytes.as_slice()),
+                        "the queries given".to_owned(),
+                    )
+                }
+            };
             let queries = if matches!(storage, Storage::Binary(_)) {
                 Queries::from_bits(&bytes, dimension)
             } else {
                 Queries::from_bytes(&bytes, dimension)
             }
-            .with_context(|| format!("reading {}", p.display()))?;
+            .with_context(|| what)?;
             return Ok((queries, None));
         }
         QuerySource::Sample(count) => count,
@@ -749,6 +826,34 @@ fn load_queries(
     let (queries, _) = knn_recall::sample_queries(storage, count, seed)
         .with_context(|| format!("sampling from {}", args.file.display()))?;
     Ok((queries, Some(Sample { count, seed })))
+}
+
+/// Refuses query rows given as data whose width, when known, is not
+/// the width queries of `dimension` have for `storage`.
+fn check_row(data: &QueryBytes, storage: &Storage<'_>, dimension: usize) -> Result<()> {
+    let bytes = |n: usize| {
+        if n == 1 {
+            "1 byte".to_owned()
+        } else {
+            format!("{n} bytes")
+        }
+    };
+    let (expected, of) = if matches!(storage, Storage::Binary(_)) {
+        (dimension / 8, format!("{dimension} bits"))
+    } else {
+        (
+            dimension.saturating_mul(4),
+            format!("{dimension} float32 components"),
+        )
+    };
+    match data.row {
+        Some(row) if row != expected => bail!(
+            "the queries given: rows of {}; this file's queries are rows of {}, {of}",
+            bytes(row),
+            bytes(expected)
+        ),
+        _ => Ok(()),
+    }
 }
 
 /// The entry draw of a CAGRA graph's own search, from --seed and
@@ -762,15 +867,15 @@ fn draw_of(args: &Args<'_>) -> Draw {
     }
 }
 
-/// The result lists to score: read from `--results`, or produced by the
-/// tool's own search.
-fn results_for(
-    args: &Args<'_>,
+/// The result lists to score: from `--results`, read or given, or
+/// produced by the tool's own search.
+fn results_for<'a>(
+    args: &Args<'a>,
     index: &IdMapIndex<'_>,
     queries: &Queries,
-) -> Result<(Vec<Vec<i64>>, Option<OwnSearch>)> {
-    if let Some(p) = &args.results {
-        return Ok((read_results(p)?, None));
+) -> Result<(Lists<'a>, Option<OwnSearch>)> {
+    if let Some(given) = &args.options.results {
+        return Ok((read_results(given)?, None));
     }
     // `run` sends an IVF index to `run_ivf`; a graph is all that reaches
     // here.
@@ -791,7 +896,7 @@ fn results_for(
         .collect();
     let cagra = hnsw.kind.cagra();
     Ok((
-        results,
+        Cow::Owned(results),
         Some(OwnSearch {
             ef_search: Some(ef_search),
             nprobes: None,
@@ -811,37 +916,59 @@ fn results_for(
     ))
 }
 
-/// What the result lists' labels mean: the file's ID map, or `--ids`.
+/// What the result lists' labels mean: the file's ID map, or `--ids`,
+/// read or given.
 fn load_labels(args: &Args<'_>, index: &IdMapIndex<'_>, vectors: usize) -> Result<Labels> {
-    let Some(p) = &args.ids else {
+    let Some(given) = &args.ids else {
         return Labels::from_id_map(index.id_map)
             .with_context(|| format!("{}: id map", args.file.display()));
     };
-    let ids: Vec<i64> =
-        serde_json::from_slice(&fs::read(p).with_context(|| format!("reading {}", p.display()))?)
+    let (ids, what) = match given {
+        Input::File(p) => {
+            let ids: Vec<i64> = serde_json::from_slice(
+                &fs::read(p).with_context(|| format!("reading {}", p.display()))?,
+            )
             .with_context(|| format!("{}: expected a JSON array of integer ids", p.display()))?;
-    // A map that does not name every vector exactly once can only be the
-    // wrong map; scoring with it would report the gap as unknown labels
-    // instead of saying why.
-    if ids.len() != vectors {
-        bail!(
-            "{}: {} ids for {vectors} vectors; --ids needs one per vector, in storage order",
-            p.display(),
-            ids.len()
-        );
-    }
-    Labels::from_ids(&ids).with_context(|| format!("reading {}", p.display()))
+            // A map that does not name every vector exactly once can only
+            // be the wrong map; scoring with it would report the gap as
+            // unknown labels instead of saying why.
+            if ids.len() != vectors {
+                bail!(
+                    "{}: {} ids for {vectors} vectors; --ids needs one per vector, in storage order",
+                    p.display(),
+                    ids.len()
+                );
+            }
+            (Cow::Owned(ids), format!("reading {}", p.display()))
+        }
+        Input::Data(ids) => {
+            if ids.len() != vectors {
+                bail!(
+                    "the ids given: {} for {vectors} vectors; one per vector is needed, in storage order",
+                    ids.len()
+                );
+            }
+            (Cow::Borrowed(ids.as_slice()), "the ids given".to_owned())
+        }
+    };
+    Labels::from_ids(&ids).with_context(|| what)
 }
 
-/// One list of labels per line: a JSON array, or an object with a
-/// `labels` array. Blank lines are skipped.
-fn read_results(path: &Path) -> Result<Vec<Vec<i64>>> {
+/// The result lists of `--results`: given, or read from a file of one
+/// list of labels per line, a JSON array or an object with a `labels`
+/// array, blank lines skipped.
+fn read_results(given: &Input<Vec<Vec<i64>>>) -> Result<Lists<'_>> {
     #[derive(serde::Deserialize)]
     #[serde(untagged)]
     enum Line {
         Labels(Vec<i64>),
         Object { labels: Vec<i64> },
     }
+    let path = match given {
+        Input::File(p) => p,
+        Input::Data(lists) if lists.is_empty() => bail!("no result lists given"),
+        Input::Data(lists) => return Ok(Cow::Borrowed(lists)),
+    };
     let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let mut results = Vec::new();
     for (i, line) in text.lines().enumerate() {
@@ -862,7 +989,7 @@ fn read_results(path: &Path) -> Result<Vec<Vec<i64>>> {
     if results.is_empty() {
         bail!("{}: no result lists", path.display());
     }
-    Ok(results)
+    Ok(Cow::Owned(results))
 }
 
 /// How the tool's own search of a graph ran, of `vectors` vectors, as the
@@ -929,17 +1056,18 @@ pub fn text(out: &Report) -> String {
             sample.count,
             sample.seed
         ),
-        (None, None) => push_line!(s, "  queries         {}", r.queries),
+        (None, None) => push_line!(s, "  queries         {} given", r.queries),
     }
+    let labels = match (&out.ids_file, out.ids_given) {
+        (Some(ids), _) => format!("from {ids}"),
+        (None, true) => "from the ids given".to_owned(),
+        (None, false) => "from the file's ID map".to_owned(),
+    };
     match (&out.results_file, &out.search) {
         (Some(p), _) => push_line!(
             s,
-            "  results         {} lists ({p}), labels {}",
-            r.queries,
-            out.ids_file.as_ref().map_or_else(
-                || "from the file's ID map".to_owned(),
-                |ids| format!("from {ids}")
-            )
+            "  results         {} lists ({p}), labels {labels}",
+            r.queries
         ),
         (None, Some(search)) if search.nprobes.is_some() => push_line!(
             s,
@@ -951,7 +1079,11 @@ pub fn text(out: &Report) -> String {
         (None, Some(search)) => {
             push_line!(s, "  results         {}", graph_search(search, out.vectors));
         }
-        (None, None) => push_line!(s, "  results         {} lists", r.queries),
+        (None, None) => push_line!(
+            s,
+            "  results         {} lists given, labels {labels}",
+            r.queries
+        ),
     }
     push_line!(
         s,
@@ -995,7 +1127,7 @@ mod tests {
     #[test]
     fn options_hold_together_as_the_command_line_holds_them() {
         let queries = Options {
-            queries: Some(PathBuf::from("q.f32")),
+            queries: Some(PathBuf::from("q.f32").into()),
             ..Options::default()
         };
         let sampled = Options {
@@ -1004,8 +1136,8 @@ mod tests {
             ..Options::default()
         };
         let scored = Options {
-            results: Some(PathBuf::from("r.jsonl")),
-            ids: Some(PathBuf::from("ids.json")),
+            results: Some(PathBuf::from("r.jsonl").into()),
+            ids: Some(PathBuf::from("ids.json").into()),
             ..queries.clone()
         };
         for options in [&queries, &sampled, &scored] {
@@ -1084,7 +1216,7 @@ mod tests {
     #[test]
     fn options_outside_their_ranges_are_refused() {
         let queries = Options {
-            queries: Some(PathBuf::from("q.f32")),
+            queries: Some(PathBuf::from("q.f32").into()),
             ..Options::default()
         };
         for options in [
@@ -1141,7 +1273,7 @@ mod tests {
     fn recall_refuses_contradictory_options_before_opening_the_file() {
         let options = Options {
             sample: Some(3),
-            ids: Some(PathBuf::from("ids.json")),
+            ids: Some(PathBuf::from("ids.json").into()),
             ..Options::default()
         };
         let e = recall(Path::new("no-such-file.faiss"), &options).unwrap_err();

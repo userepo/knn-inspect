@@ -1,0 +1,38 @@
+[build-system]
+requires = ["maturin>=1.15,<2"]
+build-backend = "maturin"
+
+[project]
+name = "knn-inspect"
+description = "Offline inspector for OpenSearch k-NN native segment files"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+# A copy of the repository's: a license file must lie inside the project.
+license-files = ["LICENSE"]
+authors = [{ name = "Ivan Petrouchtchak" }]
+keywords = ["opensearch", "k-nn", "faiss", "hnsw", "vector-search"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Rust",
+    "Topic :: Database",
+    "Typing :: Typed",
+]
+# The version is the extension crate's, which is the workspace's.
+dynamic = ["version"]
+
+[project.urls]
+Repository = "https://github.com/userepo/knn-inspect"
+Documentation = "https://github.com/userepo/knn-inspect/blob/main/python/README.md"
+
+[tool.maturin]
+module-name = "knn_inspect._native"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

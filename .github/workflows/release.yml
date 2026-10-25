@@ -1,7 +1,9 @@
-# Pushing a tag `v<version>` checks the tag against the Cargo version and
-# the README's install line, builds the CLI for each target, and opens a
-# draft release holding the archives and their SHA-256 sums. Publishing
-# the draft is a manual step. The toolchain comes from rust-toolchain.toml.
+# Pushing a tag `v<version>` checks the tag against the Cargo versions and
+# the README's install line, builds the CLI and the Python wheel for each
+# target and the Python sdist, and opens a draft release holding them and
+# their SHA-256 sums. Publishing the draft is a manual step, which sends
+# the wheels and the sdist to PyPI (publish-pypi.yml). The toolchain comes
+# from rust-toolchain.toml.
 name: Release
 
 on:
@@ -36,13 +38,20 @@ jobs:
             os: windows-2025
     steps:
       - uses: actions/checkout@v7
-      - name: Check that the tag matches the Cargo version and the README
+      - name: Check that the tag matches the Cargo versions and the README
         shell: bash
         run: |
           version="${GITHUB_REF_NAME#v}"
           cargo_version="$(cargo pkgid -p knn-inspect | sed 's/.*[#@]//')"
           if [ "$version" != "$cargo_version" ]; then
             echo "tag $GITHUB_REF_NAME but Cargo.toml says $cargo_version" >&2
+            exit 1
+          fi
+          # The Python package's version is its extension crate's, which
+          # is outside the workspace and kept in step by hand.
+          python_version="$(cargo pkgid --manifest-path python/Cargo.toml | sed 's/.*[#@]//')"
+          if [ "$version" != "$python_version" ]; then
+            echo "tag $GITHUB_REF_NAME but python/Cargo.toml says $python_version" >&2
             exit 1
           fi
           if ! grep -q -- "--tag $GITHUB_REF_NAME " README.md; then
@@ -83,9 +92,83 @@ jobs:
             knn-inspect-*.zip
           if-no-files-found: error
 
+  wheels:
+    name: Wheel (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # manylinux_2_28 (glibc), not the CLI's musl: pip on a glibc
+          # system takes no musllinux wheel.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-26.04
+            manylinux: "2_28"
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-26.04-arm
+            manylinux: "2_28"
+          - target: aarch64-apple-darwin
+            os: macos-26
+          - target: x86_64-pc-windows-msvc
+            os: windows-2025
+    steps:
+      - uses: actions/checkout@v7
+      # The oldest Python the abi3 wheel takes; the smoke test runs on it.
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - uses: PyO3/maturin-action@v1
+        with:
+          maturin-version: "1.15.0"
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          working-directory: python
+          args: --release --locked --out ../dist
+      - name: Smoke test
+        shell: bash
+        run: |
+          python -m venv "$RUNNER_TEMP/venv"
+          if [ "${{ runner.os }}" = Windows ]; then
+            py="$RUNNER_TEMP/venv/Scripts/python"
+          else
+            py="$RUNNER_TEMP/venv/bin/python"
+          fi
+          "$py" -m pip install --no-index dist/*.whl
+          "$py" -c 'import sys, knn_inspect; r = knn_inspect.verify(sys.argv[1]); print(r.text); assert r["status"] == "clean", r["status"]' \
+            fixtures/opensearch-3.9.0/nocfs/l2/_2_165_vec.faiss
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wheel-${{ matrix.target }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  sdist:
+    name: Python sdist
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: PyO3/maturin-action@v1
+        with:
+          maturin-version: "1.15.0"
+          command: sdist
+          working-directory: python
+          args: --out ../dist
+      # A wheel built from the sdist alone: it holds every crate the
+      # extension needs.
+      - name: Build from the sdist
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/python" -m pip install dist/*.tar.gz
+          "$RUNNER_TEMP/venv/bin/python" -c 'import knn_inspect; print(knn_inspect.__version__)'
+      - uses: actions/upload-artifact@v7
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
   release:
     name: Draft release
-    needs: build
+    needs: [build, wheels, sdist]
     runs-on: ubuntu-26.04
     permissions:
       contents: write

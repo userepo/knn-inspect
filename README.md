@@ -29,8 +29,32 @@ The macOS binary is not notarized; after unpacking, run
 `xattr -d com.apple.quarantine knn-inspect`. Or build from source:
 
 ```
-cargo install --git https://github.com/userepo/knn-inspect --tag v0.16.0 knn-inspect
+cargo install --git https://github.com/userepo/knn-inspect --tag v0.17.0 knn-inspect
 ```
+
+### Python
+
+The same five commands as Python functions, from Python 3.11, with wheels
+for the same platforms (Linux on glibc):
+
+```
+pip install knn-inspect
+```
+
+```python
+import numpy as np
+import knn_inspect
+
+report = knn_inspect.verify("_2_165_vec.faiss", space="cosine")
+print(report["status"], report.text)
+queries = np.random.default_rng(1).random((100, 128), dtype=np.float32)
+print(knn_inspect.recall("_2_165_vec.faiss", queries=queries, k=10)["recall"])
+```
+
+Each function returns the command's report as the dict its `--json`
+output parses to, with its text as `.text`; `recall` also takes queries
+as a numpy array or a list of vectors, and result lists and ids as
+Python lists. See [python/README.md](python/README.md).
 
 ## Usage
 

@@ -99,10 +99,10 @@ Each entry of `layers`:
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `file` | string | The path as given |
-| `queries_file` | string, optional | The `--queries` file: row-major little-endian float32, or for binary storage packed bits, a row the bytes of the file's code size, its dimension / 8 in a well-formed file (since 0.7.0) |
+| `queries_file` | string, optional | The `--queries` file: row-major little-endian float32, or for binary storage packed bits, a row the bytes of the file's code size, its dimension / 8 in a well-formed file (since 0.7.0); absent for queries given as data through the library (since 0.17.0) |
 | `sample` | object, optional | For `--sample`: `count` and `seed` |
-| `results_file` | string, optional | The `--results` file |
-| `ids_file` | string, optional | The `--ids` file |
+| `results_file` | string, optional | The `--results` file; absent for result lists given as data through the library (since 0.17.0) |
+| `ids_file` | string, optional | The `--ids` file; absent for ids given as data through the library (since 0.17.0) |
 | `search` | object, optional | For the tool's own search: `ef_search` used (a graph's) and `search_ms`; for an IVF index (since 0.15.0), `nprobes` (the count the search passed: `--nprobes`, or the file's `nprobe` as the int k-NN casts it to, which can exceed `nlist`) and `nlist` (its lists, of which it scanned the `min(nlist, nprobes)` nearest), and no `ef_search`; for a graph without its vectors (since 0.10.0), the index's `ef_search` and also `beam` (the graph search's), `rescore` (whether the first pass was rescored against the field's vectors in the `.vec`), and, when it was, `first_pass_k` (the first pass's results rescored); for a CAGRA graph (since 0.13.0), also `entry_points` (random entry points drawn per query: `--entry-points`, or the file's count, capped at the vector count for a graph without its vectors and at 65,536 draws for one with them; for a graph without its vectors, unused when `beam` reaches `vectors`, where every vector is scored, and every node, in order, when it equals `vectors`) and `seed` (of the draws: `--seed`, or 1; no longer used in either of those cases) |
 | `dimension`, `vectors` | integer | Of the file; for binary storage, `dimension` is the bits of the code size, which the queries must have (since 0.7.0); for a graph without its vectors, of the field's vectors in the `.vec`, float32, or fp16 for a `half_float` field (since 0.10.0; fp16 since 0.11.0), as for product-quantized codes, a graph's or an IVF index's (since 0.15.0); for any other IVF index, of the vectors its lists hold, by id (since 0.15.0) |
 | `metric` | string | As for `info` |

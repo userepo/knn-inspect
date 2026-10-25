@@ -169,17 +169,17 @@ impl RecallArgs {
     /// The search and scoring the arguments ask for.
     fn options(&self) -> recall::Options {
         recall::Options {
-            queries: self.queries.clone(),
+            queries: self.queries.clone().map(recall::Input::File),
             sample: self.sample,
             seed: self.seed,
             entry_points: self.entry_points,
-            results: self.results.clone(),
+            results: self.results.clone().map(recall::Input::File),
             k: self.k,
             ef_search: self.ef_search,
             nprobes: self.nprobes,
             oversample: self.oversample,
             no_rescore: self.no_rescore,
-            ids: self.ids.clone(),
+            ids: self.ids.clone().map(recall::Input::File),
         }
     }
 }
