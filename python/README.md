@@ -51,6 +51,80 @@ with the command's text as `report.text`.
 - `ids`: a sequence of ints naming node i as `ids[i]`, when the result
   lists use ids other than the file's labels.
 
+## Scoring a live index's results
+
+`recall` scores one segment's native file, whose labels are the
+segment's Lucene doc ids, while a search hit carries its `_id`. To score
+what a live index returned, give the index one shard merged to one
+segment, store each document's position in a field, name the hits by it,
+and pass `ids`: each document's position in doc-id order. With
+[opensearch-py](https://pypi.org/project/opensearch-py/):
+
+```python
+import numpy as np
+from opensearchpy import OpenSearch, helpers
+import knn_inspect
+
+client = OpenSearch("http://localhost:9200")
+name, dim, k = "vectors", 32, 10
+rng = np.random.default_rng(0)
+vectors = rng.random((2000, dim), dtype=np.float32)
+
+# One shard, and each document's position stored beside its vector.
+client.indices.create(index=name, body={
+    "settings": {"index": {"number_of_shards": 1, "number_of_replicas": 0, "knn": True}},
+    "mappings": {"properties": {
+        "pos": {"type": "integer"},
+        "vec": {"type": "knn_vector", "dimension": dim,
+                "method": {"name": "hnsw", "engine": "faiss", "space_type": "l2"}},
+    }},
+})
+helpers.bulk(client, ({"_index": name, "_id": str(i), "pos": i, "vec": v.tolist()}
+                      for i, v in enumerate(vectors)))
+
+# One segment: merged, then refreshed and flushed so the old ones go.
+client.indices.forcemerge(index=name, max_num_segments=1)
+client.indices.refresh(index=name)
+client.indices.flush(index=name)
+
+queries = rng.random((50, dim), dtype=np.float32)
+responses = [
+    client.search(index=name, body={
+        "size": k,
+        "query": {"knn": {"vec": {"vector": q.tolist(), "k": k}}},
+        "_source": ["pos"],
+    })
+    for q in queries
+]
+results = [[h["_source"]["pos"] for h in r["hits"]["hits"]] for r in responses]
+
+# Each document's pos in doc-id order: node i of the segment is ids[i].
+order = client.search(index=name, body={"size": len(vectors), "sort": ["_doc"], "_source": ["pos"]})
+ids = [h["_source"]["pos"] for h in order["hits"]["hits"]]
+```
+
+Then copy the shard's `index` directory off the node: it is
+`nodes/0/indices/<uuid>/0/index` under the node's data path, the uuid
+from `client.indices.get_settings(index=name)[name]["settings"]["index"]["uuid"]`.
+Copy the whole directory, not only the native file: for a field whose
+graph holds no vectors (`on_disk`), `recall` reads the segment's `.vec`
+as well. The native file is `.faiss`, or `.faissc` in a segment small
+enough for Lucene's compound file.
+
+```python
+from pathlib import Path
+
+segment = next(Path("index").glob("*.faiss*"))
+report = knn_inspect.recall(segment, queries=queries, results=results, ids=ids, k=k)
+print(report["recall"])
+```
+
+Leave out `ids` and the positions are read as doc ids, which need not
+follow insertion order once segments have merged: the recall can then
+come out wrong, with no error. An index of more than 10,000 documents
+needs `search_after` for the `_doc`-sorted listing, past the default
+`index.max_result_window`.
+
 ## Errors and warnings
 
 A report that cannot be built raises `knn_inspect.Error`, its message
