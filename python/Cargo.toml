@@ -6,7 +6,7 @@
 [package]
 name = "knn-inspect-py"
 description = "The Python package's extension module: knn-report's reports for knn_inspect"
-version = "0.17.0"
+version = "0.18.0"
 edition = "2024"
 rust-version = "1.99"
 authors = ["Ivan Petrouchtchak"]

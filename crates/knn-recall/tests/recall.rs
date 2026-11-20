@@ -502,7 +502,7 @@ fn binary_and_float_queries_do_not_mix() {
     );
     assert_eq!(
         err.to_string(),
-        "the file holds binary vectors, but the queries are float32"
+        "the vectors are binary, but the queries are float32"
     );
     let b = Built::l2(&[&[0.0, 0.0]]);
     let bits = Queries::from_bits(&[0x00, 0x00], 16).unwrap();

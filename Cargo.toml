@@ -11,7 +11,7 @@ members = [
 exclude = ["fuzz", "python"]
 
 [workspace.package]
-version = "0.17.0"
+version = "0.18.0"
 edition = "2024"
 rust-version = "1.99"
 authors = ["Ivan Petrouchtchak"]
@@ -28,7 +28,7 @@ knn-report = { path = "crates/knn-report" }
 # knn-format: the mapping, unaligned little-endian views, the footer CRC.
 memmap2 = "0.9.12"
 zerocopy = "0.8.63"
-crc32fast = "1.5.3"
+crc32fast = "1.5.5"
 thiserror = "2.0.21"
 
 # knn-recall: brute force in parallel over queries.
@@ -43,7 +43,7 @@ serde_json = { version = "1.0.154", features = ["float_roundtrip"] }
 memchr = "2.8.3"
 
 # knn-inspect: the CLI that prints the reports.
-clap = { version = "4.6.7", features = ["derive"] }
+clap = { version = "4.6.9", features = ["derive"] }
 anyhow = "1.0.104"
 
 [workspace.lints.rust]

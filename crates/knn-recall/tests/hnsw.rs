@@ -643,6 +643,39 @@ fn a_cagra_graph_is_searched_from_random_entries() {
 }
 
 #[test]
+fn a_searcher_moves_between_graphs_of_other_sizes() {
+    // Its table of the nodes seen is sized anew for each graph: kept from
+    // a smaller one, it would hide the larger one's other nodes.
+    let load = |name: &str| fs::read(fixtures().join(format!("synthetic-cagra/{name}.faiss")));
+    let (small, large) = (
+        load("l2-100x64-cagra").unwrap(),
+        load("l2-1000x64-cagra").unwrap(),
+    );
+    let (small, large) = (
+        knn_format::parse(&small).unwrap(),
+        knn_format::parse(&large).unwrap(),
+    );
+    let (small, large) = (small.index.hnsw().unwrap(), large.index.hnsw().unwrap());
+    let query = [0.25_f32; 64];
+    let alone = |index: &HnswIndex<'_>| {
+        Searcher::new(index.graph.node_count())
+            .search(index, &query, 10, 100, Draw::default())
+            .unwrap()
+    };
+    let mut moved = Searcher::new(small.graph.node_count());
+    for index in [small, large, small, large] {
+        assert_eq!(
+            moved
+                .search(index, &query, 10, 100, Draw::default())
+                .unwrap(),
+            alone(index)
+        );
+    }
+    // The larger graph's results lie past the smaller one's nodes too.
+    assert!(alone(large).iter().any(|hit| hit.node >= 100));
+}
+
+#[test]
 fn the_seed_steers_a_cagra_graphs_entry_draw() {
     // Golden values pin the draw stream: a search that ignored the seed
     // or the count (one draw at ef 1 reaches only the entry's own

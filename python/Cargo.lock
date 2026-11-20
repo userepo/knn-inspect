@@ -10,9 +10,9 @@ checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 
 [[package]]
 name = "crc32fast"
-version = "1.5.3"
+version = "1.5.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ba106e844045ddc02c20768ac4b0b7cb45f2cc2ecbd833ac9f5dacb183c2055"
+checksum = "2b929dd2a135771f40afabd1073f85eed59c800b7c61901e5c254270497dad64"
 dependencies = [
  "cfg-if",
 ]
@@ -62,7 +62,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "knn-check"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "knn-format",
  "serde",
@@ -70,7 +70,7 @@ dependencies = [
 
 [[package]]
 name = "knn-format"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "crc32fast",
  "memmap2",
@@ -80,7 +80,7 @@ dependencies = [
 
 [[package]]
 name = "knn-inspect-py"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "knn-check",
  "knn-report",
@@ -91,7 +91,7 @@ dependencies = [
 
 [[package]]
 name = "knn-recall"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "knn-format",
  "rayon",
@@ -101,7 +101,7 @@ dependencies = [
 
 [[package]]
 name = "knn-report"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "knn-check",
  "knn-format",

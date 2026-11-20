@@ -114,111 +114,132 @@ impl Searcher {
         let query = query.into();
         let storage = index.storage.as_ref().ok_or(Error::NoVectors)?;
         let scorer = Scorer::of(storage, query)?;
-        let distance = scorer.distance;
         let graph = &index.graph;
-        if self.visited.len() != graph.node_count() {
-            self.visited = vec![0; graph.node_count()];
-            self.stamp = 1;
-        }
-        let dist_to = |node: usize| scorer.to(node);
-
-        let (nearest, d_nearest) = if let Some(cagra) = index.kind.cagra() {
-            // `IndexHNSWCagra::search`: the nearest of the file's count of
-            // nodes drawn with replacement, the first drawn winning a tie.
-            // A count of 0 or less draws nothing and finds nothing, where
+        if let Some(cagra) = index.kind.cagra() {
+            // The file's count of draws, unless the caller gives one. A
+            // count of 0 or less draws nothing and finds nothing, where
             // k-NN's search of such a file fails.
             let count = draw
                 .count
-                .unwrap_or_else(|| usize::try_from(cagra.search_entry_points).unwrap_or(0))
-                .min(crate::MAX_ENTRY_DRAWS);
-            let Some(nodes) = u64::try_from(graph.node_count()).ok().filter(|&n| n > 0) else {
-                return Ok(Vec::new());
-            };
-            let mut state = draw.entry_state();
-            let mut best: Option<(usize, f32)> = None;
-            for _ in 0..count {
-                let Ok(node) = usize::try_from(crate::splitmix64(&mut state) % nodes) else {
-                    continue;
-                };
-                // Faiss's strict `<` against FLT_MAX: a NaN distance
-                // never enters, and among equals the first drawn stays.
-                if let Some(d) = dist_to(node)
-                    && d < best.map_or(f32::MAX, |(_, b)| b)
-                {
-                    best = Some((node, d));
-                }
-            }
-            let Some(found) = best else {
-                return Ok(Vec::new());
-            };
-            found
-        } else {
-            // Greedy descent: on each upper level, move to the closest
-            // neighbor until none is closer.
-            let Some(mut nearest) = usize::try_from(graph.entry_point)
-                .ok()
-                .filter(|&e| e < graph.node_count())
-            else {
-                return Ok(Vec::new());
-            };
-            let Some(mut d_nearest) = dist_to(nearest) else {
-                return Ok(Vec::new());
-            };
-            // Levels come from `max_level`, capped by the levels the per-level
-            // table describes, so a corrupt `max_level` cannot make the
-            // descent spin through billions of empty levels.
-            let described = graph.cum_nneighbor_per_level.len().saturating_sub(1);
-            let top = usize::try_from(graph.max_level)
-                .unwrap_or(0)
-                .min(described.saturating_sub(1));
-            for level in (1..=top).rev() {
-                loop {
-                    let prev = nearest;
-                    for v in neighbor_list(graph, prev, level) {
-                        if let Some(dv) = dist_to(v)
-                            && dv < d_nearest
-                        {
-                            nearest = v;
-                            d_nearest = dv;
-                        }
-                    }
-                    if nearest == prev {
-                        break;
-                    }
-                }
-            }
-            (nearest, d_nearest)
-        };
+                .unwrap_or_else(|| usize::try_from(cagra.search_entry_points).unwrap_or(0));
+            return Ok(self.search_drawn(graph, &scorer, count, k, ef_search, draw));
+        }
 
+        // Greedy descent: on each upper level, move to the closest
+        // neighbor until none is closer.
+        let Some(mut nearest) = usize::try_from(graph.entry_point)
+            .ok()
+            .filter(|&e| e < graph.node_count())
+        else {
+            return Ok(Vec::new());
+        };
+        let Some(mut d_nearest) = scorer.to(nearest) else {
+            return Ok(Vec::new());
+        };
+        // Levels come from `max_level`, capped by the levels the per-level
+        // table describes, so a corrupt `max_level` cannot make the
+        // descent spin through billions of empty levels.
+        let described = graph.cum_nneighbor_per_level.len().saturating_sub(1);
+        let top = usize::try_from(graph.max_level)
+            .unwrap_or(0)
+            .min(described.saturating_sub(1));
+        for level in (1..=top).rev() {
+            loop {
+                let prev = nearest;
+                for v in neighbor_list(graph, prev, level) {
+                    if let Some(dv) = scorer.to(v)
+                        && dv < d_nearest
+                    {
+                        nearest = v;
+                        d_nearest = dv;
+                    }
+                }
+                if nearest == prev {
+                    break;
+                }
+            }
+        }
+        Ok(self.search_level_0(graph, &scorer, (nearest, d_nearest), k, ef_search))
+    }
+
+    /// `IndexHNSWCagra::search` over `graph`, a file's or one in host
+    /// memory: the level-0 search from the nearest of `count` nodes drawn
+    /// with replacement by `draw`'s seed, the first drawn winning a tie.
+    /// Nothing when no draw has a distance. `k` is at least 1.
+    pub(crate) fn search_drawn<G: Level0>(
+        &mut self,
+        graph: &G,
+        scorer: &Scorer<'_, '_>,
+        count: usize,
+        k: usize,
+        ef_search: usize,
+        draw: Draw,
+    ) -> Vec<Hit> {
+        let Some(nodes) = u64::try_from(graph.node_count()).ok().filter(|&n| n > 0) else {
+            return Vec::new();
+        };
+        let mut state = draw.entry_state();
+        let mut best: Option<(usize, f32)> = None;
+        for _ in 0..count.min(crate::MAX_ENTRY_DRAWS) {
+            let Ok(node) = usize::try_from(crate::splitmix64(&mut state) % nodes) else {
+                continue;
+            };
+            // Faiss's strict `<` against FLT_MAX: a NaN distance
+            // never enters, and among equals the first drawn stays.
+            if let Some(d) = scorer.to(node)
+                && d < best.map_or(f32::MAX, |(_, b)| b)
+            {
+                best = Some((node, d));
+            }
+        }
+        best.map_or_else(Vec::new, |entry| {
+            self.search_level_0(graph, scorer, entry, k, ef_search)
+        })
+    }
+
+    /// The best-first search of level 0 from `entry`, a node and its
+    /// distance.
+    fn search_level_0<G: Level0>(
+        &mut self,
+        graph: &G,
+        scorer: &Scorer<'_, '_>,
+        entry: (usize, f32),
+        k: usize,
+        ef_search: usize,
+    ) -> Vec<Hit> {
+        let nodes = graph.node_count();
+        if self.visited.len() != nodes {
+            self.visited = vec![0; nodes];
+            self.stamp = 1;
+        }
         // Faiss sizes the queue at max(efSearch, k). Each node enters it at
         // most once, so a queue with a slot per node never fills and never
         // evicts, the same as Faiss's larger one; the cap only keeps a huge
         // k or efSearch from reserving memory for nothing.
-        let nodes = graph.node_count();
         let mut candidates = MinimaxHeap::new(ef_search.max(k).min(nodes));
-        candidates.push(nearest, d_nearest);
+        candidates.push(entry.0, entry.1);
         let mut results = Results::new(k, nodes);
-        self.search_from_candidates(graph, &dist_to, &mut candidates, &mut results, ef_search);
+        self.search_from_candidates(graph, scorer, &mut candidates, &mut results, ef_search);
         self.advance();
 
-        Ok(results
+        results
             .sorted()
             .into_iter()
             .map(|e| Hit {
                 node: e.node,
-                distance: match distance {
+                distance: match scorer.distance {
                     Distance::L2 | Distance::Hamming => e.dis,
                     Distance::NegatedInnerProduct => -e.dis,
                 },
             })
-            .collect())
+            .collect()
     }
 
     /// Faiss's `search_from_candidates` on level 0.
-    fn search_from_candidates(
+    fn search_from_candidates<G: Level0>(
         &mut self,
-        graph: &HnswGraph<'_>,
-        dist_to: &dyn Fn(usize) -> Option<f32>,
+        graph: &G,
+        scorer: &Scorer<'_, '_>,
         candidates: &mut MinimaxHeap,
         results: &mut Results,
         ef_search: usize,
@@ -246,7 +267,7 @@ impl Searcher {
                 break;
             }
             threshold = results.threshold();
-            for v1 in neighbor_list(graph, v0, 0) {
+            for v1 in graph.level_0(v0) {
                 if v1 >= self.visited.len() {
                     continue;
                 }
@@ -255,7 +276,7 @@ impl Searcher {
                 if seen {
                     continue;
                 }
-                let Some(dis) = dist_to(v1) else {
+                let Some(dis) = scorer.to(v1) else {
                     continue;
                 };
                 if dis < threshold && results.add(dis, v1) {
@@ -284,6 +305,28 @@ impl Searcher {
         } else {
             self.stamp = self.stamp.saturating_add(1);
         }
+    }
+}
+
+/// What the level-0 search walks: a file's graph, or one in host memory
+/// ([`crate::host::Graph`]).
+pub(crate) trait Level0 {
+    /// Nodes in the graph.
+    fn node_count(&self) -> usize;
+
+    /// The neighbors of `node` on level 0 as a search reads them, none
+    /// for a node the graph does not have. Ids are not checked against
+    /// the node count.
+    fn level_0(&self, node: usize) -> impl Iterator<Item = usize>;
+}
+
+impl Level0 for HnswGraph<'_> {
+    fn node_count(&self) -> usize {
+        HnswGraph::node_count(self)
+    }
+
+    fn level_0(&self, node: usize) -> impl Iterator<Item = usize> {
+        neighbor_list(self, node, 0)
     }
 }
 
@@ -343,7 +386,7 @@ pub fn search_all(
 /// distances to the sub-quantizer centroids, as `IndexPQ`'s distance
 /// computer scores codes (see [`crate::pq`]); an inner product negated,
 /// as Faiss's HNSW search negates it.
-struct Scorer<'a, 'q> {
+pub(crate) struct Scorer<'a, 'q> {
     distance: Distance,
     with: With<'a, 'q>,
 }
@@ -380,6 +423,14 @@ impl<'a, 'q> Scorer<'a, 'q> {
             _ => With::Vectors(Vectors::of(storage)?, query),
         };
         Ok(Self { distance, with })
+    }
+
+    /// Scores nodes by `vectors`, which `query` has been checked against.
+    pub(crate) fn over(vectors: Vectors<'a>, distance: Distance, query: Query<'q>) -> Self {
+        Self {
+            distance,
+            with: With::Vectors(vectors, query),
+        }
     }
 
     /// Node `node`'s distance, smaller closer, or `None` when it has no

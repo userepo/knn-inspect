@@ -26,6 +26,9 @@
 //! vectors: [`on_disk::field_vectors`] gives their field's in the `.vec`
 //! for the ground truth. [`sample_queries`] draws queries from the file's
 //! vectors.
+//! [`host`] gives the same sampling, ground truth, search and score for a
+//! CAGRA index that is still vectors and a graph in memory, with the
+//! results its file would give.
 //! [`quantizer`] ports Lucene's `OptimizedScalarQuantizer`, which wrote
 //! the quantized vectors Lucene keeps for a graph without its own,
 //! [`quantized_scorer`] the scorer of a query against them,
@@ -59,6 +62,7 @@
 
 mod faiss_heap;
 mod hnsw;
+pub mod host;
 mod ivf;
 pub mod lucene_search;
 pub mod on_disk;
@@ -81,6 +85,7 @@ use serde::Serialize;
 
 /// What can go wrong before any distance is computed.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     /// The query bytes do not hold whole rows.
     #[error(
@@ -98,10 +103,11 @@ pub enum Error {
     /// No query rows.
     #[error("no queries")]
     NoQueries,
-    /// The file's dimension is zero or negative.
+    /// The dimension of a file or of vectors in host memory is zero or
+    /// negative.
     #[error("dimension {d} is not usable")]
     Dimension {
-        /// As stored.
+        /// As stored or given.
         d: i32,
     },
     /// A binary dimension counts bits, packed eight to a byte.
@@ -116,19 +122,20 @@ pub enum Error {
         /// As stored.
         code_size: i32,
     },
-    /// The queries have a different dimension than the file.
-    #[error("queries have dimension {queries}, the file {file}")]
+    /// The queries have a different dimension than the vectors, a file's
+    /// or ones in host memory.
+    #[error("queries have dimension {queries}, the vectors {file}")]
     DimensionMismatch {
-        /// The file's.
+        /// The vectors'.
         file: usize,
         /// The queries'.
         queries: usize,
     },
-    /// Float32 queries for a binary file, or binary queries for another.
-    #[error("the file holds {file} vectors, but the queries are {queries}")]
+    /// Float32 queries for binary vectors, or binary queries for others.
+    #[error("the vectors are {file}, but the queries are {queries}")]
     QueryKind {
-        /// The file's vectors: `float32` (any non-binary storage, which
-        /// decodes to float32) or `binary`.
+        /// The vectors, a file's or ones in host memory: `float32` (any
+        /// non-binary storage, which decodes to float32) or `binary`.
         file: &'static str,
         /// The queries'.
         queries: &'static str,
@@ -368,12 +375,43 @@ pub enum Error {
         /// The node.
         node: usize,
     },
-    /// More sample queries asked for than the file has vectors.
+    /// More sample queries asked for than there are vectors, a file's or
+    /// ones in host memory.
     #[error("cannot sample {count} queries from {rows} vectors")]
     SampleTooLarge {
         /// Queries asked for.
         count: usize,
-        /// Vectors in the file.
+        /// Vectors there are.
+        rows: usize,
+    },
+    /// Values in host memory that are not whole rows: vectors of their
+    /// dimension, or a graph's neighbors of its row length.
+    #[error("{len} {what} is not a multiple of {row}, the length of a row")]
+    HostRows {
+        /// What was given: `vector values`, `bytes of bits`, or
+        /// `neighbor ids`.
+        what: &'static str,
+        /// How many.
+        len: usize,
+        /// A row's.
+        row: usize,
+    },
+    /// A graph in host memory of a degree no file's graph can have.
+    #[error(
+        "a graph of degree {degree} is below {}, the least a file can hold",
+        host::MIN_DEGREE
+    )]
+    HostDegree {
+        /// Neighbor ids to a node, as given.
+        degree: usize,
+    },
+    /// A graph in host memory with another number of nodes than the
+    /// vectors have rows.
+    #[error("the graph has {nodes} nodes, the vectors {rows} rows")]
+    HostNodes {
+        /// The graph's nodes.
+        nodes: usize,
+        /// The vectors' rows.
         rows: usize,
     },
 }
@@ -687,7 +725,11 @@ pub fn sample_queries(
     count: usize,
     seed: u64,
 ) -> Result<(Queries, Vec<usize>)> {
-    let vectors = Vectors::of(storage)?;
+    sample(&Vectors::of(storage)?, count, seed)
+}
+
+/// [`sample_queries`] over `vectors`.
+fn sample(vectors: &Vectors<'_>, count: usize, seed: u64) -> Result<(Queries, Vec<usize>)> {
     let rows = vectors.rows();
     if count > rows {
         return Err(Error::SampleTooLarge { count, rows });
@@ -771,9 +813,9 @@ pub struct Draw {
     /// first drawn entry would be its own row, and its search would start
     /// at the exact answer.
     pub seed: u64,
-    /// Nodes drawn per query; the file's entry-point count when `None`.
-    /// A search over the file's own vectors draws at most
-    /// [`MAX_ENTRY_DRAWS`] times.
+    /// Nodes drawn per query; the file's entry-point count when `None`,
+    /// or a [`host::Graph`]'s. A search over the file's own vectors, or
+    /// over ones in host memory, draws at most [`MAX_ENTRY_DRAWS`] times.
     pub count: Option<usize>,
 }
 
@@ -811,13 +853,14 @@ impl Draw {
 /// every CAGRA search's result lists.
 const ENTRY_STREAM: u64 = 0x7FB5_D329_728E_A185;
 
-/// The most entry nodes one query's search over the file's own vectors
-/// draws: far past any count a build writes (the remote builder's
-/// default is 32, faiss-cpu 1.15.1's 256), so only a corrupt count or an
-/// override past it is cut, and a file declaring billions of draws costs
-/// each query 65,536 distances, not billions. A graph without its
-/// vectors needs no such cap: its distinct draws never exceed the vector
-/// count, and a count near it is drawn over a dense permutation.
+/// The most entry nodes one query's search over the file's own vectors,
+/// or over ones in host memory, draws: far past any count a build writes
+/// (the remote builder's default is 32, faiss-cpu 1.15.1's 256), so only
+/// a corrupt count or an override past it is cut, and a file declaring
+/// billions of draws costs each query 65,536 distances, not billions. A
+/// graph without its vectors needs no such cap: its distinct draws never
+/// exceed the vector count, and a count near it is drawn over a dense
+/// permutation.
 pub const MAX_ENTRY_DRAWS: usize = 1 << 16;
 
 /// `SplitMix64`: a small, well-distributed generator with no dependency.
@@ -936,11 +979,45 @@ static HALVES: LazyLock<Box<[f32; 1 << 16]>> = LazyLock::new(|| {
 impl Decode for Fp16 {
     type Code = U16;
     fn value(code: U16) -> f32 {
-        // A u16 always indexes the table, so the fallback never runs.
-        HALVES
-            .get(usize::from(code.get()))
-            .copied()
-            .unwrap_or(f32::NAN)
+        half(code.get())
+    }
+}
+
+/// A half float's value, by its bits.
+fn half(bits: u16) -> f32 {
+    // A u16 always indexes the table, so the fallback never runs.
+    HALVES.get(usize::from(bits)).copied().unwrap_or(f32::NAN)
+}
+
+/// Float32 values in host memory.
+struct HostF32;
+
+impl Decode for HostF32 {
+    type Code = f32;
+    fn value(code: f32) -> f32 {
+        code
+    }
+}
+
+/// Half floats in host memory, by their bits, decoded as [`Fp16`] codes
+/// are.
+struct HostFp16;
+
+impl Decode for HostFp16 {
+    type Code = u16;
+    fn value(code: u16) -> f32 {
+        half(code)
+    }
+}
+
+/// Int8 values in host memory: what a [`Byte`] code decodes to, the file
+/// storing each plus 128.
+struct HostI8;
+
+impl Decode for HostI8 {
+    type Code = i8;
+    fn value(code: i8) -> f32 {
+        f32::from(code)
     }
 }
 
@@ -961,6 +1038,12 @@ enum Codes<'a> {
     Byte(&'a [u8]),
     /// Packed bits, `d` bytes per row.
     Bits(&'a [u8]),
+    /// Float32 values in host memory ([`host`]).
+    HostF32(&'a [f32]),
+    /// Half floats in host memory, by their bits.
+    HostFp16(&'a [u16]),
+    /// Int8 values in host memory.
+    HostI8(&'a [i8]),
 }
 
 impl<'a> Vectors<'a> {
@@ -1000,7 +1083,13 @@ impl<'a> Vectors<'a> {
     fn dimension(&self) -> usize {
         match self.codes {
             Codes::Bits(_) => self.d.saturating_mul(8),
-            Codes::F32(_) | Codes::Fp16(_) | Codes::Bf16(_) | Codes::Byte(_) => self.d,
+            Codes::F32(_)
+            | Codes::Fp16(_)
+            | Codes::Bf16(_)
+            | Codes::Byte(_)
+            | Codes::HostF32(_)
+            | Codes::HostFp16(_)
+            | Codes::HostI8(_) => self.d,
         }
     }
 
@@ -1008,7 +1097,13 @@ impl<'a> Vectors<'a> {
     fn kind(&self) -> &'static str {
         match self.codes {
             Codes::Bits(_) => BINARY,
-            Codes::F32(_) | Codes::Fp16(_) | Codes::Bf16(_) | Codes::Byte(_) => FLOAT32,
+            Codes::F32(_)
+            | Codes::Fp16(_)
+            | Codes::Bf16(_)
+            | Codes::Byte(_)
+            | Codes::HostF32(_)
+            | Codes::HostFp16(_)
+            | Codes::HostI8(_) => FLOAT32,
         }
     }
 
@@ -1018,6 +1113,9 @@ impl<'a> Vectors<'a> {
             Codes::F32(c) => c.len() / self.d,
             Codes::Fp16(c) | Codes::Bf16(c) => c.len() / self.d,
             Codes::Byte(c) | Codes::Bits(c) => c.len() / self.d,
+            Codes::HostF32(c) => c.len() / self.d,
+            Codes::HostFp16(c) => c.len() / self.d,
+            Codes::HostI8(c) => c.len() / self.d,
         }
     }
 
@@ -1031,6 +1129,11 @@ impl<'a> Vectors<'a> {
             (Codes::Fp16(c), Query::Floats(q)) => distance.between::<Fp16>(c.get(range)?, q),
             (Codes::Bf16(c), Query::Floats(q)) => distance.between::<Bf16>(c.get(range)?, q),
             (Codes::Byte(c), Query::Floats(q)) => distance.between::<Byte>(c.get(range)?, q),
+            (Codes::HostF32(c), Query::Floats(q)) => distance.between::<HostF32>(c.get(range)?, q),
+            (Codes::HostFp16(c), Query::Floats(q)) => {
+                distance.between::<HostFp16>(c.get(range)?, q)
+            }
+            (Codes::HostI8(c), Query::Floats(q)) => distance.between::<HostI8>(c.get(range)?, q),
             (Codes::Bits(c), Query::Bits(q)) => hamming(c.get(range)?, q),
             _ => return None,
         })
@@ -1051,6 +1154,9 @@ impl<'a> Vectors<'a> {
             Codes::Fp16(c) => out.extend(decoded::<Fp16>(c.get(range))),
             Codes::Bf16(c) => out.extend(decoded::<Bf16>(c.get(range))),
             Codes::Byte(c) => out.extend(decoded::<Byte>(c.get(range))),
+            Codes::HostF32(c) => out.extend(decoded::<HostF32>(c.get(range))),
+            Codes::HostFp16(c) => out.extend(decoded::<HostFp16>(c.get(range))),
+            Codes::HostI8(c) => out.extend(decoded::<HostI8>(c.get(range))),
             Codes::Bits(_) => {}
         }
     }
@@ -1171,6 +1277,12 @@ pub fn ground_truth(storage: &Storage<'_>, queries: &Queries, k: usize) -> Resul
     }
     let vectors = checked_vectors(storage, queries)?;
     let distance = Distance::of_storage(storage)?;
+    Ok(exact(vectors, distance, queries, k))
+}
+
+/// [`ground_truth`] over `vectors`, which `queries` have been checked
+/// against.
+fn exact(vectors: Vectors<'_>, distance: Distance, queries: &Queries, k: usize) -> GroundTruth {
     let d = vectors.d;
     let nearest_per_query = queries
         .rows()
@@ -1181,6 +1293,9 @@ pub fn ground_truth(storage: &Storage<'_>, queries: &Queries, k: usize) -> Resul
             (Codes::Fp16(c), Query::Floats(q)) => nearest::<Fp16>(c, d, distance, q, k),
             (Codes::Bf16(c), Query::Floats(q)) => nearest::<Bf16>(c, d, distance, q, k),
             (Codes::Byte(c), Query::Floats(q)) => nearest::<Byte>(c, d, distance, q, k),
+            (Codes::HostF32(c), Query::Floats(q)) => nearest::<HostF32>(c, d, distance, q, k),
+            (Codes::HostFp16(c), Query::Floats(q)) => nearest::<HostFp16>(c, d, distance, q, k),
+            (Codes::HostI8(c), Query::Floats(q)) => nearest::<HostI8>(c, d, distance, q, k),
             (Codes::Bits(c), Query::Bits(q)) => {
                 keep_nearest(c.chunks_exact(d).map(|v| hamming(v, q)), c.len() / d, k)
             }
@@ -1191,10 +1306,10 @@ pub fn ground_truth(storage: &Storage<'_>, queries: &Queries, k: usize) -> Resul
             },
         })
         .collect();
-    Ok(GroundTruth {
+    GroundTruth {
         k,
         queries: nearest_per_query,
-    })
+    }
 }
 
 /// One query's exhaustive pass over every whole row of `codes`.
@@ -1280,6 +1395,15 @@ pub fn score(
     truth: &GroundTruth,
     results: &[Vec<i64>],
 ) -> Result<Recall> {
+    paired(queries, truth, results)?;
+    let vectors = checked_vectors(storage, queries)?;
+    let distance = Distance::of_storage(storage)?;
+    let node_of = |label| labels.node(label);
+    Ok(scored(vectors, distance, node_of, queries, truth, results))
+}
+
+/// `Ok` when there is a result list and a ground truth for every query.
+fn paired(queries: &Queries, truth: &GroundTruth, results: &[Vec<i64>]) -> Result<()> {
     if results.len() != queries.len() {
         return Err(Error::ResultCount {
             results: results.len(),
@@ -1292,8 +1416,20 @@ pub fn score(
             queries: queries.len(),
         });
     }
-    let vectors = checked_vectors(storage, queries)?;
-    let distance = Distance::of_storage(storage)?;
+    Ok(())
+}
+
+/// [`score`] over `vectors`, a label's node given by `node_of`; the lists,
+/// the truth and the queries pair up, and the queries are of the vectors'
+/// kind and dimension.
+fn scored(
+    vectors: Vectors<'_>,
+    distance: Distance,
+    node_of: impl Fn(i64) -> Option<usize>,
+    queries: &Queries,
+    truth: &GroundTruth,
+    results: &[Vec<i64>],
+) -> Recall {
     let k = truth.k();
     let k_effective = truth.queries.iter().map(|n| n.found).max().unwrap_or(0);
     let possible = truth
@@ -1332,9 +1468,7 @@ pub fn score(
                 recall.duplicates = recall.duplicates.saturating_add(1);
                 continue;
             }
-            let Some(dist) = labels
-                .node(label)
-                .and_then(|node| vectors.distance(distance, node, q))
+            let Some(dist) = node_of(label).and_then(|node| vectors.distance(distance, node, q))
             else {
                 recall.unknown = recall.unknown.saturating_add(1);
                 continue;
@@ -1353,7 +1487,7 @@ pub fn score(
         recall.matches.push(matches);
     }
     recall.recall = ratio(total, possible);
-    Ok(recall)
+    recall
 }
 
 /// `numerator / denominator`, 0 for an empty denominator.
