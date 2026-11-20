@@ -72,6 +72,10 @@ enum Formats {
 
 /// The graph's quantized vectors compared with Lucene's files.
 #[derive(Debug, Clone, Serialize)]
+#[expect(
+    missing_docs,
+    reason = "JSON output fields, documented in docs/json.md"
+)]
 pub struct LuceneQuantized {
     pub status: CrossCheck,
     /// The field the segment's `.fnm` ties the native file to.

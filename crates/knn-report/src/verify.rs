@@ -34,6 +34,10 @@ impl Options {
 /// What `verify` reports of a native file: the checks, under the file and
 /// the space type they were run for.
 #[derive(Debug, Clone, Serialize)]
+#[expect(
+    missing_docs,
+    reason = "JSON output fields, documented in docs/json.md"
+)]
 pub struct Report {
     pub file: String,
     pub size: usize,

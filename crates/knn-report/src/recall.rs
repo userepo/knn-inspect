@@ -246,6 +246,10 @@ impl std::ops::Deref for Args<'_> {
 
 /// What `recall` reports: the recall, and what it was measured over.
 #[derive(Debug, Clone, Serialize)]
+#[expect(
+    missing_docs,
+    reason = "JSON output fields, documented in docs/json.md"
+)]
 pub struct Report {
     pub file: String,
     /// The `queries` file; absent for queries given as data.
@@ -281,6 +285,10 @@ pub struct Report {
 /// Queries sampled from the file's own vectors, or for a file without
 /// exact vectors from the field's in the `.vec`.
 #[derive(Debug, Clone, Serialize)]
+#[expect(
+    missing_docs,
+    reason = "JSON output fields, documented in docs/json.md"
+)]
 pub struct Sample {
     pub count: usize,
     pub seed: u64,
@@ -289,6 +297,10 @@ pub struct Sample {
 /// How the tool's own search ran: the settings that apply to the file,
 /// and how long it took.
 #[derive(Debug, Clone, Serialize)]
+#[expect(
+    missing_docs,
+    reason = "JSON output fields, documented in docs/json.md"
+)]
 pub struct OwnSearch {
     /// For a graph: the candidate queue's size.
     #[serde(skip_serializing_if = "Option::is_none")]

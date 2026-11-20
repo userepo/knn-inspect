@@ -2,6 +2,11 @@
 //!
 //! Everything above this module sees a plain `&[u8]`.
 
+#![expect(
+    unsafe_code,
+    reason = "mapping a file is the one operation the workspace cannot do in safe Rust"
+)]
+
 use std::fs::File;
 use std::io;
 use std::path::Path;

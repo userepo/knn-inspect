@@ -2080,7 +2080,7 @@ fn read_hnsw<'a>(
     hnsw_header: IndexHeader,
 ) -> Result<HnswIndex<'a>> {
     let kind = if [FourCc::HNSW_CAGRA, FourCc::HNSW_CAGRA_OLD].contains(&hnsw_fourcc) {
-        GraphKind::Cagra(CagraFields::read(cur, hnsw_fourcc == FourCc::HNSW_CAGRA)?)
+        GraphKind::Cagra(CagraFields::read(cur, hnsw_fourcc)?)
     } else {
         GraphKind::Hnsw
     };
@@ -2158,14 +2158,14 @@ fn read_hnsw<'a>(
 
 impl CagraFields {
     /// Reads the fields that follow a CAGRA graph's header: two bools,
-    /// the entry-point count, and, under `IHc2` (`with_numeric_type`),
-    /// the numeric type.
-    fn read(cur: &mut Cursor<'_>, with_numeric_type: bool) -> Result<Self> {
+    /// the entry-point count, and, under `IHc2`, the numeric type.
+    /// `fourcc` is the graph's tag.
+    fn read(cur: &mut Cursor<'_>, fourcc: FourCc) -> Result<Self> {
         let offset = cur.offset();
         let keep_max_size_level0 = cur.u8("keep_max_size_level0 flag")? != 0;
         let base_level_only = cur.u8("base_level_only flag")? != 0;
         let search_entry_points = cur.i32("search entry point count")?;
-        let numeric_type = if with_numeric_type {
+        let numeric_type = if fourcc == FourCc::HNSW_CAGRA {
             Some(cur.i32("numeric type")?)
         } else {
             None
@@ -2211,7 +2211,7 @@ fn parse_binary(mut cur: Cursor<'_>, offset: usize) -> Result<IdMapIndex<'_>> {
         });
     }
     let kind = if hnsw_fourcc == FourCc::BINARY_HNSW_CAGRA {
-        GraphKind::Cagra(CagraFields::read(&mut cur, false)?)
+        GraphKind::Cagra(CagraFields::read(&mut cur, hnsw_fourcc)?)
     } else {
         GraphKind::Hnsw
     };

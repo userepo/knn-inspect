@@ -18,6 +18,10 @@ const NO_STORAGE: &str = "none: k-NN keeps the field's quantized vectors in Luce
 
 /// What `info` reports of a native file.
 #[derive(Debug, Clone, Serialize)]
+#[expect(
+    missing_docs,
+    reason = "JSON output fields, documented in docs/json.md"
+)]
 pub struct Report {
     pub file: String,
     pub size: usize,
@@ -61,6 +65,10 @@ pub struct Report {
 
 /// The fields a CAGRA graph stores after its HNSW header.
 #[derive(Debug, Clone, Serialize)]
+#[expect(
+    missing_docs,
+    reason = "JSON output fields, documented in docs/json.md"
+)]
 pub struct CagraReport {
     pub keep_max_size_level0: bool,
     pub base_level_only: bool,
@@ -84,6 +92,10 @@ pub enum Kind {
 
 /// A scalar quantizer: its type, dimension, code size, and trained values.
 #[derive(Debug, Clone, Serialize)]
+#[expect(
+    missing_docs,
+    reason = "JSON output fields, documented in docs/json.md"
+)]
 pub struct QuantizerReport {
     pub qtype: i32,
     pub name: String,
@@ -95,6 +107,10 @@ pub struct QuantizerReport {
 /// A product quantizer: its sub-quantizers, its codes, and its centroid
 /// table.
 #[derive(Debug, Clone, Serialize)]
+#[expect(
+    missing_docs,
+    reason = "JSON output fields, documented in docs/json.md"
+)]
 pub struct PqReport {
     pub dimension: u64,
     pub m: u64,
@@ -117,6 +133,10 @@ pub struct PqReport {
 /// An IVF index: its list count and nprobe, its coarse quantizer, its
 /// direct map, and its inverted lists.
 #[derive(Debug, Clone, Serialize)]
+#[expect(
+    missing_docs,
+    reason = "JSON output fields, documented in docs/json.md"
+)]
 pub struct IvfReport {
     pub nlist: u64,
     pub nprobe: u64,
@@ -134,6 +154,10 @@ pub struct IvfReport {
 
 /// The flat index of an IVF index's list centroids.
 #[derive(Debug, Clone, Serialize)]
+#[expect(
+    missing_docs,
+    reason = "JSON output fields, documented in docs/json.md"
+)]
 pub struct CoarseQuantizerReport {
     pub fourcc: String,
     /// Centroids, by the quantizer's header.
@@ -145,6 +169,10 @@ pub struct CoarseQuantizerReport {
 
 /// An IVF index's map from a vector's id to its place in the lists.
 #[derive(Debug, Clone, Serialize)]
+#[expect(
+    missing_docs,
+    reason = "JSON output fields, documented in docs/json.md"
+)]
 pub struct DirectMapReport {
     /// The type byte: 0 none, 1 array, 2 hashtable.
     pub r#type: u8,
@@ -155,6 +183,10 @@ pub struct DirectMapReport {
 
 /// An IVF index's inverted lists, by their own header.
 #[derive(Debug, Clone, Serialize)]
+#[expect(
+    missing_docs,
+    reason = "JSON output fields, documented in docs/json.md"
+)]
 pub struct ListsReport {
     /// `full` or `sparse`.
     pub sizes: &'static str,
@@ -173,6 +205,10 @@ pub struct ListsReport {
 /// The Lucene envelope around the Faiss payload: a codec header and a
 /// footer, each when present.
 #[derive(Debug, Clone, Serialize)]
+#[expect(
+    missing_docs,
+    reason = "JSON output fields, documented in docs/json.md"
+)]
 pub struct EnvelopeReport {
     pub header: Option<HeaderReport>,
     pub footer: Option<FooterReport>,
@@ -180,6 +216,10 @@ pub struct EnvelopeReport {
 
 /// A Lucene codec header.
 #[derive(Debug, Clone, Serialize)]
+#[expect(
+    missing_docs,
+    reason = "JSON output fields, documented in docs/json.md"
+)]
 pub struct HeaderReport {
     pub length: usize,
     pub codec: String,
@@ -190,6 +230,10 @@ pub struct HeaderReport {
 
 /// A Lucene footer, and whether its checksum verifies.
 #[derive(Debug, Clone, Serialize)]
+#[expect(
+    missing_docs,
+    reason = "JSON output fields, documented in docs/json.md"
+)]
 pub struct FooterReport {
     pub offset: usize,
     pub algorithm: i32,
@@ -199,6 +243,10 @@ pub struct FooterReport {
 
 /// Where the Faiss payload lies in the file, and what follows it.
 #[derive(Debug, Clone, Serialize)]
+#[expect(
+    missing_docs,
+    reason = "JSON output fields, documented in docs/json.md"
+)]
 pub struct PayloadReport {
     pub offset: usize,
     pub length: usize,
@@ -207,6 +255,10 @@ pub struct PayloadReport {
 
 /// An HNSW graph's parameters and levels.
 #[derive(Debug, Clone, Serialize)]
+#[expect(
+    missing_docs,
+    reason = "JSON output fields, documented in docs/json.md"
+)]
 pub struct HnswReport {
     pub m: Option<i32>,
     pub ef_construction: i32,
@@ -219,6 +271,10 @@ pub struct HnswReport {
 
 /// The ID map's labels: how many, the first, and the last.
 #[derive(Debug, Clone, Serialize)]
+#[expect(
+    missing_docs,
+    reason = "JSON output fields, documented in docs/json.md"
+)]
 pub struct IdsReport {
     pub len: usize,
     pub first: Option<i64>,

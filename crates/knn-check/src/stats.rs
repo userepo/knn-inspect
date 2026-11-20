@@ -78,7 +78,7 @@ pub fn index_stats(index: &HnswIndex<'_>) -> GraphStats {
 /// empty. Allocations are bounded by the arrays the file actually holds.
 #[must_use]
 pub fn graph_stats(graph: &HnswGraph<'_>) -> GraphStats {
-    stats(graph, graph.searched_levels(), false)
+    stats(graph, graph.searched_levels(), Seeds::EntryPoint)
 }
 
 /// Computes the statistics of `graph`'s level 0, searched as k-NN
@@ -95,14 +95,23 @@ pub fn graph_stats(graph: &HnswGraph<'_>) -> GraphStats {
 pub fn base_level_stats(graph: &HnswGraph<'_>) -> GraphStats {
     let n_levels = usize::from(graph.node_count() > 0)
         .min(graph.cum_nneighbor_per_level.len().saturating_sub(1));
-    stats(graph, n_levels, true)
+    stats(graph, n_levels, Seeds::EveryNode)
+}
+
+/// Where a reachability walk starts on each level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Seeds {
+    /// The stored entry point, as an HNSW search starts.
+    EntryPoint,
+    /// Every node's neighbor list, as a CAGRA search can start anywhere.
+    EveryNode,
 }
 
 /// The statistics of `graph`'s lowest `n_levels` levels, reachability
-/// seeded from every node's neighbor lists (`random_entry`) or from the
-/// entry point.
-fn stats(graph: &HnswGraph<'_>, n_levels: usize, random_entry: bool) -> GraphStats {
+/// seeded as `seeds` says.
+fn stats(graph: &HnswGraph<'_>, n_levels: usize, seeds: Seeds) -> GraphStats {
     let n = graph.node_count();
+    let random_entry = seeds == Seeds::EveryNode;
     let entry = if random_entry {
         None
     } else {

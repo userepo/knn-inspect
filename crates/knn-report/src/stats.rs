@@ -21,6 +21,10 @@ const TEXT_HISTOGRAM_PER_LINE: usize = 8;
 /// What `stats` reports of a native file. Its JSON gives the file, the
 /// method, then the statistics.
 #[derive(Debug, Clone)]
+#[expect(
+    missing_docs,
+    reason = "JSON output fields, documented in docs/json.md"
+)]
 pub struct Report {
     pub file: String,
     pub stats: Stats,

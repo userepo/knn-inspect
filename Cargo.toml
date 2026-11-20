@@ -49,11 +49,16 @@ anyhow = "1.0.104"
 [workspace.lints.rust]
 ambiguous_negative_literals = "warn"
 missing_debug_implementations = "warn"
+# Every public item carries a doc comment (G-MISSING-DOCS).
+missing_docs = "warn"
 redundant_imports = "warn"
 redundant_lifetimes = "warn"
 trivial_numeric_casts = "warn"
 unsafe_op_in_unsafe_fn = "warn"
 unused_lifetimes = "warn"
+# `unsafe` stays in knn-format's mmap module, which opts out with
+# `#![expect(unsafe_code)]` (G-UNSAFE-ISOLATED).
+unsafe_code = "deny"
 
 [workspace.lints.clippy]
 cargo = { level = "warn", priority = -1 }

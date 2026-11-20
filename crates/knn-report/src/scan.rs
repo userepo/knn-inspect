@@ -31,6 +31,10 @@ pub use crate::verify::Options;
 
 /// What `scan` reports of a directory.
 #[derive(Debug, Clone, Serialize)]
+#[expect(
+    missing_docs,
+    reason = "JSON output fields, documented in docs/json.md"
+)]
 pub struct Report {
     pub directory: String,
     pub space: Option<Space>,
@@ -44,6 +48,10 @@ pub struct Report {
 
 /// How many native files `scan` found, by verdict.
 #[derive(Debug, Clone, Serialize)]
+#[expect(
+    missing_docs,
+    reason = "JSON output fields, documented in docs/json.md"
+)]
 pub struct Summary {
     pub files: usize,
     pub clean: usize,
@@ -97,6 +105,10 @@ impl From<Status> for Verdict {
 /// `verify`'s checks, and the cross-checks against its segment's Lucene
 /// files.
 #[derive(Debug, Clone, Serialize)]
+#[expect(
+    missing_docs,
+    reason = "JSON output fields, documented in docs/json.md"
+)]
 pub struct FileReport {
     pub file: String,
     pub size: Option<usize>,
@@ -144,6 +156,10 @@ pub struct FileReport {
 
 /// The vectors compared with the segment's Lucene flat-vector file.
 #[derive(Debug, Clone, Serialize)]
+#[expect(
+    missing_docs,
+    reason = "JSON output fields, documented in docs/json.md"
+)]
 pub struct LuceneVectors {
     pub status: CrossCheck,
     /// The `.vec` file the vectors were found in, or looked for in.
@@ -169,6 +185,10 @@ impl LuceneVectors {
 /// The ID map's labels, which k-NN sets to Lucene doc ids, checked
 /// against the document count in the segment's info file (`.si`).
 #[derive(Debug, Clone, Serialize)]
+#[expect(
+    missing_docs,
+    reason = "JSON output fields, documented in docs/json.md"
+)]
 pub struct LuceneDocs {
     pub status: CrossCheck,
     /// The `.si` file read.
@@ -323,6 +343,10 @@ fn native_files(dir: &Path) -> Result<(Vec<PathBuf>, Vec<Unreadable>)> {
 
 /// A directory, or an entry in one, that could not be read.
 #[derive(Debug, Clone, Serialize)]
+#[expect(
+    missing_docs,
+    reason = "JSON output fields, documented in docs/json.md"
+)]
 pub struct Unreadable {
     pub path: String,
     pub error: String,
